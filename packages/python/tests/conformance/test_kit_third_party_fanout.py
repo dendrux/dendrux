@@ -88,7 +88,7 @@ def test_third_party_fanout_store_passes_the_fanout_contracts(pytester: Pytester
 def test_third_party_fanout_store_passes_the_managed_contracts(pytester: Pytester) -> None:
     result = run_slice(pytester, THIRD_PARTY, "test_managed_subagents")
     assert failed_functions(result) == set(), result.stdout.str()[-3000:]
-    result.assert_outcomes(passed=22)
+    result.assert_outcomes(passed=24)
 
 
 def test_third_party_forwarding_is_held_to_the_contract(pytester: Pytester) -> None:

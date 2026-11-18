@@ -20,28 +20,39 @@ if TYPE_CHECKING:
     from dendrux.testing.store_kit._kit import Kit
 
 
+@contract("managed_subagents", needs=("managed_subagents",), uses=("clock",), format2=True)
+@pytest.mark.parametrize("terminal", [False, True])
+async def test_managed_subagents_wait_is_exempt_from_abandonment(
+    dendrux_kit: Kit, terminal: bool
+) -> None:
+    await test_managed_wait_is_exempt_from_abandonment(dendrux_kit, 3, terminal)
+
+
 @contract(
     "managed_subagents",
     needs=("managed_subagents", "managed_fanout"),
     uses=("clock",),
     format2=True,
 )
-@pytest.mark.parametrize("version", [3, 4])
+@pytest.mark.parametrize("version", [4])
 @pytest.mark.parametrize("terminal", [False, True])
 async def test_managed_wait_is_exempt_from_abandonment(
     dendrux_kit: Kit, version: int, terminal: bool
 ) -> None:
-    kit, store = dendrux_kit, dendrux_kit.store
     if version == 3:
-        request = await single_parent(kit)
-        await store.bind_managed_child(request)
-        parent = request.parent_run_id
-        children = [request.child_run_id]
+        request = await single_parent(dendrux_kit)
+        await dendrux_kit.store.bind_managed_child(request)
+        parent, children = request.parent_run_id, [request.child_run_id]
     else:
-        parent, calls = await fanout_parent(kit, 2)
+        parent, calls = await fanout_parent(dendrux_kit, 2)
         batch = _request(parent, calls)
-        await store.bind_managed_children(batch)
-        children = [child.child_run_id for child in batch.children]
+        await dendrux_kit.store.bind_managed_children(batch)
+        children = [c.child_run_id for c in batch.children]
+    await _assert_parked(dendrux_kit, parent, children, terminal)
+
+
+async def _assert_parked(kit: Kit, parent: str, children: list[str], terminal: bool) -> None:
+    store = kit.store
     if terminal:
         for child in children:
             await store.finalize_run(
