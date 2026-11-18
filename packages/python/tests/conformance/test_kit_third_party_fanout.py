@@ -1,11 +1,15 @@
-"""K11: a minimal third-party store that declares ``managed_fanout`` passes the managed kit.
+"""K11: a third-party store built by composition runs the managed and fan-out kit contracts.
 
-The store is not a ``SQLStateStore`` subclass. It declares its own capabilities and forwards
-the state-store protocol to an inner store by composition (explicit methods, so declaration
-checks see them). It implements ``get_managed_children`` itself, on the public protocol only
-(per-child ``get_run`` / ``get_loop_state`` / ``get_pause_state``), and forwards the atomic
-batch bind. The kit's fan-out and 0.7 managed contracts must pass on it, and fan-out discovery
-must come from its declaration.
+Claim (narrowed after review): composition compatibility. The store is not a ``SQLStateStore``
+subclass; it declares its own capabilities and forwards every protocol method, including the
+atomic batch bind and the single-statement status projection, to an inner store through
+explicit methods (so declaration checks see them). This proves the kit, the capability
+declaration and ``fanout_support`` work through the protocol alone. It is not a second,
+independent implementation of the projection: a projection built from several reads could
+mix states across a concurrent pause, and the kit cannot reject that deterministically (it
+sees only protocol calls, so it cannot run a writer between an implementation's internal
+reads; a concurrent probe would rely on timing). The SQL store's single snapshot is evidenced
+by its statement budget instead (one SELECT, ``test_bind_and_status_read_statement_counts``).
 """
 
 from __future__ import annotations
@@ -24,8 +28,8 @@ import functools
 import inspect
 
 from dendrux.runtime._capabilities import fanout_support
-from dendrux.runtime._managed_fanout_store import ManagedChildRow, ManagedFanoutStore
-from dendrux.runtime.state import UNSCOPED, ManagedStateStore, StateStore, StoreCapabilities
+from dendrux.runtime._managed_fanout_store import ManagedFanoutStore
+from dendrux.runtime.state import ManagedStateStore, StateStore, StoreCapabilities
 
 _FORWARDED = sorted(
     {
@@ -34,7 +38,6 @@ _FORWARDED = sorted(
         for name, _ in inspect.getmembers(protocol, inspect.isfunction)
         if not name.startswith("_")
     }
-    - {"get_managed_children"}
 )
 
 
@@ -61,25 +64,6 @@ class ThirdPartyStore:
             deployment=inner.capabilities.deployment,
         )
 
-    async def get_managed_children(self, parent_run_id, child_run_ids, *, tenant_id):
-        ids = list(child_run_ids)
-        if len(ids) > 32 or len(set(ids)) != len(ids):
-            raise ValueError("at most 32 distinct ids")
-        rows = []
-        for run_id in ids:
-            run = await self._inner.get_run(run_id)
-            if run is None or run.parent_run_id != parent_run_id:
-                continue
-            if tenant_id is not UNSCOPED and run.tenant_id != tenant_id:
-                continue
-            state = await self._inner.get_loop_state(run_id) or {}
-            pause = await self._inner.get_pause_state(run_id) or {}
-            rows.append(ManagedChildRow(
-                run_id, run.parent_run_id, run.tenant_id, str(run.status),
-                state.get("managed"), state.get("managed_wait"), state.get("loop"),
-                pause.get("pause_id"), pause.get("pause_reason"),
-            ))
-        return rows
 
 
 for _name in _FORWARDED:
@@ -97,7 +81,7 @@ def test_third_party_fanout_store_passes_the_fanout_contracts(pytester: Pytester
     result = run_slice(pytester, THIRD_PARTY, "test_managed_fanout")
     text = result.stdout.str()
     assert failed_functions(result) == set(), text[-3000:]
-    result.assert_outcomes(passed=31)
+    result.assert_outcomes(passed=37)
     assert "ThirdPartyStore" in text and "managed_fanout" in text.split("capabilities=")[1]
 
 
@@ -107,12 +91,19 @@ def test_third_party_fanout_store_passes_the_managed_contracts(pytester: Pyteste
     result.assert_outcomes(passed=22)
 
 
-def test_third_party_fanout_read_is_held_to_the_contract(pytester: Pytester) -> None:
-    """Revert check: a third-party read that ignores the tenant scope is caught."""
+def test_third_party_forwarding_is_held_to_the_contract(pytester: Pytester) -> None:
+    """Revert check: forwarding the status read without the caller's tenant scope is caught."""
     broken = THIRD_PARTY.replace(
-        "            if tenant_id is not UNSCOPED and run.tenant_id != tenant_id:\n"
-        "                continue\n",
-        "",
+        "for _name in _FORWARDED:",
+        """async def _unscoped(self, parent_run_id, child_run_ids, *, tenant_id):
+    from dendrux.runtime.state import UNSCOPED
+    return await self._inner.get_managed_children(parent_run_id, child_run_ids, tenant_id=UNSCOPED)
+
+
+for _name in _FORWARDED:""",
+    ).replace(
+        "def mutate(store):",
+        "ThirdPartyStore.get_managed_children = _unscoped\n\n\ndef mutate(store):",
     )
     assert broken != THIRD_PARTY
     result = run_slice(pytester, broken, "test_managed_fanout")
