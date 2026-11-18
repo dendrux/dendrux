@@ -236,7 +236,10 @@ async def test_two_managed_calls_are_refused_with_fanout_limit_and_counts(caplog
             "limit": 1,
             "requested": 2,
         }
-        assert set(json.loads(result.payload)) == {"error"}  # the 0.7 observation shape
+        body = json.loads(result.payload)
+        assert body["reason"] == "fanout_limit"
+        assert (body["limit"], body["requested"]) == (1, 2)
+        assert body["error"] == _managed_batch._MANAGED_BATCH_MESSAGE
     assert "managed_batch_unsupported" in caplog.text
     assert "managed_fanout_limit" in caplog.text
     assert BRIEF not in caplog.text
@@ -251,7 +254,10 @@ async def test_managed_plus_client_call_is_refused_with_client_call_and_0_7_mess
     assert len(recorder.results) == 2
     for result in recorder.results:
         assert result.meta == {"code": "managed_batch_unsupported", "reason": "client_call"}
-        assert json.loads(result.payload) == {"error": _managed_batch._MANAGED_BATCH_MESSAGE}
+        assert json.loads(result.payload) == {
+            "error": _managed_batch._MANAGED_BATCH_MESSAGE,
+            "reason": "client_call",
+        }
 
 
 async def test_managed_plus_server_call_still_runs_the_single_path() -> None:
@@ -277,3 +283,25 @@ async def test_policy_from_the_agent_drives_classification_when_capable() -> Non
     incapable = _managed_batch.batch_policy(agent, fanout_capable=False)
     assert incapable.limit == 1
     assert _managed_batch.classify_batch(only_a, lookups, incapable).reason == "fanout_limit"
+
+
+def test_exclusive_payload_carries_reason_and_the_exclusive_text() -> None:
+    tc = _call("a", {"task": "t"}, "p1")
+    result = _managed_batch._managed_batch_result(tc, BatchDecision("refuse", 2, "exclusive"))
+    assert json.loads(result.payload) == {
+        "error": _managed_batch._EXCLUSIVE_MESSAGE,
+        "reason": "exclusive",
+    }
+    assert result.meta["reason"] == "exclusive"
+
+
+def test_fanout_limit_payload_above_one_names_the_limit() -> None:
+    tc = _call("a", {"task": "t"}, "p1")
+    decision = BatchDecision("refuse", 5, "fanout_limit")
+    body = json.loads(_managed_batch._managed_batch_result(tc, decision, limit=4).payload)
+    assert body["limit"] == 4 and body["requested"] == 5 and "at most 4" in body["error"]
+
+
+def test_result_without_a_decision_is_the_plain_0_7_body() -> None:
+    result = _managed_batch._managed_batch_result(_call("a", {"task": "t"}, "p1"))
+    assert json.loads(result.payload) == {"error": _managed_batch._MANAGED_BATCH_MESSAGE}
