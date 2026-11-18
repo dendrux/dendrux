@@ -12,6 +12,7 @@ from dendrux import Agent, tool
 from dendrux.errors import SubagentDefinitionError
 from dendrux.loops import _managed_batch
 from dendrux.loops._managed_batch import BatchDecision, decide_batch, effective_limit
+from dendrux.loops.base import BaseRecorder
 from dendrux.loops.react import ReActLoop
 from dendrux.strategies.native import NativeToolCalling
 from dendrux.types import Limits, LLMResponse, ToolCall
@@ -197,16 +198,27 @@ def _call(name: str, params: dict[str, Any], pid: str) -> ToolCall:
     return ToolCall(name=name, params=params, provider_tool_call_id=pid)
 
 
-async def _run(agent: Agent, response: LLMResponse) -> tuple[ScriptedLLM, Any]:
+class _Recorder(BaseRecorder):
+    def __init__(self) -> None:
+        self.results: list[Any] = []
+
+    async def on_tool_completed(
+        self, run_id: str, tool_call: ToolCall, tool_result: Any, iteration: int
+    ) -> None:
+        self.results.append(tool_result)
+
+
+async def _run(agent: Agent, response: LLMResponse) -> tuple[_Recorder, Any]:
+    recorder = _Recorder()
     llm = ScriptedLLM([response, LLMResponse(text="done")])
     result = await ReActLoop().run(
-        agent=agent, provider=llm, strategy=NativeToolCalling(), user_input="go"
+        agent=agent,
+        provider=llm,
+        strategy=NativeToolCalling(),
+        user_input="go",
+        recorder=recorder,
     )
-    return llm, result
-
-
-def _observations(llm: ScriptedLLM) -> dict[str, dict[str, Any]]:
-    return {m.call_id: json.loads(m.content) for m in llm.messages[1] if m.role.value == "tool"}
+    return recorder, result
 
 
 async def test_two_managed_calls_are_refused_with_fanout_limit_and_counts(caplog) -> None:
@@ -215,17 +227,19 @@ async def test_two_managed_calls_are_refused_with_fanout_limit_and_counts(caplog
         tool_calls=[_call("a", {"task": BRIEF}, "p1"), _call("b", {"task": BRIEF}, "p2")]
     )
     with caplog.at_level(logging.WARNING):
-        llm, _ = await _run(agent, response)
-    seen = _observations(llm)
-    assert len(seen) == 2
-    for body in seen.values():
-        assert body["reason"] == "fanout_limit"
-        assert body["limit"] == 1
-        assert body["requested"] == 2
-    text = caplog.text
-    assert "managed_batch_unsupported" in text
-    assert "managed_fanout_limit" in text
-    assert BRIEF not in text
+        recorder, _ = await _run(agent, response)
+    assert len(recorder.results) == 2
+    for result in recorder.results:
+        assert result.meta == {
+            "code": "managed_batch_unsupported",
+            "reason": "fanout_limit",
+            "limit": 1,
+            "requested": 2,
+        }
+        assert set(json.loads(result.payload)) == {"error"}  # the 0.7 observation shape
+    assert "managed_batch_unsupported" in caplog.text
+    assert "managed_fanout_limit" in caplog.text
+    assert BRIEF not in caplog.text
 
 
 async def test_managed_plus_client_call_is_refused_with_client_call_and_0_7_message() -> None:
@@ -233,13 +247,11 @@ async def test_managed_plus_client_call_is_refused_with_client_call_and_0_7_mess
     response = LLMResponse(
         tool_calls=[_call("a", {"task": BRIEF}, "p1"), _call("read_sheet", {"sheet": "S"}, "p2")]
     )
-    llm, _ = await _run(agent, response)
-    seen = _observations(llm)
-    assert len(seen) == 2
-    for body in seen.values():
-        assert body["reason"] == "client_call"
-        assert body["error"] == _managed_batch._MANAGED_BATCH_MESSAGE
-        assert "limit" not in body
+    recorder, _ = await _run(agent, response)
+    assert len(recorder.results) == 2
+    for result in recorder.results:
+        assert result.meta == {"code": "managed_batch_unsupported", "reason": "client_call"}
+        assert json.loads(result.payload) == {"error": _managed_batch._MANAGED_BATCH_MESSAGE}
 
 
 async def test_managed_plus_server_call_still_runs_the_single_path() -> None:
@@ -249,3 +261,19 @@ async def test_managed_plus_server_call_still_runs_the_single_path() -> None:
     )
     _, result = await _run(agent, response)
     assert result.status.value == "running"  # handed off to the runner, not refused
+
+
+async def test_policy_from_the_agent_drives_classification_when_capable() -> None:
+    agent = _parent(
+        _child("a"), _child("b"), exclusive=["b"], limits=Limits(max_parallel_subagents=3)
+    )
+    lookups = await agent.get_tool_lookups()
+    both = [_call("a", {"task": "t"}, "p1"), _call("b", {"task": "t"}, "p2")]
+    capable = _managed_batch.batch_policy(agent, fanout_capable=True)
+    assert capable.limit == 3
+    assert _managed_batch.classify_batch(both, lookups, capable).reason == "exclusive"
+    only_a = [_call("a", {"task": "t"}, "p1"), _call("a", {"task": "t"}, "p2")]
+    assert _managed_batch.classify_batch(only_a, lookups, capable).action == "fanout"
+    incapable = _managed_batch.batch_policy(agent, fanout_capable=False)
+    assert incapable.limit == 1
+    assert _managed_batch.classify_batch(only_a, lookups, incapable).reason == "fanout_limit"

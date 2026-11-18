@@ -178,18 +178,17 @@ def _refusal_message(decision: BatchDecision, limit: int) -> str:
 def _managed_batch_result(
     tc: ToolCall, decision: BatchDecision | None = None, *, limit: int = 1
 ) -> ToolResult:
-    """The observation for one refused call; without a decision, the plain 0.7 body."""
+    """The observation for one refused call: the 0.7 body, with the reason in ``meta``."""
     message = _MANAGED_BATCH_MESSAGE if decision is None else _refusal_message(decision, limit)
-    body: dict[str, Any] = {"error": message}
     meta: dict[str, Any] = {"code": MANAGED_BATCH_UNSUPPORTED}
     if decision is not None and decision.reason is not None:
-        body["reason"] = meta["reason"] = decision.reason
+        meta["reason"] = decision.reason
         if decision.reason == "fanout_limit":
-            body["limit"], body["requested"] = limit, decision.count
+            meta["limit"], meta["requested"] = limit, decision.count
     return ToolResult(
         name=tc.name,
         call_id=tc.id,
-        payload=json.dumps(body),
+        payload=json.dumps({"error": message}),
         success=False,
         error=message,
         meta=meta,
