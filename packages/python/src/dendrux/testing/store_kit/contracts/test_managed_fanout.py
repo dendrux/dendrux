@@ -10,6 +10,7 @@ derive the checkpoint's ``managed_wait`` map from it. Fault cuts need the option
 from __future__ import annotations
 
 import asyncio
+import json
 from copy import deepcopy
 from dataclasses import fields, replace
 from functools import partial
@@ -85,11 +86,19 @@ class _EncodedWait(PauseState):
         return deepcopy(self.encoded)
 
 
-def fanout_wait(bindings: Sequence[tuple[str, str]], *, pause_id: str | None = None) -> PauseState:
+def fanout_wait(
+    bindings: Sequence[tuple[str, str]],
+    *,
+    pause_id: str | None = None,
+    calls: Sequence[ToolCall] | None = None,
+    provider_kwargs: dict[str, Any] | None = None,
+) -> PauseState:
     """A v4 fan-out wait over ``(tool_call_id, child_run_id)`` bindings, in call order."""
     base = PauseState(
         agent_name="KitAgent",
-        pending_tool_calls=[ToolCall(name="reviewer", params={}, id=c) for c, _ in bindings],
+        pending_tool_calls=list(calls)
+        if calls is not None
+        else [ToolCall(name="reviewer", params={}, id=c) for c, _ in bindings],
         history=[],
         steps=[],
         iteration=1,
@@ -100,6 +109,7 @@ def fanout_wait(bindings: Sequence[tuple[str, str]], *, pause_id: str | None = N
         pause_id=pause_id or ulid(),
         schema_version=2,
         loop_state_ref=True,
+        provider_kwargs=dict(provider_kwargs or {}),
     )
     data = base.to_dict()
     data["schema_version"] = 4
@@ -113,7 +123,9 @@ def fanout_wait(bindings: Sequence[tuple[str, str]], *, pause_id: str | None = N
     return wait
 
 
-async def _parent(kit: Kit, n: int, tenant: str | None = "t") -> tuple[str, list[str]]:
+async def _parent(
+    kit: Kit, n: int, tenant: str | None = "t", *, name: str = "reviewer"
+) -> tuple[str, list[str]]:
     """A running managed root at epoch 0 with ``n`` pending managed calls."""
     parent = await started_run(kit, tenant)
     calls = [ulid() for _ in range(n)]
@@ -124,7 +136,7 @@ async def _parent(kit: Kit, n: int, tenant: str | None = "t") -> tuple[str, list
             "v": 1,
             "loop": "react",
             "phase": "dispatch",
-            "pending": [{"call_id": c, "tool": "reviewer", "target": "agent"} for c in calls],
+            "pending": [{"call_id": c, "tool": name, "target": "agent"} for c in calls],
             MANAGED_HEADER_KEY: ManagedHeader(parent, ()).to_dict(),
         },
         pii_mapping=None,
@@ -151,32 +163,48 @@ def _request(
     *,
     root: str | None = None,
     path: tuple[str, ...] = (),
+    name: str = "reviewer",
+    provider_id: str | None = None,
+    child: Any = None,
+    provider_kwargs: dict[str, Any] | None = None,
     **overrides: Any,
 ) -> BindManagedChildrenRequest:
+    """A batch over ``calls``; ``child(i)`` returns per-child field overrides."""
     children = tuple(
         ManagedChildSpec(
-            tool_call_id=call,
-            row_id=ulid(),
-            provider_tool_call_id=None,
-            tool_name="reviewer",
-            params={"task": f"kit brief {i}"},
-            child_run_id=ulid(),
-            child_agent_name="reviewer",
-            child_path=(*path, "reviewer"),
-            child_input_data={"input": f"kit brief {i}"},
-            child_loop_state={"v": 1, "loop": "react", "phase": "dispatch"},
-            intent_event=event_write(_STARTED, call, 1),
-            child_seed_traces=(trace_write("user", f"kit brief {i}", 0, kind="seed"),),
+            **{
+                "tool_call_id": call,
+                "row_id": ulid(),
+                "provider_tool_call_id": provider_id,
+                "tool_name": name,
+                "params": {"task": f"kit brief {i}"},
+                "child_run_id": ulid(),
+                "child_agent_name": name,
+                "child_path": (*path, name),
+                "child_input_data": {"input": f"kit brief {i}"},
+                "child_loop_state": {"v": 1, "loop": "react", "phase": "dispatch"},
+                "intent_event": event_write(_STARTED, call, 1),
+                "child_seed_traces": (trace_write("user", f"kit brief {i}", 0, kind="seed"),),
+                **(child(i) if child is not None else {}),
+            }
         )
         for i, call in enumerate(calls)
     )
+    wait_calls = [
+        ToolCall(name=c.tool_name, params={}, id=c.tool_call_id, provider_tool_call_id=provider_id)
+        for c in children
+    ]
     values: dict[str, Any] = {
         "tenant_id": tenant,
         "root_run_id": root or parent,
         "parent_run_id": parent,
         "parent_claim_epoch": 0,
         "iteration_index": 1,
-        "parent_wait": fanout_wait([(c.tool_call_id, c.child_run_id) for c in children]),
+        "parent_wait": fanout_wait(
+            [(c.tool_call_id, c.child_run_id) for c in children],
+            calls=wait_calls,
+            provider_kwargs=provider_kwargs,
+        ),
         "parent_patch": LoopStatePatch(set_fields={"iteration": 1}),
         "children": children,
         "max_parallel": max(len(children), 2),
@@ -596,6 +624,36 @@ async def test_fanout_same_root_binders_share_the_cap(dendrux_kit: Kit) -> None:
     assert len(lost) == 1 and isinstance(lost[0], ManagedStateError)
     assert lost[0].code == "managed_run_limit"
     await _absent(store, requests[results.index(lost[0])])
+
+
+def _compact_bytes(value: Any) -> int:
+    return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
+@fanout
+async def test_fanout_bind_refuses_an_oversized_wait_without_writes(dendrux_kit: Kit) -> None:
+    store = dendrux_kit.store
+    parent, calls = await _parent(dendrux_kit, 2)
+    request = _request(parent, calls, provider_kwargs={"model": "m" * (32 * 1024)})
+    assert _compact_bytes(request.parent_wait.to_dict()) > 32 * 1024
+    before = await _snapshot(store, parent)
+    with pytest.raises(ManagedStateError) as refused:
+        await store.bind_managed_children(request)
+    assert refused.value.reason == "wait_invalid"
+    assert await _snapshot(store, parent) == before
+    await _absent(store, request)
+
+
+@fanout
+async def test_fanout_bind_holds_a_maximum_size_batch(dendrux_kit: Kit) -> None:
+    """32 children with ULID call ids, 255-character provider ids and 64-character names."""
+    store = dendrux_kit.store
+    name = "n" * 64
+    parent, calls = await _parent(dendrux_kit, 32, name=name)
+    request = _request(parent, calls, name=name, provider_id="p" * 255)
+    assert 16 * 1024 < _compact_bytes(request.parent_wait.to_dict()) <= 32 * 1024
+    assert (await store.bind_managed_children(request)).outcome == "created"
+    await _published(store, request)
 
 
 # ---------------------------------------------------------------------------------------------
