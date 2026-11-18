@@ -19,6 +19,11 @@ if TYPE_CHECKING:
 
 pytest_plugins = ["pytester"]
 
+# Slices select one contract module by name, so a new managed module (for example the 0.8
+# fan-out contracts in ``test_managed_fanout.py``) never changes another slice's counts.
+MANAGED_SLICE = "test_managed_subagents"
+FANOUT_SLICE = "test_managed_fanout"
+
 
 def _creator_after_lost_ack(**claim_overrides: int) -> str:
     return mutant(
@@ -139,7 +144,7 @@ def test_managed_contract_rejects_broken_store(pytester: Pytester, name: str) ->
 
 
 def test_managed_contract_slice_passes_on_intact_store(pytester: Pytester) -> None:
-    intact = run_slice(pytester, NONE, "managed_")
+    intact = run_slice(pytester, NONE, MANAGED_SLICE)
     intact.assert_outcomes(passed=22)
     assert "managed_subagents" in intact.stdout.str()
 
@@ -173,7 +178,7 @@ def mutate(store):
     assert refused.value.missing == (PREREQUISITE,)
     return store
 """.replace("PREREQUISITE", repr(prerequisite))
-    result = run_slice(pytester, mutation, "managed_")
+    result = run_slice(pytester, mutation, MANAGED_SLICE)
     result.assert_outcomes(passed=1, skipped=21)
     assert "managed_subagents" not in result.stdout.str().split("capabilities=")[1].split(")")[0]
 
@@ -194,12 +199,77 @@ def mutate(store):
     store.capabilities = replace(store.capabilities, managed_subagents=False)
     return store
 """
-    result = run_slice(pytester, mutation, "managed_")
+    result = run_slice(pytester, mutation, MANAGED_SLICE)
     result.assert_outcomes(passed=1, skipped=21)
     assert "managed_subagents" not in result.stdout.str().split("capabilities=")[1].split(")")[0]
 
 
 def test_managed_fault_cuts_are_reported_uncertified_without_injector(pytester: Pytester) -> None:
-    result = run_kit(pytester, injector=None, k="managed_")
+    result = run_kit(pytester, injector=None, k=MANAGED_SLICE)
     result.assert_outcomes(passed=17, skipped=5)
     assert "crash recovery: not certified" in result.stdout.str()
+
+
+def test_fanout_contract_slice_passes_on_intact_store(pytester: Pytester) -> None:
+    intact = run_slice(pytester, NONE, FANOUT_SLICE)
+    intact.assert_outcomes(passed=31)
+    assert "managed_subagents" in intact.stdout.str()
+
+
+def test_undeclared_fanout_skips_fanout_contracts_only(pytester: Pytester) -> None:
+    mutation = """
+from dataclasses import replace
+
+def mutate(store):
+    store.capabilities = replace(store.capabilities, managed_fanout=False)
+    return store
+"""
+    fanout = run_slice(pytester, mutation, FANOUT_SLICE)
+    fanout.assert_outcomes(passed=1, skipped=30)
+    managed = run_slice(pytester, mutation, MANAGED_SLICE)
+    managed.assert_outcomes(passed=22)
+
+
+def test_fanout_fault_cuts_are_reported_uncertified_without_injector(pytester: Pytester) -> None:
+    result = run_kit(pytester, injector=None, k=FANOUT_SLICE)
+    result.assert_outcomes(passed=25, skipped=6)
+    assert "crash recovery: not certified" in result.stdout.str()
+
+
+def test_fanout_is_a_reported_capability_after_managed_subagents() -> None:
+    from dendrux.testing.store_kit._declaration import CAPABILITIES
+
+    assert CAPABILITIES.index("managed_fanout") == CAPABILITIES.index("managed_subagents") + 1
+
+
+@pytest.mark.parametrize(
+    "narrowed",
+    [
+        None,
+        "managed_fanout",
+        "managed_subagents",
+        "fenced_writes",
+        "retry_ids",
+        "checkpointing",
+        "atomic_completion",
+        "recovery",
+    ],
+)
+def test_declared_fanout_needs_managed_use(narrowed: str | None) -> None:
+    from dataclasses import replace
+
+    from dendrux.runtime.stores.sql.sqlite import SQLiteStateStore
+    from dendrux.testing.store_kit._declaration import Declaration
+
+    caps = SQLiteStateStore.capabilities
+    if narrowed is not None:
+        caps = replace(caps, **{narrowed: False})
+    declaration = Declaration("KitStore", caps)
+    assert declaration.has("managed_fanout") is (narrowed is None)
+    assert ("managed_fanout" in declaration.declared) is (narrowed is None)
+
+
+def test_fanout_appears_in_the_report_label_only_when_capable(pytester: Pytester) -> None:
+    intact = run_slice(pytester, NONE, "test_fanout_support_reads_the_declaration")
+    label = intact.stdout.str().split("capabilities=")[1].split(")")[0]
+    assert label.endswith("managed_subagents,managed_fanout")
