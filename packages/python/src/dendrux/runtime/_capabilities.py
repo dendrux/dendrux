@@ -6,6 +6,7 @@ import inspect
 import logging
 import warnings
 import weakref
+from dataclasses import dataclass
 from typing import Any, NoReturn
 
 from dendrux import _codes
@@ -66,6 +67,11 @@ _REQUIREMENTS: dict[str, dict[str, tuple[str, ...]]] = {
         "get_run_control": (),
         "mark_cancel_requested": (),
         "get_children_page": (),
+    },
+    # 0.8: batch bind of 2..32 children and their status read; requires managed_subagents.
+    "managed_fanout": {
+        "bind_managed_children": (),
+        "get_managed_children": ("tenant_id",),
     },
 }
 # Managed subagents need every durability promise the bind and adoption rely on.
@@ -144,6 +150,37 @@ def require_managed_subagents(store: Any) -> StoreCapabilities:
     absent = tuple(name for name in _MANAGED_PREREQUISITES if not getattr(caps, name))
     if absent:
         _refuse(store, "managed_subagents", "capabilities", absent)
+    return caps
+
+
+@dataclass(frozen=True)
+class FanoutSupport:
+    """Whether a store can bind a fan-out of 2..32 managed children (0.8)."""
+
+    capable: bool
+
+
+def fanout_support(store: Any) -> FanoutSupport:
+    """The one fan-out discovery: read the store's declaration, never its methods.
+
+    Capable only when the store declares ``managed_fanout`` and is managed-capable
+    (``managed_subagents`` with every prerequisite). A store that is not capable keeps the
+    0.7 single-child behaviour (effective fan-out limit 1).
+    """
+    validate_capabilities(store)
+    caps = capabilities(store)
+    return FanoutSupport(
+        capable=caps.managed_fanout
+        and caps.managed_subagents
+        and all(getattr(caps, name) for name in _MANAGED_PREREQUISITES)
+    )
+
+
+def require_managed_fanout(store: Any) -> StoreCapabilities:
+    """Refuse before any fan-out write unless :func:`fanout_support` says capable."""
+    caps = require_managed_subagents(store)
+    if not fanout_support(store).capable:
+        _refuse(store, "managed_fanout", "bind_managed_children", ("bind_managed_children",))
     return caps
 
 
