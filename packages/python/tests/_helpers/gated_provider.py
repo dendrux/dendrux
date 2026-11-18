@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 from dendrux.llm._retry_telemetry import begin_call_attempt_tracking, end_call_attempt_tracking
 from dendrux.llm.base import LLMProvider
+from dendrux.runtime.context import get_delegation_context
 from dendrux.types import (
     LLMResponse,
     ProviderCapabilities,
@@ -57,6 +58,11 @@ class GatedStreamLLM(LLMProvider):
         self.closed = False
         self.cancelled = False
         self.call_count = 0
+        self.gate_complete = False
+        self.complete_tasks: list[asyncio.Task[Any] | None] = []
+        self.complete_contexts: list[Any] = []
+        self.complete_closed = False
+        self.complete_error: Exception | None = None
 
     @property
     def model(self) -> str:
@@ -66,7 +72,28 @@ class GatedStreamLLM(LLMProvider):
         self.call_count += 1
         if self._before:
             return self._before.pop(0)
+        async with aclosing(self._complete_events()) as events:
+            async for _ in events:
+                pass
         return LLMResponse(text=self.first + self.second)
+
+    async def _complete_events(self) -> AsyncGenerator[None, None]:
+        token = begin_call_attempt_tracking()
+        self.complete_tasks.append(asyncio.current_task())
+        self.complete_contexts.append(get_delegation_context())
+        try:
+            yield None
+            self.first_sent.set()
+            if self.gate_complete:
+                await self.gate.wait()
+            self.complete_tasks.append(asyncio.current_task())
+            if self.complete_error is not None:
+                raise self.complete_error
+            yield None
+        finally:
+            self.complete_tasks.append(asyncio.current_task())
+            end_call_attempt_tracking(token)
+            self.complete_closed = True
 
     async def complete_stream(
         self, messages: Any, tools: Any = None, **kwargs: Any
