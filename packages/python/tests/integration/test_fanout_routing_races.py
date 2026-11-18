@@ -2,8 +2,8 @@
 
 Each "process" is its own engine and connection pool over the same private test database,
 with its own Agent instance. Schedules use events and barriers, never timing luck. The
-adoption step is the fake ``settle_parent`` of the routing tests; its claim is the store's
-own compare-and-set, so the "one adoption" assertions hold on real concurrency.
+adoption step is the real fan-in ``settle_parent``, observed by a spy; its claim is the
+store's own compare-and-set, so the "one adoption" assertions hold on real concurrency.
 """
 
 from __future__ import annotations
@@ -24,13 +24,13 @@ from tests._helpers.scripted_provider import ScriptedLLM
 from tests.integration.test_fanout_routing import (
     ROOT_TEXT,
     TENANT,
-    FakeSettle,
+    SettleSpy,
     approver,
     fan_out,
-    install_fake_settle,
     pause_of,
     published,
     root_agent,
+    spy_settle,
     start_root,
 )
 
@@ -62,7 +62,7 @@ def finisher_held(name: str) -> tuple[Agent, ScriptedLLM]:
 
 
 async def _owner_finishes(
-    store: Any, root: Agent, child: Agent, child_id: str, claim: Any, fake: FakeSettle
+    store: Any, root: Agent, child: Agent, child_id: str, claim: Any, fake: SettleSpy
 ) -> RunResult | None:
     """An owner task: run the bound child to its end, then settle the parent as the last
     finisher (a fresh read after its own terminal commit) and continue it if it adopts."""
@@ -94,8 +94,9 @@ async def test_r4_approval_submit_against_a_siblings_terminal_commit(
     async def both_terminal() -> None:
         await barrier.wait()
 
-    fake = FakeSettle(gate=both_terminal if schedule == "both_read_all_terminal" else None)
-    install_fake_settle(monkeypatch, fake)
+    fake = spy_settle(
+        monkeypatch, gate=both_terminal if schedule == "both_read_all_terminal" else None
+    )
     async with AsyncExitStack() as stack:
         store_a, store_b = await _processes(stack, engine, 2)
         one, one_llm = finisher_held("one")
@@ -140,7 +141,7 @@ async def test_r6_submits_to_two_leaves_from_two_processes(
 ) -> None:
     """R6: both callers look the tree up before either claims; each answer applies once to
     its own leaf, nothing crosses, nothing deadlocks, and the root adopts once."""
-    fake = install_fake_settle(monkeypatch)
+    fake = spy_settle(monkeypatch)
     looked_up = asyncio.Barrier(2)
     walk = _managed_route._walk
 

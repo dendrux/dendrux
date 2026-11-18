@@ -8,8 +8,8 @@ then unwinds leaf-first: the leaf's parent settles first, then its parent, and s
 The 0.8 driver (owner tasks, fan-in) is not built yet, so fan-out states are made directly
 through the store: the parent is checkpointed with its pending managed calls, the batch is
 bound with ``bind_managed_children``, and each child then runs from its bound checkpoint with
-its own claim. The adoption step is a fake ``settle_parent`` that satisfies the T0b Protocol
-(:class:`FakeSettle`); it claims and completes the wait through ordinary store writes.
+its own claim. Settlement is the real fan-in (``settle_parent``), observed by
+:class:`SettleSpy`.
 Runs on SQLite and Postgres (``DENDRUX_TEST_PG_URL``, a private ``*_test`` database).
 """
 
@@ -25,7 +25,7 @@ from dendrux import Agent, tool
 from dendrux._lifecycle import TERMINAL_STATUS_VALUES, StoredEventType
 from dendrux._managed_wait import ManagedFanout, ManagedWait
 from dendrux.errors import PauseStatusMismatchError, RunNotFoundError, RunNotPausedError
-from dendrux.runtime import _managed_budget, _managed_route, _reclaim
+from dendrux.runtime import _managed_budget, _managed_fanout, _managed_route, _reclaim
 from dendrux.runtime._managed_fanout_store import BindManagedChildrenRequest, ManagedChildSpec
 from dendrux.runtime._reclaim import continue_claimed
 from dendrux.runtime._trace_shared import message_trace
@@ -368,118 +368,49 @@ async def bind_one(
     return spec.child_run_id, bound.child_claim
 
 
-class FakeSettle:
-    """A ``settle_parent`` (T0b Protocol) built on ordinary store writes, for routing tests.
+class SettleSpy:
+    """Wraps the real ``settle_parent`` (T0b Protocol, T4c adoption) to observe the unwind.
 
-    It reads the wait's children in a fresh read; when every one is terminal it claims the
-    parked parent with the v4 adoption descriptor (one winner, store CAS) and completes each
-    intent with the child's answer in call order. ``calls`` records every settle attempt as
-    ``(parent run id, all children terminal)``; ``adoptions`` counts claims won.
+    ``calls`` records every settle attempt as ``(parent run id, all children terminal)``
+    from a read just before the real settle; ``adoptions`` counts claims it won. ``gate``
+    (optional) is awaited first: a race schedule's hook.
     """
 
-    def __init__(self, *, adopt: bool = True, gate: Any = None) -> None:
-        self.adopt = adopt
-        self.gate = gate  # awaited before the read: a race schedule's hook
+    def __init__(self, real: SettleParent, *, gate: Any = None) -> None:
+        self.real = real
+        self.gate = gate
         self.calls: list[tuple[str, bool]] = []
         self.adoptions = 0
 
-    async def __call__(self, store: StateStore, node: WaitNode) -> ClaimResult | None:
+    async def __call__(
+        self, store: StateStore, node: WaitNode, **kwargs: Any
+    ) -> ClaimResult | None:
         if self.gate is not None:
             await self.gate()
         ids = [child.run_id for child in node.children]
         rows = await store.get_managed_children(node.run_id, ids, tenant_id=node.tenant_id)  # type: ignore[attr-defined]
         settled = len(rows) == len(ids) and all(r.status in TERMINAL_STATUS_VALUES for r in rows)
         self.calls.append((node.run_id, settled))
-        if not settled or not self.adopt:
-            return None
-        return await self._adopt(store, node)
-
-    async def _adopt(self, store: Any, node: WaitNode) -> ClaimResult | None:
-        calls = [child.call.id for child in node.children if child.call is not None]
-        claim = await store.submit_and_claim(
-            node.run_id,
-            expected_status=RunStatus.PAUSED.value,
-            submitted_data={"managed_fanout_adoption": {"v": 1, "calls": calls}},
-            submission={
-                "submission_id": generate_ulid(),
-                "kind": "tool_results",
-                "pause_id": node.pause_id,
-                "payload_ref": {"pause_data_key": "submission"},
-                "call_ids": calls,
-                "reserved_order_index": 2,
-                "managed_fanout_adoption": {"v": 1},
-            },
-        )
-        if not isinstance(claim, ClaimResult):
-            return None
-        self.adoptions += 1
-        state = dict(claim.loop_state or {})
-        for index, child in enumerate(node.children):
-            assert child.call is not None
-            record = await store.get_run(child.run_id)
-            last = index == len(node.children) - 1
-            cleared = {"managed_wait": None, "submission": None, "managed_admitted": None}
-            patch = LoopStatePatch(
-                remove_pending=(child.call.id,),
-                set_phase="model_next" if last else None,
-                set_fields=cleared if last else {},
-            )
-            text = record.answer or record.status
-            observation = message_trace(
-                Message(role=Role.TOOL, content=text, call_id=child.call.id, name=child.call.name),
-                2 + index,
-            )
-            observation.meta["iteration"] = 1
-            await store.complete_tool_call(
-                node.run_id,
-                claim_epoch=claim.claim_epoch,
-                tool_call_id=child.call.id,
-                outcome="completed" if record.status == "success" else "failed",
-                result_payload=text,
-                success=record.status == "success",
-                duration_ms=1,
-                error_message=None,
-                replayed=False,
-                observation=observation,
-                event=EventWrite(
-                    generate_ulid(),
-                    StoredEventType.TOOL_COMPLETED.value,
-                    1,
-                    {"call_id": child.call.id, "target": "agent"},
-                    child.call.id,
-                    None,
-                ),
-                loop_state_patch=patch,
-                meta=None,
-                pii_mapping=None,
-            )
-            state = {**state, **patch.set_fields}
-            state["pending"] = [
-                p for p in state.get("pending", []) if p["call_id"] != child.call.id
-            ]
-            if patch.set_phase:
-                state["phase"] = patch.set_phase
-        return ClaimResult(claim.claim_epoch, claim.storage_format, state, None)
+        claim = await self.real(store, node, **kwargs)
+        self.adoptions += claim is not None
+        return claim
 
 
 @pytest.fixture
-def settle(monkeypatch: pytest.MonkeyPatch) -> FakeSettle:
-    """Route every v4 settle through a fake adoption (see :func:`install_fake_settle`)."""
-    return install_fake_settle(monkeypatch)
+def settle(monkeypatch: pytest.MonkeyPatch) -> SettleSpy:
+    """Observe the real fan-in settlement (see :func:`spy_settle`)."""
+    return spy_settle(monkeypatch)
 
 
-def install_fake_settle(
-    monkeypatch: pytest.MonkeyPatch, fake: FakeSettle | None = None
-) -> FakeSettle:
-    """Route every v4 settle through a fake adoption (the real one is the fan-in task).
+def spy_settle(monkeypatch: pytest.MonkeyPatch, *, gate: Any = None) -> SettleSpy:
+    """Spy on the real ``settle_parent``; let a v4-adopted parent continue.
 
     A parent continued after a v4 adoption still holds its old v4 envelope in its pause
-    data. The 0.7 continuation reads only a stale v3 wait there; the fan-in task extends
-    ``_reclaim._continuation_base`` to v4 (contract gap), mirrored here for the test.
+    data. Reading it is the recovery task's change to ``_reclaim._continuation_base``
+    (not merged yet); this test-only stand-in mirrors it.
     """
-    fake = fake or FakeSettle()
-    protocol: SettleParent = fake
-    monkeypatch.setattr(_managed_route, "settle_fanout", protocol)
+    spy = SettleSpy(_managed_fanout.settle_parent, gate=gate)
+    monkeypatch.setattr(_managed_fanout, "settle_parent", spy)
     base = _reclaim._continuation_base
 
     def continuation_base(raw: dict[str, Any], run_id: str) -> PauseState:
@@ -496,7 +427,7 @@ def install_fake_settle(
         )
 
     monkeypatch.setattr(_reclaim, "_continuation_base", continuation_base)
-    return fake
+    return spy
 
 
 def assert_coherent(result: RunResult) -> None:
@@ -813,7 +744,7 @@ def client_call_id(fan: Fan, index: int) -> str:
 
 
 async def test_answers_in_any_order_adopt_once_and_finish_the_root(
-    store: Any, settle: FakeSettle
+    store: Any, settle: SettleSpy
 ) -> None:
     """A2: approval in one child, a client tool in another; answer the second first."""
     a, b = approver("a"), client_child("b")
@@ -1029,7 +960,7 @@ async def test_foreign_tenant_submits_are_not_found_before_disclosure(
 
 
 async def test_unwind_settles_the_leafs_parent_first_then_its_parent(
-    store: Any, settle: FakeSettle
+    store: Any, settle: SettleSpy
 ) -> None:
     """R waits on A and B; A waits on A1 and A2. Answering A2 settles A first, continues
     A to its end, then settles R (B still paused: R keeps waiting). Answering B then
@@ -1068,7 +999,7 @@ async def test_unwind_settles_the_leafs_parent_first_then_its_parent(
 
 
 async def test_unwind_stops_at_a_parent_with_an_unsettled_child(
-    store: Any, settle: FakeSettle
+    store: Any, settle: SettleSpy
 ) -> None:
     """A1 still paused: answering A2 settles A (not adoptable) and never reaches R."""
     a1, a2 = approver("a1"), approver("a2")
@@ -1096,7 +1027,7 @@ async def test_unwind_stops_at_a_parent_with_an_unsettled_child(
 
 
 async def test_a_chain_above_a_fanout_shows_every_pause_and_unwinds_through_0_7_adoption(
-    store: Any, settle: FakeSettle
+    store: Any, settle: SettleSpy
 ) -> None:
     """R waits (v3) on M; M fans out to A and B. Reads re-address both pauses to R; the
     last answer settles M (v4), continues M, then adopts M into R the 0.7 way."""

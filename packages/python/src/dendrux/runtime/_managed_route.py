@@ -47,7 +47,7 @@ if TYPE_CHECKING:
     from dendrux.agent import Agent
     from dendrux.runtime._entry_checks import EntryPoint
     from dendrux.runtime._managed_fanout_store import ManagedChildRow
-    from dendrux.runtime.state import ClaimResult, RunRecord, StateStore, TenantScope
+    from dendrux.runtime.state import RunRecord, StateStore, TenantScope
 
 logger = logging.getLogger(__name__)
 
@@ -569,29 +569,20 @@ async def submit_routed(
     return await unwind_tree(tree, leaf, store, result, notifier=notifier)
 
 
-async def settle_fanout(store: StateStore, node: WaitNode) -> ClaimResult | None:
-    """``settle_parent`` for a v4 wait: the seam the fan-in adoption plugs into.
-
-    Until that adoption exists, a v4 wait is never claimed here: it stays parked, and
-    the caller returns the fresh root view (RUNNING while its children await adoption).
-    """
-    del store, node
-    return None
-
-
 async def unwind_tree(
     tree: WorkflowTree, leaf: LeafNode, store: Any, result: RunResult, *, notifier: Any
 ) -> RunResult:
     """Unwind from a continued leaf toward the root, its immediate parent first.
 
     While the run just driven is terminal, settle the wait above it: a v3 wait by the
-    0.7 adoption, a v4 wait by :func:`settle_fanout`. A parent that adopts continues in
+    0.7 adoption, a v4 wait by the fan-in (``settle_parent``: a fresh read of every
+    child, then one claim and the completions in call order). A parent that adopts continues in
     this task, delegating again if its model does. Stops at the first wait that is not
     adoptable, is claimed by another caller, or whose run ends paused, and then returns
     a fresh root view (the root's own result when the root itself was continued).
     """
-    # The driver imports this module at load; its 0.8 split removes this cycle.
-    from dendrux.runtime import _managed, _reclaim
+    # cycle: _managed imports this module at load; removed when dispatch is extracted.
+    from dendrux.runtime import _managed, _managed_fanout, _reclaim
 
     shared: Any = unclaimed_store(store)
     result = await _managed.drive(result, notifier=notifier)
@@ -603,7 +594,7 @@ async def unwind_tree(
         if wait.version == 3:
             claim = await _managed.claim_adoption(_waiting_of(wait), shared)
         else:
-            claim = await settle_fanout(shared, wait)
+            claim = await _managed_fanout.settle_parent(shared, wait)
         if claim is None:
             break
         resumed = await _reclaim.continue_claimed(
