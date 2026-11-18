@@ -489,13 +489,10 @@ class StatementTooLargeError(PersistenceError):
 
 
 class ManagedStateError(_KwargsReduceMixin, PersistenceError):
-    """Internal (0.7): persisted managed-subagent state cannot support a transition.
+    """Internal: persisted managed-subagent state cannot support a transition.
 
-    Raised for a malformed managed wait, a parent without its managed header,
-    a missing or conflicting binding, or a bound child run that is missing or
-    inconsistent. It never recreates or guesses state: the workflow needs
-    resolution. ``reason`` is a stable sub-code; the message carries run ids and
-    codes only, never stored text.
+    It never recreates or guesses state; malformed waits or mismatches are refused.
+    ``reason`` is a stable sub-code; messages carry codes, never stored text.
     """
 
     code = "managed_state_invalid"
@@ -513,6 +510,9 @@ class ManagedStateError(_KwargsReduceMixin, PersistenceError):
             "child_missing",
             "child_mismatch",
             "path_missing",
+            "fanout_limit",
+            "fanout_capability",
+            "fanout_invalid",
         }
     )
 

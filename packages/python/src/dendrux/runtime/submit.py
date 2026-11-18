@@ -1289,7 +1289,7 @@ def _governed_limits(limits: Any) -> dict[str, Any]:
     # overrides remain governed.
     defaults = Limits()
     defaulted_bounds = {"max_pending_calls", "max_rebuild_bytes", "max_rebuild_rows"}
-    defaulted_bounds.update({"max_managed_runs", "max_subagent_definitions"})
+    defaulted_bounds |= {"max_managed_runs", "max_subagent_definitions", "max_parallel_subagents"}
     return {
         key: value
         for key, value in asdict(limits).items()
