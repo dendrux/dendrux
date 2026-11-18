@@ -99,8 +99,8 @@ class StoreCapabilities:
     atomic_completion: bool = False
     recovery: bool = False
     deployment: Literal["single_process", "single_host", "multi_server"] | None = None
-    # Internal (0.7): atomic managed-subagent bind (``bind_managed_child``).
-    managed_subagents: bool = False
+    managed_subagents: bool = False  # Internal (0.7): ``bind_managed_child``.
+    managed_fanout: bool = False  # Internal (0.8): ``bind_managed_children`` (2..32 children).
 
 
 @dataclass(frozen=True)
