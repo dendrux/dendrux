@@ -169,6 +169,15 @@ def _existing_wait_id(
     state = parent.loop_state or {}
     intents = [IntentRow(r.tool_call_id, r.outcome, r.content_digest, ch) for r, (_, ch) in rows]
     calls = tuple(c for c, _ in bindings)
+    # Historical first: a fully resolved batch the checkpoint no longer names reads back as
+    # itself, whatever later batch the parent is waiting on or adopting now.
+    historical = not any(row.outcome == ROW_STARTED for row, _ in rows)
+    if (
+        historical
+        and not _names_any(state, set(calls))
+        and resolved_prefix(intents, bindings, run_id=parent_id) == len(bindings)
+    ):
+        return None
     adoption = fanout_adoption(state, run_id=parent_id)
     if adoption is not None:
         outgoing = state.get(MANAGED_BINDING_KEY) or {}
@@ -185,10 +194,6 @@ def _existing_wait_id(
         wait_id = _parked_at(parent, bindings)
         if wait_id is not None:
             return wait_id
-    elif resolved_prefix(intents, bindings, run_id=parent_id) == len(bindings) and not _names_any(
-        state, set(calls)
-    ):
-        return None
     raise ManagedStateError(reason=_CONFLICT, run_id=parent_id)
 
 

@@ -534,6 +534,35 @@ async def test_fanout_readback_on_a_terminal_parent(dendrux_kit: Kit) -> None:
     assert [b.child_run_id for b in existing.children] == [c.child_run_id for c in request.children]
 
 
+@fanout
+@pytest.mark.parametrize("stage", ["parked", "adopting", "partly_adopted"])
+async def test_fanout_historical_replay_ignores_a_later_batch(dendrux_kit: Kit, stage: str) -> None:
+    """A fully adopted batch reads back as itself while a later batch waits or is adopted."""
+    store = dendrux_kit.store
+    parent, calls = await _parent(dendrux_kit, 4)
+    first = _request(parent, calls[:2])
+    await store.bind_managed_children(first)
+    epoch = await _claim_adoption(store, first)
+    await _complete(store, parent, epoch, calls[0], 10)
+    cleared = {"managed_wait": None, "submission": None, "managed_admitted": None}
+    patch = LoopStatePatch(remove_pending=(calls[1],), set_fields=cleared)
+    await _complete(store, parent, epoch, calls[1], 11, loop_state_patch=patch)
+    later = _request(parent, calls[2:], parent_claim_epoch=epoch)
+    assert (await store.bind_managed_children(later)).outcome == "created"
+    if stage != "parked":
+        later_epoch = await _claim_adoption(store, later)
+        if stage == "partly_adopted":
+            await _complete(store, parent, later_epoch, calls[2], 12)
+    before = await _snapshot(store, parent)
+    for replay in (first, _request(parent, calls[:2])):
+        existing = await store.bind_managed_children(replay)
+        assert (existing.outcome, existing.parent_wait_id) == ("existing", None)
+        assert [(b.child_run_id, b.child_claim) for b in existing.children] == [
+            (c.child_run_id, None) for c in first.children
+        ]
+    assert await _snapshot(store, parent) == before
+
+
 # ---------------------------------------------------------------------------------------------
 # K4, contenders
 # ---------------------------------------------------------------------------------------------
