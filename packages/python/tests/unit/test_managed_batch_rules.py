@@ -305,3 +305,16 @@ def test_fanout_limit_payload_above_one_names_the_limit() -> None:
 def test_result_without_a_decision_is_the_plain_0_7_body() -> None:
     result = _managed_batch._managed_batch_result(_call("a", {"task": "t"}, "p1"))
     assert json.loads(result.payload) == {"error": _managed_batch._MANAGED_BATCH_MESSAGE}
+
+
+@pytest.mark.parametrize("exclusive", [None, [], ["a"], ["ghost"]])
+def test_invalid_subagent_entry_is_refused_before_exclusive_names(exclusive: Any) -> None:
+    with pytest.raises(SubagentDefinitionError) as info:
+        Agent(
+            name="lead",
+            prompt="p",
+            provider=ScriptedLLM([]),
+            subagents=[object()],  # type: ignore[list-item]
+            exclusive_subagents=exclusive,
+        )
+    assert info.value.reason == "not_agent"

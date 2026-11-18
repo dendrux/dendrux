@@ -473,6 +473,7 @@ class Agent:
         prompt: str = ...,
         tools: list[Callable[..., Any]] = ...,
         subagents: Sequence[Agent] | None = ...,
+        exclusive_subagents: Sequence[str] | None = ...,
         tool_sources: list[MCPServer | MCPSource | MCPHost | MCPToolView] | None = ...,
         max_iterations: int = ...,
         max_delegation_depth: int | None = ...,
@@ -664,17 +665,16 @@ class Agent:
         from dendrux.runtime import _subagents
 
         self._subagents: tuple[Agent, ...] = _subagents.normalize_subagents(self.name, subagents)
-        self._exclusive_subagents = _subagents.normalize_exclusive(self, exclusive)
-        if not self._subagents:
-            return
-        from dendrux.loops.single import SingleCall
+        if self._subagents:
+            from dendrux.loops.single import SingleCall
 
-        if isinstance(self._loop, SingleCall):
-            _subagents.refuse(
-                _subagents.SubagentDefinitionError(self.name, reason="single_call_parent")
-            )
-        _managed_budget.validate_definitions(self, agent_type=Agent)
-        _subagents.warn_fanout(self)
+            if isinstance(self._loop, SingleCall):
+                _subagents.refuse(
+                    _subagents.SubagentDefinitionError(self.name, reason="single_call_parent")
+                )
+            _managed_budget.validate_definitions(self, agent_type=Agent)
+            _subagents.warn_fanout(self)
+        self._exclusive_subagents = _subagents.normalize_exclusive(self, exclusive)
 
     def _configure_persistence(
         self,
