@@ -81,7 +81,7 @@ def test_third_party_fanout_store_passes_the_fanout_contracts(pytester: Pytester
     result = run_slice(pytester, THIRD_PARTY, "test_managed_fanout")
     text = result.stdout.str()
     assert failed_functions(result) == set(), text[-3000:]
-    result.assert_outcomes(passed=43)
+    result.assert_outcomes(passed=47)
     assert "ThirdPartyStore" in text and "managed_fanout" in text.split("capabilities=")[1]
 
 
