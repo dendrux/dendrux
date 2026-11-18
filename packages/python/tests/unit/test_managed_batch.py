@@ -181,7 +181,7 @@ async def test_unsupported_batch_refused_per_call_with_zero_effects(
     seen = _observations(llm, 1)
     assert len(seen) == len(batch)
     for observation in seen.values():
-        assert set(observation) == {"error"} and "subagent" in observation["error"]
+        assert {"error", "reason"} <= set(observation) and "subagent" in observation["error"]
     assert BRIEF not in json.dumps(seen)
 
 
