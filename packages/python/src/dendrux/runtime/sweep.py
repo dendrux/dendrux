@@ -36,6 +36,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from dendrux import _codes
+from dendrux._lifecycle import PAUSE_STATUS_VALUES
 from dendrux.runtime._bounds import (
     SWEEP_BATCH_DEFAULT,
     SWEEP_BATCH_MAX,
@@ -52,7 +53,8 @@ from dendrux.runtime.state import SweepResult, _validate_sweep_age
 if TYPE_CHECKING:
     from datetime import timedelta
 
-    from dendrux.runtime.state import StateStore, SweptRun
+    from dendrux.runtime.state import ReclaimableRun, StateStore, SweptRun
+    from dendrux.runtime.stores.sql._sql_sweep import _SqlSweep
 
 
 _CURSOR_PREFIX = "sweep:v1:"
@@ -94,8 +96,6 @@ class _SweepCursor:
 
 
 def _waiting_position(value: Any) -> tuple[str, datetime, str] | None:
-    from dendrux._lifecycle import PAUSE_STATUS_VALUES
-
     if value is None:
         return None
     status, age, run_id = value
@@ -106,25 +106,131 @@ def _waiting_position(value: Any) -> tuple[str, datetime, str] | None:
 
 
 async def _sweep_waiting(
-    store: StateStore, threshold: timedelta | None, limits: dict[str, int], progress: _SweepCursor
+    store: StateStore,
+    threshold: timedelta | None,
+    limits: dict[str, int],
+    progress: _SweepCursor,
+    *,
+    adoptable_after: timedelta | None = None,
+    adoptable: list[str] | None = None,
 ) -> list[SweptRun]:
-    if threshold is None:
-        progress.waiting_done = True
-        return []
+    result, progress.waiting = await _waiting_page(
+        store,
+        threshold,
+        limits,
+        progress,
+        adoptable_after=adoptable_after,
+        adoptable=adoptable,
+    )
+    progress.waiting_done = progress.waiting is None
+    return result
+
+
+async def _waiting_page(
+    store: StateStore,
+    threshold: timedelta | None,
+    limits: dict[str, int],
+    progress: _SweepCursor,
+    *,
+    adoptable_after: timedelta | None,
+    adoptable: list[str] | None,
+) -> tuple[list[SweptRun], tuple[str, datetime, str] | None]:
+    if threshold is None and adoptable_after is None:
+        return [], None
     scan = getattr(store, "_scan_abandoned_runs", None)
     if getattr(store, "_uses_waiting_sweep_cursor", False) is True and callable(scan):
         if progress.waiting_done:
-            return []
-        result, progress.waiting = await scan(
+            return [], None
+        if adoptable_after is not None:
+            return await _native_adoption_page(
+                store, threshold, limits, progress, adoptable_after, adoptable
+            )
+        page = await scan(
             threshold,
             batch_size=limits.get("batch_size", SWEEP_BATCH_DEFAULT),
             max_runs=limits.get("max_runs", SWEEP_MAX_RUNS_DEFAULT),
             cursor=progress.waiting,
         )
-        progress.waiting_done = progress.waiting is None
-        return cast("list[SweptRun]", result)
-    progress.waiting_done = True
-    return await store.sweep_abandoned_runs(older_than=threshold, **limits)
+        # The native scan returns the same typed page as its SQL implementation.
+        return cast("tuple[list[SweptRun], tuple[str, datetime, str] | None]", page)
+    if adoptable_after is not None:
+        _codes.log_code(logging.getLogger(__name__), _codes.STORE_CAPABILITY, run_id=None)
+        raise NotImplementedError("adoptable_after requires the native SQL waiting scan")
+    # The no-age call returned above; adoption-only custom stores have just refused.
+    result = await store.sweep_abandoned_runs(older_than=cast("timedelta", threshold), **limits)
+    return result, None
+
+
+async def _native_adoption_page(
+    store: StateStore,
+    threshold: timedelta | None,
+    limits: dict[str, int],
+    progress: _SweepCursor,
+    adoptable_after: timedelta,
+    adoptable: list[str] | None,
+) -> tuple[list[SweptRun], tuple[str, datetime, str] | None]:
+    # Optional database extra: only native SQL adoption listing loads this module.
+    from dendrux.runtime.stores.sql._sql_sweep import _collect_runs
+
+    # The native scan marker guarantees the SQL collector's hosting interface.
+    native = cast("_SqlSweep", store)
+    return cast(
+        "tuple[list[SweptRun], tuple[str, datetime, str] | None]",
+        await _collect_runs(
+            native,
+            threshold,
+            waiting=True,
+            batch_size=limits.get("batch_size", SWEEP_BATCH_DEFAULT),
+            max_runs=limits.get("max_runs", SWEEP_MAX_RUNS_DEFAULT),
+            cursor=progress.waiting,
+            adoptable_after=adoptable_after,
+            adoptable=adoptable,
+        ),
+    )
+
+
+async def _sweep_running(
+    store: StateStore,
+    threshold: timedelta | None,
+    progress: _SweepCursor,
+    *,
+    batch_size: int,
+    max_runs: int,
+    max_returned: int,
+    max_reclaims: int,
+    on_stale: Literal["error", "reclaim"],
+    limits: dict[str, int],
+) -> tuple[list[SweptRun], list[ReclaimableRun], str | None]:
+    stale: list[SweptRun] = []
+    reclaimable: list[ReclaimableRun] = []
+    next_cursor = None
+    if threshold is not None and not progress.running_done:
+        combined_scan = getattr(store, "_scan_expired_runs", None)
+        if getattr(store, "_uses_combined_sweep", False) is True and callable(combined_scan):
+            page = await combined_scan(
+                cutoff=datetime.now(UTC) - threshold,
+                batch_size=batch_size,
+                max_runs=max_runs,
+                max_returned=max_returned,
+                reclaim_limit=max_reclaims,
+                cursor=progress.running,
+                on_stale=on_stale,
+            )
+            stale, reclaimable, next_cursor = page.finalised, page.reclaimable, page.cursor
+        elif on_stale == "reclaim":
+            page = await store.mark_lease_expired(
+                cutoff=datetime.now(UTC) - threshold,
+                batch_size=batch_size,
+                max_runs=max_runs,
+                max_returned=max_returned,
+                reclaim_limit=max_reclaims,
+                cursor=progress.running,
+                finalise_unrecoverable=True,
+            )
+            stale, reclaimable, next_cursor = page.finalised, page.reclaimable, page.cursor
+        else:
+            stale = await store.sweep_stale_runs(older_than=threshold, **limits)
+    return stale, reclaimable, next_cursor
 
 
 async def sweep(
@@ -133,6 +239,7 @@ async def sweep(
     state_store: StateStore | None = None,
     stale_running: timedelta | None = None,
     abandoned_waiting: timedelta | None = None,
+    adoptable_after: timedelta | None = None,
     batch_size: int = SWEEP_BATCH_DEFAULT,
     max_runs: int = SWEEP_MAX_RUNS_DEFAULT,
     database_options: dict[str, Any] | None = None,
@@ -143,8 +250,7 @@ async def sweep(
 ) -> SweepResult:
     """Sweep stale and abandoned runs. Developer calls this at app startup.
 
-    Detects stale RUNNING rows and abandoned WAITING rows, emits lifecycle
-    events, and reports finalisations and runs marked for explicit recovery.
+    Reports finalisations, reclaimable runs and roots ready for managed adoption.
 
     Args:
         database_url: Database URL. Creates a temporary engine, disposed
@@ -163,7 +269,11 @@ async def sweep(
             are older than this duration. The updated_at check protects pauses
             written by older workers; recent metadata edits delay abandonment.
             If None, no abandoned-waiting sweep is performed.
-
+        adoptable_after: With native SQL stores, list roots whose managed waits
+            are older than this non-negative timedelta and whose children are
+            terminal. Works without abandoned_waiting; never adopts or finalises
+            a run using this age. Dispatch each returned root to Agent.reclaim().
+            Custom stores without the native waiting scan refuse this option.
         batch_size: Candidate rows per projected page (default 100, maximum 1000).
         max_runs: Candidates inspected per category (default 10,000, maximum
             100,000), using the same integer bound for running and waiting.
@@ -198,10 +308,15 @@ async def sweep(
         ValueError: If both or neither of database_url/state_store provided.
     """
     _validate_source(database_url, state_store, database_options)
-    _validate_thresholds(stale_running, abandoned_waiting)
+    _validate_thresholds(stale_running, abandoned_waiting, adoptable_after)
     if on_stale is None:
         on_stale = "reclaim"
-    if stale_running is None and abandoned_waiting is None and on_stale != "reclaim":
+    if (
+        stale_running is None
+        and abandoned_waiting is None
+        and adoptable_after is None
+        and on_stale != "reclaim"
+    ):
         return SweepResult(stale_running=[])
 
     if on_stale not in ("error", "reclaim"):
@@ -240,45 +355,36 @@ async def sweep(
                     f"StateStore {type(store).__name__} does not declare the 'recovery' "
                     'capability; pass on_stale="error" to finalise stale runs without it'
                 )
-            reclaimable = []
-            next_cursor = None
-            stale = []
-            if stale_running is not None and not progress.running_done:
-                combined_scan = getattr(store, "_scan_expired_runs", None)
-                if getattr(store, "_uses_combined_sweep", False) is True and callable(
-                    combined_scan
-                ):
-                    page = await combined_scan(
-                        cutoff=datetime.now(UTC) - stale_running,
-                        batch_size=batch_size,
-                        max_runs=max_runs,
-                        max_returned=max_returned,
-                        reclaim_limit=max_reclaims,
-                        cursor=progress.running,
-                        on_stale=on_stale,
-                    )
-                    stale, reclaimable, next_cursor = page.finalised, page.reclaimable, page.cursor
-                elif on_stale == "reclaim":
-                    page = await store.mark_lease_expired(
-                        cutoff=datetime.now(UTC) - stale_running,
-                        batch_size=batch_size,
-                        max_runs=max_runs,
-                        max_returned=max_returned,
-                        reclaim_limit=max_reclaims,
-                        cursor=progress.running,
-                        finalise_unrecoverable=True,
-                    )
-                    stale, reclaimable, next_cursor = page.finalised, page.reclaimable, page.cursor
-                else:
-                    stale = await store.sweep_stale_runs(older_than=stale_running, **limits)
+            stale, reclaimable, next_cursor = await _sweep_running(
+                store,
+                stale_running,
+                progress,
+                batch_size=batch_size,
+                max_runs=max_runs,
+                max_returned=max_returned,
+                max_reclaims=max_reclaims,
+                on_stale=on_stale,
+                limits=limits,
+            )
             progress.running = next_cursor
             progress.running_done = next_cursor is None
-            abandoned = await _sweep_waiting(store, abandoned_waiting, limits, progress)
+            adoptable: list[str] = []
+            abandoned = await _sweep_waiting(
+                store,
+                abandoned_waiting,
+                limits,
+                progress,
+                adoptable_after=adoptable_after,
+                adoptable=adoptable,
+            )
             return SweepResult(
                 stale_running=stale,
                 abandoned_waiting=abandoned,
                 reclaimable=reclaimable,
-                cursor=progress.encode(with_waiting=abandoned_waiting is not None),
+                cursor=progress.encode(
+                    with_waiting=abandoned_waiting is not None or adoptable_after is not None
+                ),
+                adoptable=adoptable,
             )
         finally:
             if engine is not None:

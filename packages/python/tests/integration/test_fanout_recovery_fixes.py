@@ -604,3 +604,121 @@ async def test_public_continuation_frame_is_configured_before_preparation_return
         assert observed == [not streaming]
     finally:
         await root.close()
+
+
+@pytest.mark.parametrize("abandon", [None, timedelta(hours=1)])
+async def test_public_sweep_lists_adoptable_with_bounded_cursor(store, engine, abandon):
+    from dendrux import sweep
+
+    root = lead()
+    waits = [await parked(store, root, [Child(), Child()]) for _ in range(3)]
+    old = datetime.now(UTC) - timedelta(hours=2)
+    async with engine.begin() as conn:
+        await conn.execute(update(AgentRun).values(status_changed_at=old, updated_at=old))
+    before = [await store.get_run(wait.run_id) for wait in waits]
+    cursor, found = None, []
+    for _ in range(5):
+        result = await sweep(
+            state_store=store,
+            adoptable_after=timedelta(hours=1),
+            abandoned_waiting=abandon,
+            batch_size=1,
+            max_runs=1,
+            cursor=cursor,
+        )
+        assert not result.abandoned_waiting and len(result.adoptable) <= 1
+        found.extend(result.adoptable)
+        cursor = result.cursor
+        if cursor is None:
+            break
+    assert cursor is None and sorted(found) == sorted(wait.run_id for wait in waits)
+    assert [await store.get_run(wait.run_id) for wait in waits] == before
+    await root.close()
+
+
+@pytest.mark.parametrize("age", [-1, 0, "old", timedelta(microseconds=-1)])
+async def test_public_sweep_validates_adoption_age_before_queries(store, engine, age):
+    from dendrux import sweep
+
+    statements = []
+
+    def record(*args):
+        statements.append(args[2])
+
+    event.listen(engine.sync_engine, "before_cursor_execute", record)
+    try:
+        with pytest.raises(ValueError):
+            await sweep(state_store=store, adoptable_after=age)
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", record)
+    assert statements == []
+
+
+def test_adoptable_result_lists_are_instance_owned(engine):
+    from dendrux.runtime.state import SweepResult
+
+    first, second = SweepResult([]), SweepResult([])
+    first.adoptable.append("root")
+    assert second.adoptable == []
+
+
+async def test_public_sweep_lists_nested_root_once_without_abandoning(store, engine):
+    from dendrux import sweep
+    from tests.integration.test_fanout_store_races import batch, fanout_parent, nest
+
+    root, calls = await fanout_parent(store, 2)
+    first = batch(root, calls)
+    await store.bind_managed_children(first)
+    for branch in first.children:
+        parent = branch.child_run_id
+        nested = batch(parent, await nest(store, parent, 2), root=root, path=("reviewer",))
+        await store.bind_managed_children(nested)
+        for child in nested.children:
+            await store.finalize_run(child.child_run_id, status="success", claim_epoch=0)
+    async with engine.begin() as conn:
+        await conn.execute(
+            update(AgentRun).values(status_changed_at=datetime.now(UTC) - timedelta(hours=2))
+        )
+    result = await sweep(state_store=store, adoptable_after=timedelta(0))
+    assert result.adoptable == [root] and result.cursor is None
+    assert not result.abandoned_waiting
+    assert (await store.get_run(parent)).status == "paused"
+
+
+async def test_custom_sweep_refuses_adoption_listing_without_changing_legacy_calls(engine):
+    from dendrux import sweep
+
+    class Custom:
+        async def sweep_abandoned_runs(self, *, older_than):
+            assert older_than == timedelta(hours=1)
+            return []
+
+    custom = Custom()
+    result = await sweep(state_store=custom, on_stale="error", abandoned_waiting=timedelta(hours=1))
+    assert result.adoptable == []
+    with pytest.raises(NotImplementedError):
+        await sweep(state_store=custom, on_stale="error", adoptable_after=timedelta(0))
+
+
+async def test_public_sweep_does_not_restart_a_completed_waiting_category(store):
+    from dendrux import sweep
+
+    for _ in range(3):
+        await store.create_run(generate_ulid(), "lead", tenant_id=TENANT)
+    cursor, swept = None, []
+    for _ in range(5):
+        result = await sweep(
+            state_store=store,
+            stale_running=timedelta(0),
+            abandoned_waiting=timedelta(hours=1),
+            on_stale="error",
+            max_runs=1,
+            batch_size=1,
+            cursor=cursor,
+        )
+        swept.extend(result.stale_running)
+        assert result.abandoned_waiting == []
+        cursor = result.cursor
+        if cursor is None:
+            break
+    assert cursor is None and len(swept) == 3
