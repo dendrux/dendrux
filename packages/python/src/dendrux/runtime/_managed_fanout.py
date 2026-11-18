@@ -824,7 +824,7 @@ async def _reconnect_leaf(
     except (RunAlreadyActiveError, RunFencedError, RunNotReclaimableError) as exc:
         if not fanout_tree or (
             isinstance(exc, RunNotReclaimableError)
-            and exc.reason not in {"lease_fresh", "not_running"}
+            and exc.reason not in {"lease_fresh", "not_running", "already_reclaimed"}
         ):
             raise
         if await scoped_run(store, node.run_id, tenant_id) is None:
@@ -863,6 +863,7 @@ async def _reconnect_children(
 
 
 def _raise_reconnect_error(tasks: Sequence[asyncio.Task[RunResult | Exception]]) -> None:
+    # A child's own cancellation propagates after the join, even in an uncancelled caller.
     for task in tasks:
         if task.cancelled():
             task.result()

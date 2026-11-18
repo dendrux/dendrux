@@ -205,8 +205,40 @@ def _managed_handoff(
 
 
 def _handed_off(found: _ManagedPending | None, held: list[ToolCall]) -> bool:
-    """Every surviving managed call is held and ready for the durable bind."""
-    return found is not None and [tc.id for tc in held] == [tc.id for tc in found.ordered]
+    """A nonempty admitted subset retains the captured managed call order."""
+    return (
+        found is not None
+        and bool(held)
+        and _ordered_subset(found.call_ids, [call.id for call in held])
+    )
+
+
+def _ordered_subset(order: Sequence[str], subset: Sequence[str]) -> bool:
+    remaining = iter(order)
+    return all(any(candidate == call_id for candidate in remaining) for call_id in subset)
+
+
+def _pending_managed_ids(entries: Any, run_id: str) -> set[str]:
+    if not isinstance(entries, list):
+        raise ManagedStateError(reason="binding_conflict", run_id=run_id)
+    pending: set[str] = set()
+    seen: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ManagedStateError(reason="binding_conflict", run_id=run_id)
+        call_id, phase = entry.get("call_id"), entry.get("phase")
+        if (
+            not isinstance(call_id, str)
+            or not call_id
+            or call_id in seen
+            or not isinstance(phase, str)
+            or phase not in {"client", "gated", "dispatchable", "approved", "rejected", "invalid"}
+        ):
+            raise ManagedStateError(reason="binding_conflict", run_id=run_id)
+        seen.add(call_id)
+        if phase not in {"rejected", "invalid"}:
+            pending.add(call_id)
+    return pending
 
 
 def _surviving_managed(
@@ -214,17 +246,16 @@ def _surviving_managed(
 ) -> _ManagedPending | None:
     if found is None:
         return None
-    pending = {
-        item["call_id"]
-        for item in state.get("pending", [])
-        if item.get("phase") not in {"rejected", "invalid"}
-    }
+    pending = _pending_managed_ids(state.get("pending", []), run_id)
     calls = [call for call in found.ordered if call.id in pending]
     if not calls:
         return None
     admitted = state.get("managed_admitted")
     if isinstance(admitted, list):
-        admitted = [call_id for call_id in admitted if call_id in pending]
+        ids = [call.id for call in calls]
+        if not _ordered_subset(found.call_ids, admitted) or not _ordered_subset(admitted, ids):
+            raise ManagedStateError(reason="binding_conflict", run_id=run_id)
+        admitted = ids
     return _ManagedPending.from_calls(calls, admitted=admitted, run_id=run_id)
 
 
