@@ -249,16 +249,6 @@ class _ToolCallOutcome(NamedTuple):
 # --- Managed subagents (0.7) -------------------------------------------------
 
 
-async def _refuse_managed_batch(calls: Sequence[ToolCall], batch: _ToolBatch) -> None:
-    """Answer every call of an unsupported batch before any hook, approval or effect."""
-    _codes.log_code(logger, _codes.MANAGED_BATCH_UNSUPPORTED, run_id=batch.run_id, count=len(calls))
-    mark = getattr(batch.recorder, "mark_managed_refusal", None)
-    if mark is not None:
-        await mark([tc.id for tc in calls])  # durable for the whole batch, before any refusal
-    for tc in calls:
-        await batch.reject(tc, _managed_batch._managed_batch_result(tc))
-
-
 def managed_tool_defs(lookups: ToolLookups) -> list[ToolDef]:
     """The generated subagent tool definitions in ``lookups`` (offered to the model)."""
     return [lookups.defs[name] for name, fn in lookups.fn.items() if isinstance(fn, SubagentTool)]
@@ -1276,6 +1266,7 @@ async def _process_tool_calls(
     before_tool: BeforeToolHook | None = None,
     tenant_id: str | None = None,
     image_runtime: ImageRuntime | None = None,
+    batch_policy: _managed_batch.BatchPolicy | None = None,
 ) -> _ToolCallOutcome:
     """Execute tool calls: enforce limits, run server tools, update history.
 
@@ -1298,8 +1289,11 @@ async def _process_tool_calls(
         warnings=warnings,
     )
     all_calls = step.meta.get("all_tool_calls", [step.action])
-    if _managed_batch._managed_batch_unsupported(all_calls, lookups):
-        await _refuse_managed_batch(all_calls, batch)
+    decision = _managed_batch.classify_batch(all_calls, lookups, batch_policy)
+    if decision.action == "refuse":
+        await _managed_batch.refuse_managed_batch(
+            all_calls, batch, decision, batch_policy or _managed_batch.BatchPolicy()
+        )
         return _ToolCallOutcome(all_results=batch.all_results, pending_calls=[])
     calls, gates = await _prepare_tool_calls(
         all_calls,
@@ -2198,6 +2192,8 @@ async def _run_tool_step(
         before_tool=ctx.before_tool,
         tenant_id=ctx.hook_tenant_id,
         image_runtime=ctx.image_runtime,
+        # T4b wires the store capability together with the driver.
+        batch_policy=_managed_batch.batch_policy(ctx.agent, fanout_capable=False),
     )
     return outcome, tool_history_start
 
