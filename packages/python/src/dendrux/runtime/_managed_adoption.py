@@ -1,10 +1,11 @@
-"""Managed subagents: turning one terminal child's saved outcome into its parent's report.
+"""Managed subagents: turning terminal children's saved outcomes into their parent's reports.
 
 The parent admits a child's outcome as it admits any tool result: the report
 is built from the saved terminal record (codes and counts only on failure),
 passed through the parent's ``tool_result_transform``, size-checked and then
-projected through the parent's guardrails. The claim and the completion
-transaction that make the report durable stay in :mod:`dendrux.runtime._managed`.
+projected through the parent's guardrails. For one child (0.7) the claim and
+completion stay in :mod:`dendrux.runtime._managed`; for a fan-out wait (0.8)
+this module claims first and then completes each call in call order.
 """
 
 from __future__ import annotations
