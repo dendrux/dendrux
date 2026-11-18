@@ -137,6 +137,10 @@ class BatchPolicy:
     fanout_capable: bool = False
 
 
+DEFAULT_POLICY = BatchPolicy()
+"""The 0.7 rules: no exclusive subagents, one managed call per turn."""
+
+
 def batch_policy(agent: Agent, *, fanout_capable: bool) -> BatchPolicy:
     return BatchPolicy(
         exclusive=agent._exclusive_subagents,
@@ -146,10 +150,9 @@ def batch_policy(agent: Agent, *, fanout_capable: bool) -> BatchPolicy:
 
 
 def classify_batch(
-    calls: Sequence[ToolCall], lookups: ToolLookups, policy: BatchPolicy | None = None
+    calls: Sequence[ToolCall], lookups: ToolLookups, policy: BatchPolicy = DEFAULT_POLICY
 ) -> BatchDecision:
     """The decision for an emitted batch under ``policy`` (default: the 0.7 rules)."""
-    policy = policy or BatchPolicy()
     managed = [tc.name for tc in calls if _is_managed(tc.name, lookups)]
     client = sum(
         1

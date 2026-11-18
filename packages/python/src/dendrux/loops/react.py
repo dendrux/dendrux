@@ -249,6 +249,9 @@ class _ToolCallOutcome(NamedTuple):
 # --- Managed subagents (0.7) -------------------------------------------------
 
 
+_refuse_managed_batch = _managed_batch.refuse_managed_batch  # patch seam for recovery tests
+
+
 def managed_tool_defs(lookups: ToolLookups) -> list[ToolDef]:
     """The generated subagent tool definitions in ``lookups`` (offered to the model)."""
     return [lookups.defs[name] for name, fn in lookups.fn.items() if isinstance(fn, SubagentTool)]
@@ -1266,7 +1269,7 @@ async def _process_tool_calls(
     before_tool: BeforeToolHook | None = None,
     tenant_id: str | None = None,
     image_runtime: ImageRuntime | None = None,
-    batch_policy: _managed_batch.BatchPolicy | None = None,
+    batch_policy: _managed_batch.BatchPolicy = _managed_batch.DEFAULT_POLICY,
 ) -> _ToolCallOutcome:
     """Execute tool calls: enforce limits, run server tools, update history.
 
@@ -1291,9 +1294,7 @@ async def _process_tool_calls(
     all_calls = step.meta.get("all_tool_calls", [step.action])
     decision = _managed_batch.classify_batch(all_calls, lookups, batch_policy)
     if decision.action == "refuse":
-        await _managed_batch.refuse_managed_batch(
-            all_calls, batch, decision, batch_policy or _managed_batch.BatchPolicy()
-        )
+        await _refuse_managed_batch(all_calls, batch, decision, batch_policy)
         return _ToolCallOutcome(all_results=batch.all_results, pending_calls=[])
     calls, gates = await _prepare_tool_calls(
         all_calls,
