@@ -75,7 +75,8 @@ class CrashError(Exception):
 
 @dataclass(frozen=True)
 class Child:
-    """How one bound child ends: its terminal status, answer and saved checkpoint extras."""
+    """How one bound child ends: its terminal status (``running``: left unfinished), its answer
+    and saved checkpoint extras."""
 
     answer: str | None = "ok"
     status: str = RunStatus.SUCCESS.value
@@ -230,6 +231,8 @@ async def parked(store: Any, root: Agent, children: list[Child]) -> Fanout:
     )
     assert (await store.bind_managed_children(request)).outcome == "created"
     for child_id, child in zip(child_ids, children, strict=True):
+        if child.status == RunStatus.RUNNING.value:
+            continue  # left running for the test to finish
         assert await store.finalize_run(
             child_id,
             status=child.status,
@@ -688,3 +691,76 @@ async def test_adoption_needs_the_v4_marker_in_the_claim(store: Any, engine: Any
         await adopt_fanout(store, node_of(fanout, root), claim)
     assert refused.value.reason == "binding_conflict"
     assert [r.outcome for r in await intents(engine, fanout.run_id, fanout)] == ["started"] * 2
+
+
+# ---------------------------------------------------------------------------
+# The claim's stored JSON on the real store (both forms), and nothing but ids
+# ---------------------------------------------------------------------------
+
+
+async def test_real_store_keeps_the_claim_json_exactly(
+    store: Any, engine: Any, monkeypatch: Any
+) -> None:
+    secret = "SENTINEL-report-7c1e"
+    fanout = await parked(store, lead(), [Child(secret), Child(secret), Child(secret)])
+    ids = [c.id for c in fanout.calls]
+    with monkeypatch.context() as patch:
+        crash_on_completion(patch, store, 1)  # the claim committed; no completion did
+        with pytest.raises(CrashError):
+            await adopt_settled(store, node_of(fanout, lead()))
+    row = await parent_row(engine, fanout.run_id)
+    descriptor = row.loop_state["submission"]
+    assert descriptor == {
+        "submission_id": descriptor["submission_id"],
+        "kind": "tool_results",
+        "pause_id": fanout.pause_id,
+        "payload_ref": {"pause_data_key": "submission"},
+        "call_ids": ids,
+        "reserved_order_index": 2,
+        "managed_fanout_adoption": {"v": 1},
+    }
+    assert row.pause_data["submission"] == {
+        "submission_id": descriptor["submission_id"],
+        "kind": "tool_results",
+        "pause_id": fanout.pause_id,
+        "call_ids": ids,
+        "payload": {"managed_fanout_adoption": {"v": 1, "calls": ids}},
+    }
+    # Call order lives in lists (JSONB may reorder object keys, never list items).
+    assert [b["tool_call_id"] for b in row.pause_data["managed_fanout"]["bindings"]] == ids
+    assert secret not in json.dumps([row.pause_data, row.loop_state])
+    assert (row.status, row.claim_epoch) == (RunStatus.RUNNING.value, 2)
+    assert [r.outcome for r in await intents(engine, fanout.run_id, fanout)] == ["started"] * 3
+
+
+# ---------------------------------------------------------------------------
+# Cost: a fixed claim plus a constant per call (no N+1), counted per dialect
+# ---------------------------------------------------------------------------
+
+
+async def test_adoption_statements_are_a_constant_per_call(store: Any, engine: Any) -> None:
+    from sqlalchemy import event
+
+    from dendrux.guardrails import PII
+
+    root = lead(guardrails=[PII(action="redact")])
+    totals: dict[int, int] = {}
+    for n in (2, 3, 4, 8):
+        fanout = await parked(store, root, [Child(f"report {i}") for i in range(n)])
+        seen = {"n": 0}
+
+        def count(*_: Any, seen: dict[str, int] = seen) -> None:
+            seen["n"] += 1
+
+        event.listen(engine.sync_engine, "before_cursor_execute", count)
+        try:
+            assert await adopt_settled(store, node_of(fanout, root)) is not None
+        finally:
+            event.remove(engine.sync_engine, "before_cursor_execute", count)
+        totals[n] = seen["n"]
+    per_call = totals[3] - totals[2]
+    assert [totals[n] - totals[2] for n in (3, 4, 8)] == [per_call, 2 * per_call, 6 * per_call]
+    # Measured: SQLite 9 + 9N, Postgres 9 + 7N (cancel check, three admission reads and the
+    # claim transaction; one intent read; per call two child reads, one mapping read and
+    # one completion transaction).
+    assert per_call <= 9 and totals[2] - 2 * per_call <= 9, totals
