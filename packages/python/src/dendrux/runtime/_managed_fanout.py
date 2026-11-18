@@ -32,6 +32,7 @@ from dendrux.runtime import (
     _managed_budget,
     _managed_cancel,
     _managed_fanout_store,
+    _managed_route,
     _reclaim,
     _run_events,
     _run_execute,
@@ -45,7 +46,7 @@ from dendrux.runtime._managed_definitions import require_bindable, require_claim
 from dendrux.runtime._managed_route import _Waiting
 from dendrux.runtime._managed_tree import BranchSpec, FanoutInvocation, LeafNode, WaitNode
 from dendrux.runtime._run_entry import PreparedChild, prepare_child_creation
-from dendrux.runtime._run_pending import _build_cached_result
+from dendrux.runtime._run_pending import _build_cached_result, _PendingReader, attach_facing
 from dendrux.runtime.durability import _fanout_ownership_handoff
 from dendrux.runtime.state import (
     ClaimResult,
@@ -755,6 +756,23 @@ def _fanout_wait(
     )
 
 
+async def reconnect_tree(
+    root_agent: Agent,
+    store: StateStore,
+    root_run_id: str,
+    *,
+    tenant_id: TenantScope,
+    notifier: LoopNotifier | None,
+) -> RunResult:
+    """Validate and reconnect a fan-out workflow, then read its root-facing pending view."""
+    tree = await _managed_route.route_tree(root_agent, store, root_run_id, tenant_id=tenant_id)
+    result = await drive_node(
+        store, tree.root, tenant_id=tree.tenant_id, fanout_tree=True, notifier=notifier
+    )
+    await attach_facing(result, _PendingReader(store), root_run_id, tree.tenant_id)
+    return result
+
+
 async def drive_node(
     store: StateStore,
     node: WaitNode | LeafNode,
@@ -777,8 +795,18 @@ async def drive_node(
         return await _build_cached_result(store, node.run_id)
     if isinstance(node, LeafNode) or record.status != RunStatus.PAUSED.value:
         return await _reconnect_leaf(store, node, record.status, tenant_id, fanout_tree, notifier)
-    await _reconnect_children(store, node, fanout_tree=fanout_tree, notifier=notifier)
+    return await _reconnect_wait(store, node, fanout_tree=fanout_tree, notifier=notifier)
+
+
+async def _reconnect_wait(
+    store: StateStore, node: WaitNode, *, fanout_tree: bool, notifier: LoopNotifier | None
+) -> RunResult:
+    joined_terminal = await _reconnect_children(
+        store, node, fanout_tree=fanout_tree, notifier=notifier
+    )
     if node.version == 4:
+        if not joined_terminal and not await _reconnect_terminal_children(store, node):
+            return await _build_cached_result(store, node.run_id)
         claim = await settle_parent(store, node)
         if claim is None:
             return await _build_cached_result(store, node.run_id)
@@ -792,6 +820,17 @@ async def drive_node(
         )
         result = await _managed.adopt(waiting, store=store, notifier=notifier)
     return await _managed.drive(result, notifier=notifier)
+
+
+async def _reconnect_terminal_children(store: StateStore, node: WaitNode) -> bool:
+    # A validated v4 wait supplies this optional reader; re-read after joining owners.
+    ids = [binding.child_run_id for binding in node.bindings]
+    rows = await cast("_managed_fanout_store.ManagedFanoutStore", store).get_managed_children(
+        node.run_id, ids, tenant_id=node.tenant_id
+    )
+    if len(rows) != len(ids) or {row.run_id for row in rows} != set(ids):
+        raise ManagedStateError(reason="child_missing", run_id=node.run_id)
+    return all(row.status in _TERMINAL for row in rows)
 
 
 async def _reconnect_leaf(
@@ -835,7 +874,7 @@ async def _reconnect_leaf(
 
 async def _reconnect_children(
     store: StateStore, node: WaitNode, *, fanout_tree: bool, notifier: LoopNotifier | None
-) -> None:
+) -> bool:
     tasks: list[asyncio.Task[RunResult | Exception]] = []
     cancellation = None
     try:
@@ -860,6 +899,14 @@ async def _reconnect_children(
         if cleanup_cancel is not None:
             raise cleanup_cancel
     _raise_reconnect_error(tasks)
+    return _reconnected_terminal(tasks)
+
+
+def _reconnected_terminal(tasks: Sequence[asyncio.Task[RunResult | Exception]]) -> bool:
+    results = [task.result() for task in tasks]
+    return all(
+        isinstance(result, RunResult) and result.status.value in _TERMINAL for result in results
+    )
 
 
 def _raise_reconnect_error(tasks: Sequence[asyncio.Task[RunResult | Exception]]) -> None:

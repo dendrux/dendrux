@@ -29,6 +29,7 @@ from dendrux.types import (
     PauseState,
     Role,
     RunAlreadyActiveError,
+    RunResult,
     RunStatus,
     ToolCall,
     UsageStats,
@@ -722,3 +723,193 @@ async def test_public_sweep_does_not_restart_a_completed_waiting_category(store)
         if cursor is None:
             break
     assert cursor is None and len(swept) == 3
+
+
+@pytest.mark.parametrize("live", [False, True])
+async def test_public_reclaim_reconnects_fanout_instead_of_returning_private_wait(store, live):
+    root = lead(state_store=store, llm=ScriptedLLM([LLMResponse(text="done")]))
+    fanout = await parked(store, root, [Child(status="running") if live else Child(), Child()])
+    before = await store.get_run(fanout.child_ids[1])
+    result = await root.reclaim(fanout.run_id, tenant_id=TENANT)
+    assert result.run_id == fanout.run_id
+    assert result.status == (RunStatus.RUNNING if live else RunStatus.SUCCESS)
+    assert result.pending is None and result.pendings == () and result.pause_id is None
+    assert root.provider.calls == int(not live)
+    assert root.subagents[0].provider.calls == 0
+    assert await store.get_run(fanout.child_ids[1]) == before
+    rows = await store.get_tool_calls(fanout.run_id, iteration_index=1)
+    assert all(row.outcome == ("started" if live else "completed") for row in rows)
+    await root.close()
+
+
+async def test_public_reconnect_joins_created_owner_when_next_task_creation_fails(
+    store, monkeypatch
+):
+    import inspect
+
+    root = lead(state_store=store)
+    fanout = await parked(store, root, [Child(), Child()])
+    before = [await store.get_run(run_id) for run_id in fanout.child_ids]
+    original = asyncio.create_task
+    owners, failed = [], []
+    failure = RuntimeError("task creation failed")
+
+    def create(operation, **kwargs):
+        if operation.cr_code.co_name == "_reconnect_branch":
+            if owners:
+                failed.append(operation)
+                raise failure
+            task = original(operation, **kwargs)
+            owners.append(task)
+            return task
+        return original(operation, **kwargs)
+
+    monkeypatch.setattr(asyncio, "create_task", create)
+    with pytest.raises(RuntimeError) as error:
+        await root.reclaim(fanout.run_id, tenant_id=TENANT)
+    assert error.value is failure
+    assert len(owners) == len(failed) == 1 and owners[0].done()
+    assert inspect.getcoroutinestate(failed[0]) == inspect.CORO_CLOSED
+    assert [await store.get_run(run_id) for run_id in fanout.child_ids] == before
+    assert root.provider.calls == 0 and root.subagents[0].provider.calls == 0
+    await root.close()
+
+
+async def test_public_reconnect_retains_cancellation_during_owner_join(store, monkeypatch):
+    root = lead(state_store=store)
+    fanout = await parked(store, root, [Child(), Child()])
+    before = await store.get_run(fanout.run_id)
+    joining, release = asyncio.Event(), asyncio.Event()
+    original = _managed_fanout._join_reconnect
+    owners = []
+
+    async def join(tasks, *, cancel):
+        owners.extend(tasks)
+        joining.set()
+        await release.wait()
+        await original(tasks, cancel=cancel)
+
+    monkeypatch.setattr(_managed_fanout, "_join_reconnect", join)
+    task = asyncio.create_task(root.reclaim(fanout.run_id, tenant_id=TENANT))
+    try:
+        await asyncio.wait_for(joining.wait(), 10)
+        task.cancel("join cancellation")
+        release.set()
+        with pytest.raises(asyncio.CancelledError) as error:
+            await task
+        assert error.value.args == ("join cancellation",)
+        assert all(owner.done() for owner in owners)
+        assert await store.get_run(fanout.run_id) == before
+        assert root.provider.calls == 0
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        await root.close()
+
+
+async def test_public_reconnect_race_has_one_adoption_winner(store, engine, monkeypatch):
+    if engine.dialect.name != "postgresql":
+        pytest.skip("Independent concurrent claims require Postgres")
+    transformed = []
+
+    async def transform(ctx):
+        transformed.append(ctx.call_id)
+        return ctx.result
+
+    root = lead(
+        state_store=store,
+        llm=ScriptedLLM([LLMResponse(text="done")]),
+        tool_result_transform=transform,
+    )
+    fanout = await parked(store, root, [Child(), Child()])
+    ready, arrivals = asyncio.Event(), 0
+    original = _managed_fanout.settle_parent
+
+    async def settle(*args, **kwargs):
+        nonlocal arrivals
+        arrivals += 1
+        if arrivals == 2:
+            ready.set()
+        await asyncio.wait_for(ready.wait(), 10)
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(_managed_fanout, "settle_parent", settle)
+    results = await asyncio.gather(
+        root.reclaim(fanout.run_id, tenant_id=TENANT),
+        root.reclaim(fanout.run_id, tenant_id=TENANT),
+    )
+    assert arrivals == 2 and any(result.status == RunStatus.SUCCESS for result in results)
+    assert {result.run_id for result in results} == {fanout.run_id}
+    assert transformed == [call.id for call in fanout.calls]
+    assert root.provider.calls == 1 and root.subagents[0].provider.calls == 0
+    rows = await store.get_tool_calls(fanout.run_id)
+    assert len(rows) == 2 and all(row.outcome == "completed" for row in rows)
+    assert (await store.get_run(fanout.run_id)).status == "success"
+    await root.close()
+
+
+async def test_public_reconnect_retains_the_owned_root_result(store):
+    root = lead(state_store=store, llm=ScriptedLLM([LLMResponse(text="done")]))
+    fanout = await parked(store, root, [Child(), Child()])
+    result = await root.reclaim(fanout.run_id, tenant_id=TENANT)
+    assert result.status == RunStatus.SUCCESS and result.answer == "done"
+    assert result.steps and result.pendings == () and result.pause_id is None
+    await root.close()
+
+
+async def test_public_reconnect_rereads_not_owner_results_after_join(store, engine, monkeypatch):
+    from contextvars import ContextVar
+
+    if engine.dialect.name != "postgresql":
+        pytest.skip("Independent concurrent completions require Postgres")
+    caller = ContextVar("reconnect_test_caller")
+    transformed = []
+
+    async def transform(ctx):
+        transformed.append(ctx.call_id)
+        return ctx.result
+
+    root = lead(
+        state_store=store,
+        llm=ScriptedLLM([LLMResponse(text="done")]),
+        tool_result_transform=transform,
+    )
+    fanout = await parked(store, root, [Child(status="running"), Child(status="running")])
+    cached, completed = set(), set()
+    caches_ready, finishes_ready = asyncio.Event(), asyncio.Event()
+
+    async def leaf(store, node, *args):
+        label = caller.get()
+        if node.run_id != fanout.child_ids[label]:
+            cached.add(label)
+            if len(cached) == 2:
+                caches_ready.set()
+            return RunResult(run_id=node.run_id, status=RunStatus.RUNNING)
+        await asyncio.wait_for(caches_ready.wait(), 10)
+        assert await store.finalize_run(node.run_id, status="success", answer="ok", claim_epoch=0)
+        completed.add(label)
+        if len(completed) == 2:
+            finishes_ready.set()
+        await asyncio.wait_for(finishes_ready.wait(), 10)
+        return await runner._build_cached_result(store, node.run_id)
+
+    async def reconnect(label):
+        token = caller.set(label)
+        try:
+            return await root.reclaim(fanout.run_id, tenant_id=TENANT)
+        finally:
+            caller.reset(token)
+
+    monkeypatch.setattr(_managed_fanout, "_reconnect_leaf", leaf)
+    try:
+        results = await asyncio.wait_for(asyncio.gather(reconnect(0), reconnect(1)), 20)
+        assert any(result.status == RunStatus.SUCCESS for result in results)
+        assert transformed == [call.id for call in fanout.calls]
+        assert root.provider.calls == 1
+        assert (await store.get_run(fanout.run_id)).status == "success"
+        rows = await store.get_tool_calls(fanout.run_id)
+        assert len(rows) == 2 and all(row.outcome == "completed" for row in rows)
+    finally:
+        caches_ready.set()
+        finishes_ready.set()
+        await root.close()

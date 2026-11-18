@@ -1038,17 +1038,16 @@ async def reconnect(
     item: Any,
     notifier: LoopNotifier | None,
 ) -> RunResult:
-    """Continue a managed workflow from its root id after a restart.
-
-    Walks the persisted bindings root to leaf. A terminal child is adopted into its
-    waiting parent without running it again. A running leaf is reclaimed under lease
-    rules (a live owner is never stolen from); a SingleCall leaf never is, on any
-    store: ``sweep()`` fails it first. A leaf's external pause is a root view.
-    """
-    from dendrux.runtime import _reclaim
+    """Reconnect a workflow, preserving legacy recovery rules for trees without fan-out."""
+    # Cycle: the fan-out driver uses this module's adoption; removed with driver extraction.
+    from dendrux.runtime import _managed_fanout, _reclaim
     from dendrux.runtime.runner import _build_cached_result
 
     found = await route(root_agent, store, root_run_id, tenant_id=tenant_id)
+    if await _managed_route.reaches_fanout(store, found):
+        return await _managed_fanout.reconnect_tree(
+            root_agent, store, root_run_id, tenant_id=found.tenant_id, notifier=notifier
+        )
     waiting, leaf = list(found.waiting), found.leaf
     if leaf.status in {s.value for s in TERMINAL_STATUSES}:
         if not waiting:
@@ -1066,8 +1065,6 @@ async def reconnect(
             notifier=notifier,
             via_root=bool(waiting),
         )
-    elif not waiting:
-        return await _build_cached_result(store, root_run_id)
     else:
         result = await _build_cached_result(store, leaf.id)
     return await _trampoline(
