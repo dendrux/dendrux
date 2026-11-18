@@ -25,10 +25,11 @@ from dendrux.runtime._managed_route import _Waiting
 from dendrux.runtime._managed_tree import FanoutInvocation
 from dendrux.runtime._subagents import _tighten
 from dendrux.runtime.state import UNSCOPED, claimed_store
+from dendrux.runtime.tasks import _drain_cleanup
 from dendrux.types import RunEvent, RunEventType, RunResult, RunStatus, ToolCall, ToolResult
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator
+    from collections.abc import AsyncGenerator, Awaitable, Callable
 
     from dendrux.agent import Agent
     from dendrux.runtime._managed_fanout import FanoutRun
@@ -218,31 +219,49 @@ async def _stream_failure(state: _StreamState, exc: Exception, run_id: str) -> A
 
 
 async def _close_workflow(state: _StreamState) -> RunResult | None:
-    """Abandoned stream: run a live fan-out's exit path, then cancel the rest of the
-    workflow. A cancellation retained by the fan-out's exit path is re-raised only after
-    the root and its descendants are cancelled; run streams close in this task."""
-    cancellation = await state.fanout.close()
-    result = await _close_runs(state)
+    """Abandoned stream: run a live fan-out's exit path, close the active run's stream in
+    this task, then finalize the root and its descendants in one retained store-only
+    cleanup. A cancellation arriving anywhere on the way is kept; the first one is
+    re-raised once the root is final."""
+    first = await state.fanout.close()
+    closed, late = await _close_current(state)
+    result, kept = await _drain_cleanup(_finalize_root(state, closed), run_id=state.root_run_id)
+    cancellation = _first_of(first, late, kept)
     if cancellation is not None:
         raise cancellation
     return result
 
 
-async def _close_runs(state: _StreamState) -> RunResult | None:
-    """Release a claimed but unstarted continuation, close the active run's stream, then
-    cancel a waiting root with its descendants."""
-    result = None
+async def _close_current(state: _StreamState) -> tuple[RunResult | None, Any]:
+    """Close the active run's stream here (its generator never leaves this task).
+
+    Returns its result and a cancellation that interrupted the close, if any.
+    """
+    if state.current is None:
+        return None, None
+    try:
+        await state.current.aclose()
+    except asyncio.CancelledError as cancellation:
+        return state.current.result, cancellation
+    return state.current.result, None
+
+
+async def _finalize_root(state: _StreamState, result: RunResult | None) -> RunResult | None:
+    """Store-only: release a claimed but unstarted continuation, then cancel a waiting
+    root with its descendants and read its view."""
     if state.unstarted is not None:
         await _cancel_unstarted(state)
-    if state.current is not None:
-        await state.current.aclose()
-        result = state.current.result
     if not state.root_active and state.root_run_id is not None:
         await state.root_agent.cancel_run(
             state.root_run_id, cascade=True, tenant_id=state.tenant_id
         )
         result = await _managed_route.root_view(state.store, state.root_run_id)
     return result
+
+
+def _first_of(*cancellations: Any) -> Any:
+    """The earliest cancellation seen, if any."""
+    return next((c for c in cancellations if c is not None), None)
 
 
 async def _cancel_unstarted(state: _StreamState) -> None:
@@ -402,16 +421,15 @@ async def open_fanout_leaf(
 class FanoutStream:
     """One live fan-out inside the root stream: owner progress, the join, then the fan-in.
 
-    Only owner tasks put on the bounded queue: each put is followed by ``wake.set()``,
-    and each owner's done callback sets ``wake``. A tool event raised in one of a run's
-    parallel-tool helper tasks is staged for that run without touching the queue; the
-    run's owner task puts it, in order, before its own next event (or the consumer takes
-    what is left after the join). The consumer, the root stream's generator in the
-    caller's task, clears ``wake``, drains the queue, leaves once every owner is done,
-    else waits on ``wake``. No task waits on the queue, and no cleanup path touches it:
-    closing only stops later puts, and owners blocked on a full queue are cancelled with
-    their tasks. Every run of a branch reports through one notifier, so nested events
-    reach this queue tagged with their own run ids.
+    Only an owner task's structured subtree puts on the bounded queue: the owner and the
+    parallel-tool tasks it creates, awaits, and cancels and joins with itself. Each put
+    waits for room (backpressure) and is followed by ``wake.set()``; each owner's done
+    callback sets ``wake``. The consumer, the root stream's generator in the caller's
+    task, clears ``wake``, drains the queue, leaves once every owner is done, else waits
+    on ``wake``. No task waits on the queue, and no cleanup path touches it: closing
+    only stops later puts, and producers blocked on a full queue are cancelled and
+    joined with their owner. Every run of a branch reports through one notifier, so
+    nested events reach this queue tagged with their own run ids.
     """
 
     def __init__(self, invocation: FanoutInvocation, notifier: Any) -> None:
@@ -423,8 +441,6 @@ class FanoutStream:
         self._notifier = notifier
         self._run: FanoutRun | None = None
         self._closed = False
-        self._owners: dict[str, asyncio.Task[Any] | None] = {}
-        self._staged: dict[str, list[RunEvent]] = {}
 
     async def events(self, state: _StreamState) -> AsyncGenerator[RunEvent, None]:
         """Forward owner progress until every owner is done; join; settle on ``state``."""
@@ -446,8 +462,8 @@ class FanoutStream:
         finally:
             state.fanout = _NO_FANOUT
         await run.aexit()
-        for event in self._leftovers():
-            yield event
+        while not self.queue.empty():
+            yield self.queue.get_nowait()
         run.outcomes()  # the first collected branch error, after every event
         if run.bound.outcome != "created":
             self.result = _managed.not_owner_result(self.run_id)
@@ -465,17 +481,12 @@ class FanoutStream:
                 return
             await self.wake.wait()
 
-    def _leftovers(self) -> list[RunEvent]:
-        """After the join: what is still queued, then events no owner put (run order)."""
-        left = [self.queue.get_nowait() for _ in range(self.queue.qsize())]
-        return left + [event for staged in self._staged.values() for event in staged]
-
     async def _start(self) -> FanoutRun | None:
         """Bind and hand every claim to its owner; a refused bind leaves ``result`` set."""
         # cycle: _managed_fanout imports _managed, which imports this module at load.
         from dendrux.runtime import _managed, _managed_fanout
 
-        notifier = _managed_fanout._BranchEvents(_RunEvents(self._notifier, self), self.emit)
+        notifier = _managed_fanout._BranchEvents(_RunEvents(self._notifier, self._put), self._put)
         try:
             run = await _managed_fanout.start_fanout(self.invocation, notifier=notifier)
         except (RunCancelledError, RunFencedError) as stop:
@@ -490,32 +501,8 @@ class FanoutStream:
     def _owner_done(self, _: asyncio.Task[Any]) -> None:
         self.wake.set()
 
-    def started(self, run_id: str) -> None:
-        """A run starts (or continues) in this task: its owner task from now on."""
-        self._owners[run_id] = asyncio.current_task()
-
-    def _owns(self, run_id: str) -> bool:
-        """This task owns the run (a run never seen starting counts as owned here)."""
-        current = asyncio.current_task()
-        return self._owners.get(run_id, current) is current
-
-    async def emit(self, event: RunEvent) -> None:
-        """Owner task: put the run's staged events, then this one. Helper task: stage it."""
-        run_id = str(event.run_id)
-        if not self._owns(run_id):
-            self._staged.setdefault(run_id, []).append(event)
-            return
-        await self.flush(run_id)
-        await self._put(event)
-
-    async def flush(self, run_id: str) -> None:
-        """Owner task only: put the events the run's helper tasks staged, in order."""
-        staged = self._staged.get(run_id) if self._owns(run_id) else None
-        while staged and not self._closed:
-            await self._put(staged.pop(0))
-
     async def _put(self, event: RunEvent) -> None:
-        """Owner tasks only: wait for room (backpressure), then wake the consumer."""
+        """Owner subtrees only: wait for room (backpressure), then wake the consumer."""
         if self._closed:
             return
         await self.queue.put(event)
@@ -560,34 +547,22 @@ async def _exit_retaining(run: FanoutRun | None) -> asyncio.CancelledError | Non
 
 
 class _RunEvents:
-    """Forwards every hook. Tells the stream which task owns a run, puts the run's staged
-    events when it finishes, and signals a run that stops at an external pause.
+    """Forwards every hook; a run that stops at an external pause also tells the stream.
 
     The dynamic notifier hook boundary is the same forwarding seam as the branch events.
     """
 
-    def __init__(self, inner: Any, stream: FanoutStream) -> None:
+    def __init__(self, inner: Any, sink: Callable[[RunEvent], Awaitable[None]]) -> None:
         self.inner = inner or BaseNotifier()
-        self._stream = stream
+        self._sink = sink
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.inner, name)
 
-    async def on_run_started(self, run_id: str, **kwargs: Any) -> None:
-        self._stream.started(run_id)
-        await _hooks.notify_run_started(
-            self.inner,
-            run_id,
-            agent_name=kwargs.get("agent_name"),
-            agent_model=kwargs.get("agent_model"),
-            trace_link=kwargs.get("trace_link"),
-        )
-
     async def on_run_finished(self, run_id: str, result: RunResult) -> None:
         await _hooks.notify_run_finished(self.inner, run_id, result)
-        await self._stream.flush(run_id)
         if result.status in PAUSE_STATUSES:
-            await self._stream.emit(
+            await self._sink(
                 RunEvent(type=RunEventType.SUBAGENT_PAUSED, run_id=run_id, pending=result.pending)
             )
 

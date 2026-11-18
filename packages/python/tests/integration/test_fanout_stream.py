@@ -13,6 +13,7 @@ Runs on SQLite and Postgres (``DENDRUX_TEST_PG_URL``, a private ``*_test`` datab
 from __future__ import annotations
 
 import asyncio
+from contextvars import ContextVar
 from typing import Any
 
 import pytest
@@ -975,30 +976,6 @@ def queue_spy(monkeypatch: Any) -> list[tuple[str, str]]:
     return calls
 
 
-async def test_parallel_tools_hand_their_events_to_the_owner_task(
-    store, live_adoption, monkeypatch
-):
-    calls = queue_spy(monkeypatch)
-    observer = CompletionOrder()
-    children = [noting("alpha", 2), noting("beta", 2)]  # two parallel tools per child
-    root = lead(store, ScriptedLLM([batch(children), LLMResponse(text="done")]), children)
-    try:
-        events = await collect(root.stream("go", tenant_id=TENANT, notifier=observer))
-        final = events[-1].run_result
-        assert (final.status, final.answer) == (RunStatus.SUCCESS, "done")
-        puts = [task for op, task in calls if op == "put"]
-        assert puts and all(task.startswith("fanout:") for task in puts)
-        progress = child_events(events, final.run_id)
-        assert len(progress) == 2 * 2 * 3  # nothing lost
-        for child_id in await child_ids(store, final.run_id, ["alpha", "beta"]):
-            own = [e for e in progress if e.run_id == child_id]
-            assert [e.tool_call_id for e in own if e.type == RunEventType.TOOL_RESULT] == (
-                observer.completed[child_id]
-            )
-    finally:
-        await close_all(root, *children)
-
-
 async def test_closing_a_full_queue_leaves_the_queue_alone(store, live_adoption, monkeypatch):
     calls = queue_spy(monkeypatch)
     full = _full_gate(monkeypatch)
@@ -1021,4 +998,200 @@ async def test_closing_a_full_queue_leaves_the_queue_alone(store, live_adoption,
         assert not owner_tasks_left()
         assert stream.result is not None and stream.result.status == RunStatus.CANCELLED
     finally:
+        await close_all(root, *children)
+
+
+# ---------------------------------------------------------------------------
+# Owner subtrees put directly; root finalization survives a cancellation
+# ---------------------------------------------------------------------------
+
+OWNER: ContextVar[asyncio.Task[Any] | None] = ContextVar("t7_test_owner", default=None)
+
+
+class OwnerTag(CompletionOrder):
+    """Tags each run's task (and the parallel-tool tasks it creates) with that task."""
+
+    async def on_run_started(self, run_id: str, **kwargs: Any) -> None:
+        OWNER.set(asyncio.current_task())
+
+
+def tagged_puts(monkeypatch: Any) -> list[tuple[Any, Any]]:
+    """``(owner tag, current task)`` for every put on a fan-out stream queue."""
+    puts: list[tuple[Any, Any]] = []
+    original = asyncio.Queue.put
+
+    async def put(queue: Any, item: Any) -> None:
+        if queue.maxsize == _managed_stream.QUEUE_EVENTS:
+            puts.append((OWNER.get(), asyncio.current_task()))
+        await original(queue, item)
+
+    monkeypatch.setattr(asyncio.Queue, "put", put)
+    return puts
+
+
+def batches(name: str, turns: int, width: int) -> Agent:
+    """A ReAct child that runs ``turns`` turns of ``width`` parallel notes."""
+    script = [
+        LLMResponse(
+            tool_calls=[
+                ToolCall("note", {"text": name}, id=f"{name}-{t}-{i}") for i in range(width)
+            ]
+        )
+        for t in range(turns)
+    ]
+    llm = ScriptedLLM([*script, LLMResponse(text=name)])
+    return worker(name, llm, tools=[note], max_iterations=turns + 1)
+
+
+async def test_parallel_tools_put_from_the_owner_subtree_with_backpressure(
+    store, live_adoption, monkeypatch
+):
+    runs = captured_runs(monkeypatch)
+    puts = tagged_puts(monkeypatch)
+    full = _full_gate(monkeypatch)
+    observer = OwnerTag()
+    children = [batches("alpha", 15, 3), batches("beta", 15, 3)]  # 2 x 15 x 3 x 3 = 270
+    root = lead(store, ScriptedLLM([batch(children), LLMResponse(text="done")]), children)
+    caller = asyncio.current_task()
+    try:
+        events: list[Any] = []
+        async with asyncio.timeout(6 * DEADLOCK_S):
+            async with root.stream("go", tenant_id=TENANT, notifier=observer) as stream:
+                async for event in stream:
+                    events.append(event)
+                    if len(child_events(events, events[0].run_id)) == 1:
+                        await full.wait()  # producers hit the bound before the next step
+                    await asyncio.sleep(0.001)  # a slow consumer
+        final = events[-1].run_result
+        assert (final.status, final.answer) == (RunStatus.SUCCESS, "done")
+        progress = child_events(events, final.run_id)
+        assert len(progress) == 2 * 15 * 3 * 3  # nothing lost
+        owners = {task for run in runs for task in run.owners}
+        assert puts and all(tag in owners and task is not caller for tag, task in puts)
+        assert any(task is not tag for tag, task in puts)  # parallel-tool tasks put too
+        for child_id in await child_ids(store, final.run_id, ["alpha", "beta"]):
+            results = [
+                e.tool_call_id
+                for e in progress
+                if e.type == RunEventType.TOOL_RESULT and e.run_id == child_id
+            ]
+            assert results == observer.completed[child_id]
+    finally:
+        await close_all(root, *children)
+
+
+async def test_a_fast_parallel_result_arrives_while_its_sibling_is_blocked(store, live_adoption):
+    released = asyncio.Event()
+
+    @tool()
+    async def fast() -> str:
+        """Return at once."""
+        return "fast"
+
+    @tool()
+    async def slow() -> str:
+        """Wait until the consumer saw the fast result."""
+        await released.wait()
+        return "slow"
+
+    turn = LLMResponse(tool_calls=[ToolCall("fast", {}, id="f"), ToolCall("slow", {}, id="s")])
+    children = [
+        worker(name, ScriptedLLM([turn, LLMResponse(text=name)]), tools=[fast, slow])
+        for name in ("alpha", "beta")
+    ]
+    root = lead(store, ScriptedLLM([batch(children), LLMResponse(text="done")]), children)
+    try:
+        events: list[Any] = []
+        async with asyncio.timeout(DEADLOCK_S):
+            async with root.stream("go", tenant_id=TENANT) as stream:
+                async for event in stream:
+                    events.append(event)
+                    if event.type == RunEventType.TOOL_RESULT and event.tool_call_id == "f":
+                        released.set()
+        assert events[-1].run_result.status == RunStatus.SUCCESS
+    finally:
+        released.set()
+        await close_all(root, *children)
+
+
+async def test_close_with_parallel_tools_blocked_on_the_full_queue(
+    store, live_adoption, monkeypatch
+):
+    runs = captured_runs(monkeypatch)
+    puts = tagged_puts(monkeypatch)
+    full = _full_gate(monkeypatch)
+    observer = OwnerTag()
+    children = [noting("alpha", Q2_CALLS), noting("beta", Q2_CALLS)]  # 50 parallel notes each
+    root = lead(store, ScriptedLLM([batch(children), LLMResponse(text="done")]), children)
+    before = set(asyncio.all_tasks())
+    stream = root.stream("go", tenant_id=TENANT, notifier=observer)
+    try:
+        async with stream:
+            iterator = aiter(stream)
+            async for event in iterator:
+                if child_events([event], ""):
+                    break
+            async with asyncio.timeout(DEADLOCK_S):
+                await full.wait()
+            blocked_helpers = [task for tag, task in puts if task is not tag and not task.done()]
+            assert blocked_helpers  # parallel-tool tasks are waiting in put
+            async with asyncio.timeout(DEADLOCK_S):
+                await stream.aclose()
+        assert all(task.done() for task in blocked_helpers)
+        assert set(asyncio.all_tasks()) - before - {asyncio.current_task()} == set()
+        assert runs[0].owners_done() and not owner_tasks_left()
+        statuses = await _rows(store, runs[0].invocation.parent_run_id)
+        assert "running" not in statuses.values()
+        assert statuses["root"] == "cancelled"
+    finally:
+        await close_all(root, *children)
+
+
+async def test_a_cancel_while_the_root_is_being_cancelled_still_finishes_it(
+    store, live_adoption, monkeypatch
+):
+    pairs = [gated_child("alpha"), gated_child("beta")]
+    children, providers = [c for c, _ in pairs], [p for _, p in pairs]
+    root = lead(store, ScriptedLLM([batch(children), LLMResponse(text="done")]), children)
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = root.cancel_run
+
+    async def cancel_run(*args: Any, **kwargs: Any) -> Any:
+        entered.set()
+        await release.wait()
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(root, "cancel_run", cancel_run)
+    stream = root.stream("go", tenant_id=TENANT)
+    seen: list[Any] = []
+
+    async def consume() -> None:
+        async with stream:
+            iterator = aiter(stream)
+            async for event in iterator:
+                seen.append(event)
+                if len({e.run_id for e in child_events(seen, seen[0].run_id)}) == 2:
+                    break
+            for provider in providers:
+                await provider.first_sent.wait()
+            await stream.aclose()
+
+    caller = asyncio.create_task(consume())
+    try:
+        async with asyncio.timeout(DEADLOCK_S):
+            await entered.wait()
+        caller.cancel("first")
+        await asyncio.sleep(0)
+        release.set()
+        with pytest.raises(asyncio.CancelledError) as caught:
+            async with asyncio.timeout(DEADLOCK_S):
+                await caller
+        assert caught.value.args == ("first",)
+        statuses = await _rows(store, seen[0].run_id)
+        assert statuses == {"root": "cancelled", "alpha": "cancelled", "beta": "cancelled"}
+    finally:
+        release.set()
+        for provider in providers:
+            provider.gate.set()
+        await asyncio.gather(caller, return_exceptions=True)
         await close_all(root, *children)
