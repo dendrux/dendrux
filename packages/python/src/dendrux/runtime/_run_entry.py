@@ -446,11 +446,12 @@ async def prepare_child_creation(child: Agent, branch: ManagedInvocation) -> Pre
     if projection.error is not None:
         # The generated call has one task field; retain only its safe rejected projection.
         branch = replace(branch, call=replace(branch.call, params={"task": text}))
-    return PreparedChild(_prepared_child_spec(branch, loop, create), projection)
+    spec = _prepared_child_spec(branch, loop, create, child_blocked=projection.error is not None)
+    return PreparedChild(spec, projection)
 
 
 def _prepared_child_spec(
-    branch: ManagedInvocation, loop: Loop, create: dict[str, Any]
+    branch: ManagedInvocation, loop: Loop, create: dict[str, Any], *, child_blocked: bool
 ) -> ManagedChildSpec:
     # Cycle: _managed imports runner, which re-exports this entry module.
     from dendrux.runtime import _managed, _managed_budget
@@ -474,6 +475,7 @@ def _prepared_child_spec(
         child_strategy=create.get("strategy"),
         child_meta=create.get("meta"),
         child_pii_mapping=create.get("pii_mapping"),
+        child_blocked=child_blocked,
     ).detached()
 
 

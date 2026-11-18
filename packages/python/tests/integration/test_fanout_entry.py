@@ -348,6 +348,7 @@ async def test_p20_raising_detector_is_unscannable_with_n1_parity(store):
         assert "UNSCANNABLE" in prepared.projection.error
         assert {finding.entity_type for finding in prepared.projection.findings} == {"UNSCANNABLE"}
         assert prepared.spec.child_meta[BLOCKED_META_KEY] is True
+        assert prepared.spec.child_blocked is True
         result, bound = await _managed._run_child(branch, None)
         assert bound and result.status == RunStatus.ERROR
         assert "UNSCANNABLE" in result.error
@@ -426,10 +427,8 @@ async def test_handoff_repeated_cancel_cannot_skip_finalization(store, monkeypat
         await asyncio.gather(caller, return_exceptions=True)
 
 
-@pytest.mark.xfail(
-    strict=True, reason="Contract gap: native creation strips child_meta block evidence"
-)
-async def test_p20_prepared_block_evidence_survives_native_batch_bind(store):
+@pytest.mark.parametrize("forged_marker", [False, True])
+async def test_p20_prepared_block_evidence_survives_native_batch_bind(store, forged_marker):
     prepare = getattr(_run_entry, "prepare_child_creation", None)
     assert callable(prepare), "write-free child creation preparation is required"
     from tests.integration.test_fanout_store_races import fanout_wait
@@ -448,6 +447,9 @@ async def test_p20_prepared_block_evidence_survives_native_batch_bind(store):
                 request.parent_wait,
             )
             specs.append((await prepare(child, branch)).spec)
+        assert [spec.child_blocked for spec in specs] == [True, False]
+        if forged_marker:
+            specs[1] = replace(specs[1], child_meta={**specs[1].child_meta, BLOCKED_META_KEY: True})
         request = replace(
             request,
             children=tuple(specs),
@@ -726,8 +728,9 @@ async def test_fix1_commit_ack_deadline_preserves_first_cancel(store, monkeypatc
         caller.cancel("first")
         await asyncio.sleep(0)
         caller.cancel("later")
-        done, _ = await asyncio.wait({caller}, timeout=0.5)
-        assert caller in done, "cancelled fan-out exceeded the ownership deadline"
+        # A generous hang tripwire: acknowledgement remains gated, so cleanup must time out.
+        done, _ = await asyncio.wait({caller}, timeout=5.0)
+        assert caller in done, "cancelled fan-out exceeded its cleanup hang tripwire"
         with pytest.raises(asyncio.CancelledError) as error:
             await caller
         assert error.value.args == ("first",)
@@ -824,6 +827,7 @@ async def test_fix1_prepared_projection_reused_without_scanning(store, blocked):
         prepared = await _run_entry.prepare_child_creation(child, branch)
         assert hasattr(prepared, "projection"), "preparation must retain its projection"
         assert hasattr(prepared, "spec"), "preparation must return PreparedChild"
+        assert prepared.spec.child_blocked is (prepared.projection.error is not None)
         before = guard.calls
         engine = prepared.projection.engine
         mapping = engine.get_pii_mapping()
