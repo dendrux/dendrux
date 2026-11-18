@@ -212,7 +212,7 @@ def test_managed_fault_cuts_are_reported_uncertified_without_injector(pytester: 
 
 def test_fanout_contract_slice_passes_on_intact_store(pytester: Pytester) -> None:
     intact = run_slice(pytester, NONE, FANOUT_SLICE)
-    intact.assert_outcomes(passed=42)
+    intact.assert_outcomes(passed=43)
     assert "managed_subagents" in intact.stdout.str()
 
 
@@ -225,14 +225,14 @@ def mutate(store):
     return store
 """
     fanout = run_slice(pytester, mutation, FANOUT_SLICE)
-    fanout.assert_outcomes(passed=1, skipped=41)
+    fanout.assert_outcomes(passed=1, skipped=42)
     managed = run_slice(pytester, mutation, MANAGED_SLICE)
     managed.assert_outcomes(passed=22)
 
 
 def test_fanout_fault_cuts_are_reported_uncertified_without_injector(pytester: Pytester) -> None:
     result = run_kit(pytester, injector=None, k=FANOUT_SLICE)
-    result.assert_outcomes(passed=36, skipped=6)
+    result.assert_outcomes(passed=37, skipped=6)
     assert "crash recovery: not certified" in result.stdout.str()
 
 

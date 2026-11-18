@@ -499,6 +499,8 @@ class _SqlReads(_StoreHost):
                     id=r.id,
                     outcome=r.outcome,
                     observation=(r.meta or {}).get(OBSERVATION_META_KEY),
+                    content_digest=r.content_digest,
+                    managed_child_run_id=_bound_child(r.meta),
                     idempotent=r.idempotent,
                     replayed_at=_to_aware_utc(r.replayed_at),
                     tool_call_id=r.tool_call_id,
@@ -711,3 +713,10 @@ class _SqlReads(_StoreHost):
                 )
 
         return stmt.where(self.metadata_filter_predicate(AgentRun.meta, metadata_filter))
+
+
+def _bound_child(meta: dict[str, Any] | None) -> str | None:
+    """The child a managed intent row was bound to (its ``meta.managed.child_run_id``)."""
+    managed = (meta or {}).get("managed")
+    child = managed.get("child_run_id") if isinstance(managed, dict) else None
+    return child if isinstance(child, str) else None
