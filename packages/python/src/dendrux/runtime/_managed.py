@@ -1,34 +1,7 @@
-"""Managed subagents (0.7): the inline driver, the bind handoff and durable adoption.
+"""Drive single-child workflows inline through durable bind, adoption and continuation.
 
-For ``await root.run(task)`` on an Agent with ``subagents=``:
-
-1. The parent's loop returns an in-memory handoff for one admitted subagent call.
-   :func:`prepare_handoff` makes the parent's checkpoint durable and returns a
-   descend marker; the parent's run frame then exits without pausing.
-2. :func:`drive` runs the child in the same caller task. The child's run entry
-   takes the invocation and creates the child through the store's atomic
-   ``bind_managed_child`` (parent parked as a v3 managed wait, its epoch
-   retired). Only the confirmed creator executes the child.
-3. When the child is terminal, :func:`adopt` turns its saved outcome into the
-   parent's tool observation: ``submit_and_claim`` on the parent's private wait
-   generation, then ``complete_tool_call`` with the binding cleared. The parent
-   then continues from its checkpoint, never from an old frame.
-
-:func:`reconnect` runs the same adoption and continuation after a restart; no
-step exists only in memory.
-
-Root routing (T3): a root-id continuation (``submit_*``, ``resume``,
-``resume_stream``) reaches the active leaf through the persisted bindings
-(:func:`route`), is validated and claimed with the leaf's own definition, and
-:func:`unwind` adopts finished outcomes back up to the root.
-:func:`workflow_stream` drives the same transitions for ``stream`` and
-``resume_stream``, advancing each run's generator in the caller's task.
-
-This module is the driver core. Routing and the root view live in
-:mod:`~dendrux.runtime._managed_route`, building a parent's report from a
-child's outcome in :mod:`~dendrux.runtime._managed_adoption`, and the workflow
-stream's state, legs and cleanup in :mod:`~dendrux.runtime._managed_stream`; the
-names stay importable from here.
+Routing, reports and stream cleanup live in the managed helper modules. Fan-out
+claim ownership lives in ``_managed_fanout``; the N=1 driver stays in this task.
 """
 
 from __future__ import annotations
@@ -494,7 +467,10 @@ def _task(invocation: ManagedInvocation) -> str:
 
 
 async def _after_child_error(
-    invocation: ManagedInvocation, exc: Exception
+    invocation: ManagedInvocation,
+    exc: Exception,
+    *,
+    failure_for_storage: Exception | None = None,
 ) -> tuple[RunResult, bool]:
     """The child's run raised: ``(result, bound)``, or re-raise ``exc``.
 
@@ -516,7 +492,7 @@ async def _after_child_error(
             return not_owner_result(invocation.parent_run_id), False
         return await _cancel_parent(invocation), False
     if record is None:
-        await _fail_parent(invocation, exc)
+        await _fail_parent(invocation, failure_for_storage or exc)
         raise exc
     if record.status not in {s.value for s in TERMINAL_STATUSES}:
         raise exc
