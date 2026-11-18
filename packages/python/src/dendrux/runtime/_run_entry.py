@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal
 
 import dendrux.chat as _chat
@@ -33,16 +33,20 @@ from dendrux.context_blocks import (
     render_band,
     validate_context,
 )
+from dendrux.errors import ManagedStateError
 from dendrux.loops.react import ReActLoop
 from dendrux.loops.single import SingleCall
 from dendrux.runtime import (
     _run_events,
     _run_images,
+    _run_tools,
 )
-from dendrux.runtime._entry_guardrails import _entry_projection
+from dendrux.runtime._entry_checks import resolve_runner_tenant, runner_entry_checks
+from dendrux.runtime._entry_guardrails import _entry_projection, _EntryProjection
 from dendrux.runtime._managed_fanout_store import ManagedChildSpec
 from dendrux.runtime._run_errors import logger
 from dendrux.runtime._subagents import _tighten
+from dendrux.runtime.context import resolve_child_tenant
 from dendrux.runtime.replay import (
     LoadedReplay,
     ReplayLast,
@@ -59,6 +63,7 @@ from dendrux.runtime.state import (
     ClaimResult,
     unclaimed_store,
 )
+from dendrux.runtime.stores._limits_fit import ensure_agent_limits_fit
 from dendrux.runtime.submit import (
     GOVERNANCE_KEY,
     governance_snapshot,
@@ -352,32 +357,68 @@ def _projected_creation_fields(blocked: bool, create: dict[str, Any]) -> dict[st
     return fields
 
 
-async def prepare_child_creation(child: Agent, branch: ManagedInvocation) -> ManagedChildSpec:
+@dataclass(frozen=True)
+class PreparedChild:
+    """Detached bind data and the caller-prepared projection transferred to one owner.
+
+    The projection's mutable engine has one owner; reuse it without rescanning.
+    It is omitted from repr because its PII mapping is execution-private.
+    """
+
+    spec: ManagedChildSpec
+    projection: _EntryProjection = field(repr=False)
+
+
+async def prepare_child_creation(child: Agent, branch: ManagedInvocation) -> PreparedChild:
     """Prepare a detached child creation in the caller task without durable writes.
 
     ``branch`` supplies the same inherited fields as a single-child invocation.
     Detectors and skill rendering run here, before bind takes any database lock.
     Blocked projection remains a creation, with safe seeds and block evidence.
     """
+    if child is not branch.child:
+        raise ManagedStateError(reason="child_mismatch", run_id=branch.child_run_id)
+    tenant_id = resolve_runner_tenant(child, "run", branch.tenant_id, state_store=branch.store)
+    _require_idempotency_store(branch.store, None)
+    await ensure_agent_limits_fit(child, branch.store)
     loop = _new_run_loop(child, None)
     provider = child._require_provider()
+    strategy = NativeToolCalling()
     session = SkillSession.prepare(child, loop=loop)
+    depth = _resolve_max_delegation_depth(
+        _tighten(branch.max_depth, child.max_delegation_depth), None
+    )
+    tenant_id = resolve_child_tenant(None, tenant_id)
+    # Match _managed._task's coercion; importing that driver here creates an entry cycle.
+    text = str((branch.call.params or {}).get("task", ""))
+    runner_entry_checks(
+        child,
+        "run",
+        tenant_id=tenant_id,
+        metadata=None,
+        user_input=text,
+        history=None,
+        context=None,
+        provider_kwargs={},
+        idempotency_key=None,
+        provider=provider,
+    )
+    _run_tools._validate_loop_skill_compat(child, loop)
     projection = _entry_projection(child, branch.child_run_id)
     with session.bind():
         system = await projection.project(Message(Role.SYSTEM, child.get_system_prompt(loop)), 0)
-        text = str((branch.call.params or {}).get("task", ""))
         history, _, context, text, parts = await projection.prepare([], None, text, None, session)
         seeds, _ = await _runtime_seeds(
             branch.store,
             child,
             provider,
             loop,
-            NativeToolCalling(),
+            strategy,
             {},
             history,
             user_input=text,
             run_id=branch.child_run_id,
-            tenant_id=branch.tenant_id,
+            tenant_id=tenant_id,
             context=context,
             user_parts=parts,
             engine=projection.engine,
@@ -388,7 +429,7 @@ async def prepare_child_creation(child: Agent, branch: ManagedInvocation) -> Man
             loop,
             session,
             None,
-            _tighten(branch.max_depth, child.max_delegation_depth),
+            depth,
             user_input=text,
             output_type=child.output_type,
         )
@@ -397,12 +438,15 @@ async def prepare_child_creation(child: Agent, branch: ManagedInvocation) -> Man
             {
                 "input_data": _run_images._input_data(text, parts),
                 "model": provider.model,
-                "strategy": "NativeToolCalling",
+                "strategy": type(strategy).__name__,
                 "meta": metadata,
                 **seeds,
             },
         )
-    return _prepared_child_spec(branch, loop, create)
+    if projection.error is not None:
+        # The generated call has one task field; retain only its safe rejected projection.
+        branch = replace(branch, call=replace(branch.call, params={"task": text}))
+    return PreparedChild(_prepared_child_spec(branch, loop, create), projection)
 
 
 def _prepared_child_spec(

@@ -232,44 +232,41 @@ async def _fanout_ownership_handoff(
         result = await asyncio.shield(task)
         await _flush_live_updates(native)
         return result
-    # Lifecycle isolation: release custody, then propagate the original error or cancellation.
-    except (Exception, asyncio.CancelledError) as error:  # noqa: BLE001, RUF100
-        if isinstance(error, asyncio.CancelledError) and not marker.get("issued"):
+    except asyncio.CancelledError as cancellation:
+        if not marker.get("issued"):
             task.cancel()
-        cancellation = None
         try:
-            _, cancellation = await _drain_cleanup(
-                _cancel_fanout_handoff(native, task, run_id=run_id), run_id=run_id
+            # Any cancellation returned by the drain is later than this caller's first one.
+            await _drain_cleanup(
+                _cancel_fanout_handoff(native, task, marker, run_id=run_id), run_id=run_id
             )
+        except asyncio.CancelledError:
+            raise cancellation from None
+        except Exception:  # noqa: BLE001, RUF100 - cleanup isolation logs failure and preserves cancellation.
+            _log_handoff_failure(marker, run_id)
         finally:
-            if inspect.iscoroutine(operation):
-                operation.close()
-            if isinstance(error, asyncio.CancelledError):
-                raise error  # noqa: TRY201 - cleanup must preserve the first cancellation
-            if cancellation is not None:
-                raise cancellation
-            raise error
+            try:
+                if inspect.iscoroutine(operation):
+                    operation.close()
+            finally:
+                raise cancellation  # noqa: TRY201 - preserve the first caller cancellation
 
 
 async def _cancel_fanout_handoff(
     store: StateStore,
     task: asyncio.Task[BindManagedChildrenResult],
+    marker: dict[str, Any],
     *,
     run_id: str,
 ) -> None:
-    # Cycle: ledger -> run_events -> durability; split the lifecycle import in T4b.
+    # Cycle: ledger -> run_events -> durability; defer until cancellation persistence runs.
     from dendrux.runtime._fanout_ledger import FanoutLedger
 
-    try:
-        [result] = await asyncio.gather(task, return_exceptions=True)
-        if isinstance(result, BaseException):
-            if not isinstance(result, asyncio.CancelledError):
-                _codes.log_code(logger, _codes.CANCEL_PERSIST_FAILED, run_id=run_id)
-            return  # No confirmed claims; the original failure propagates in the caller.
+    async def cancel_bound(result: BindManagedChildrenResult) -> None:
         ledger = FanoutLedger(result)
-        await _without_live_flush(store, ledger.finalize(store, ledger.close()))
-    finally:
-        await _flush_live_updates(store)
+        await ledger.finalize(store, ledger.close())
+
+    await _cancel_handoff(store, task, cancel_bound, marker, run_id)
 
 
 @asynccontextmanager

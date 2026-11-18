@@ -255,11 +255,11 @@ async def test_p20_preparation_blocks_one_child_without_binding(store):
                 child,
                 request.parent_wait,
             )
-            specs.append(await prepare(child, branch))
+            specs.append((await prepare(child, branch)).spec)
             assert await store.get_run(branch.child_run_id) is None
         assert specs[0].child_meta[BLOCKED_META_KEY] is True
         assert not specs[1].child_meta.get(BLOCKED_META_KEY)
-        assert SECRET not in repr([(s.child_input_data, s.child_seed_traces) for s in specs])
+        assert SECRET not in repr(specs)
         assert specs[1].child_input_data == {"input": "clean"}
     finally:
         await child.close()
@@ -318,13 +318,10 @@ async def test_p19_mutation_while_root_lock_is_pending(store, monkeypatch):
         await asyncio.gather(caller, return_exceptions=True)
 
 
-@pytest.mark.xfail(
-    strict=True, reason="Contract gap: GuardrailEngine converts detector exceptions to UNSCANNABLE"
-)
-async def test_p20_detector_exception_binds_nothing_and_uses_parent_failure(store):
-    prepare = getattr(_run_entry, "prepare_child_creation", None)
-    assert callable(prepare), "write-free child creation preparation is required"
+async def test_p20_raising_detector_is_unscannable_with_n1_parity(store):
     from dendrux.runtime import _managed
+    from dendrux.types import RunStatus
+    from tests.integration.test_managed_bind import bind_request
 
     class BrokenDetector:
         action = "block"
@@ -333,8 +330,8 @@ async def test_p20_detector_exception_binds_nothing_and_uses_parent_failure(stor
             raise ValueError("SENTINEL-detector-failure")
 
     root, calls = await fanout_parent(store, 2)
-    request = batch(root, calls)
     child = Agent(name="reviewer", prompt="p", provider=MockLLM([]), guardrails=[BrokenDetector()])
+    request = batch(root, calls)
     branch = invocation(
         store,
         root,
@@ -342,17 +339,23 @@ async def test_p20_detector_exception_binds_nothing_and_uses_parent_failure(stor
         child,
         request.parent_wait,
     )
+    branch = replace(
+        branch, wait=bind_request(root, calls[0], child_id=branch.child_run_id).parent_wait
+    )
     try:
-        with pytest.raises(ValueError):
-            try:
-                await prepare(child, branch)
-            except Exception as error:
-                await _managed._fail_parent(branch, error)
-                raise
-        assert await store.get_run(branch.child_run_id) is None
-        assert (await store.get_run(root)).status == "error"
-        assert await store.get_pause_state(root) is None
-        assert await store.get_tool_calls(root) == []
+        prepared = await _run_entry.prepare_child_creation(child, branch)
+        assert hasattr(prepared, "projection"), "UNSCANNABLE evidence must be retained"
+        assert "UNSCANNABLE" in prepared.projection.error
+        assert {finding.entity_type for finding in prepared.projection.findings} == {"UNSCANNABLE"}
+        assert prepared.spec.child_meta[BLOCKED_META_KEY] is True
+        result, bound = await _managed._run_child(branch, None)
+        assert bound and result.status == RunStatus.ERROR
+        assert "UNSCANNABLE" in result.error
+        assert child.provider._call_count == 0
+        row = await store.get_run(branch.child_run_id)
+        assert row.input_data == prepared.spec.child_input_data
+        assert row.meta[BLOCKED_META_KEY] is True
+        assert "SENTINEL-detector-failure" not in repr(prepared)
     finally:
         await child.close()
 
@@ -444,7 +447,7 @@ async def test_p20_prepared_block_evidence_survives_native_batch_bind(store):
                 child,
                 request.parent_wait,
             )
-            specs.append(await prepare(child, branch))
+            specs.append((await prepare(child, branch)).spec)
         request = replace(
             request,
             children=tuple(specs),
@@ -497,8 +500,6 @@ async def test_preparation_matches_single_child_creation_arguments(
 
     from dendrux.loops.single import SingleCall
     from dendrux.runtime import _managed
-    from dendrux.runtime.context import managed_invocation_scope
-    from dendrux.runtime.runner import _run_once
 
     class Answer(BaseModel):
         answer: str
@@ -531,17 +532,9 @@ async def test_preparation_matches_single_child_creation_arguments(
 
     monkeypatch.setattr(_managed, "bind_child", bind)
     try:
-        spec = await _run_entry.prepare_child_creation(child, branch)
-        with managed_invocation_scope(branch), pytest.raises(CreationCapturedError):
-            await _run_once(
-                child,
-                provider=child.provider,
-                user_input="clean",
-                state_store=store,
-                tenant_id="t1",
-                max_delegation_depth=3,
-                output_type=child.output_type,
-            )
+        spec = (await _run_entry.prepare_child_creation(child, branch)).spec
+        with pytest.raises(CreationCapturedError):
+            await _managed._run_child(branch, None)
         for field, old in (
             ("child_input_data", "input_data"),
             ("child_model", "model"),
@@ -640,8 +633,7 @@ async def test_raised_unknown_never_rebinds_or_claims(store, caplog):
         await method(store, operation, run_id=root)
     assert raised.value is error
     assert attempts == [1]
-    assert "cancel_persist_failed" in caplog.text
-    assert any(getattr(record, "run_id", None) == root for record in caplog.records)
+    assert "cancel_persist_failed" not in caplog.text
 
 
 async def test_p19_postgres_mutation_during_real_root_lock_wait(engine):
@@ -699,3 +691,355 @@ async def test_p19_postgres_mutation_during_real_root_lock_wait(engine):
         for child in before.children:
             traces = await store.get_traces(child.child_run_id)
             assert traces[0].meta["original"] == [1]
+
+
+@pytest.mark.parametrize("index", [-4, -1, 3, 100])
+def test_fix1_ledger_refuses_out_of_range_indices(index):
+    ledger = ledger_type()(tokens())
+    before = ledger.states
+    assert ledger.accept(index) is False
+    assert ledger.states == before
+
+
+async def test_fix1_commit_ack_deadline_preserves_first_cancel(store, monkeypatch, caplog):
+    root, calls = await fanout_parent(store, 2)
+    request = batch(root, calls)
+    committed, release = asyncio.Event(), asyncio.Event()
+    original = AsyncSession.commit
+    armed = True
+
+    async def commit(session):
+        nonlocal armed
+        await original(session)
+        if armed:
+            armed = False
+            committed.set()
+            await release.wait()
+
+    monkeypatch.setattr(AsyncSession, "commit", commit)
+    monkeypatch.setattr(durability, "_OWNERSHIP_DEADLINE_S", 0.05)
+    caller = asyncio.create_task(
+        handoff()(store, lambda: store.bind_managed_children(request), run_id=root)
+    )
+    try:
+        await wait_for_gate(committed, task=caller)
+        caller.cancel("first")
+        await asyncio.sleep(0)
+        caller.cancel("later")
+        done, _ = await asyncio.wait({caller}, timeout=0.5)
+        assert caller in done, "cancelled fan-out exceeded the ownership deadline"
+        with pytest.raises(asyncio.CancelledError) as error:
+            await caller
+        assert error.value.args == ("first",)
+        assert "cancel_persist_failed" in caplog.text
+        assert any(getattr(r, "run_id", None) == root for r in caplog.records)
+        for child in request.children:
+            assert (await store.get_run(child.child_run_id)).status == "running"
+    finally:
+        release.set()
+        await asyncio.gather(caller, return_exceptions=True)
+
+
+@pytest.mark.parametrize("outcome", ["exception", "cancelled", "returned_cancel"])
+async def test_fix1_drain_outcome_is_explicit(monkeypatch, caplog, outcome):
+    started, release = asyncio.Event(), asyncio.Event()
+    running = []
+    root = generate_ulid()
+
+    async def operation():
+        durability._mark_commit_issued()
+        started.set()
+        await release.wait()
+        return tokens()
+
+    def factory():
+        task = asyncio.create_task(operation())
+        running.append(task)
+        return task
+
+    async def drain(coro, **kwargs):
+        coro.close()
+        release.set()
+        await asyncio.gather(*running)
+        if outcome == "exception":
+            raise ValueError("SENTINEL-cleanup-error")
+        if outcome == "cancelled":
+            raise asyncio.CancelledError("cleanup")
+        return None, asyncio.CancelledError("later")
+
+    monkeypatch.setattr(durability, "_drain_cleanup", drain)
+    caller = asyncio.create_task(handoff()(object(), factory, run_id=root))
+    try:
+        await wait_for_gate(started, task=caller)
+        caller.cancel("first")
+        with pytest.raises(asyncio.CancelledError) as error:
+            await caller
+        assert error.value.args == ("first",)
+        assert ("cancel_persist_failed" in caplog.text) is (outcome == "exception")
+        assert "SENTINEL-cleanup-error" not in caplog.text
+        if outcome == "exception":
+            assert any(getattr(r, "run_id", None) == root for r in caplog.records)
+    finally:
+        release.set()
+        await asyncio.gather(*running, return_exceptions=True)
+        await asyncio.gather(caller, return_exceptions=True)
+
+
+@pytest.mark.parametrize("blocked", [False, True])
+async def test_fix1_prepared_projection_reused_without_scanning(store, blocked):
+    from dendrux.guardrails import Finding
+    from dendrux.guardrails._engine import _entry_engine
+    from dendrux.types import RunResult, RunStatus
+
+    class Counter:
+        action = "block" if blocked else "redact"
+
+        def __init__(self):
+            self.calls = 0
+
+        async def scan(self, text):
+            self.calls += 1
+            value = SECRET if blocked else "person@example.com"
+            start = text.find(value)
+            return (
+                []
+                if start < 0
+                else [
+                    Finding("SECRET" if blocked else "EMAIL", start, start + len(value), 1.0, value)
+                ]
+            )
+
+    guard = Counter()
+    root, calls = await fanout_parent(store, 2)
+    request = batch(root, calls)
+    child = Agent(name="reviewer", prompt="p", provider=MockLLM([]), guardrails=[guard])
+    branch = invocation(
+        store,
+        root,
+        ToolCall("reviewer", {"task": SECRET if blocked else "person@example.com"}, id=calls[0]),
+        child,
+        request.parent_wait,
+    )
+    try:
+        prepared = await _run_entry.prepare_child_creation(child, branch)
+        assert hasattr(prepared, "projection"), "preparation must retain its projection"
+        assert hasattr(prepared, "spec"), "preparation must return PreparedChild"
+        before = guard.calls
+        engine = prepared.projection.engine
+        mapping = engine.get_pii_mapping()
+        assert prepared.spec.child_pii_mapping == mapping
+        if not blocked:
+            assert "person@example.com" in mapping.values()
+        else:
+            assert prepared.projection.error and prepared.projection.findings
+            assert prepared.spec.child_meta[BLOCKED_META_KEY] is True
+
+        class OwnerLoop:
+            async def run(self, **kwargs):
+                assert _entry_engine(branch.child_run_id) is engine
+                return RunResult(run_id=branch.child_run_id, status=RunStatus.SUCCESS)
+
+        result = await _run_entry._run_projected_loop(
+            prepared.projection,
+            OwnerLoop(),
+            None,
+            run_id=branch.child_run_id,
+            user_input=prepared.spec.child_input_data["input"],
+            initial_history=None,
+            recorder=None,
+            notifier=None,
+        )
+        assert result.status == (RunStatus.ERROR if blocked else RunStatus.SUCCESS)
+        assert guard.calls == before
+        assert engine.get_pii_mapping() == mapping
+        assert _entry_engine(branch.child_run_id) is None
+    finally:
+        await child.close()
+
+
+@pytest.mark.parametrize("invalid", ["statement_capacity", "input_limit", "loop_tools", "depth"])
+async def test_fix1_preparation_entry_checks_fail_parent_before_bind(store, monkeypatch, invalid):
+    from dendrux import tool
+    from dendrux.loops.single import SingleCall
+    from dendrux.runtime import _managed
+    from dendrux.types import Limits
+
+    root, calls = await fanout_parent(store, 2)
+    request = batch(root, calls)
+    child = Agent(
+        name="reviewer",
+        prompt="p",
+        provider=MockLLM([]),
+        limits=Limits(max_input_bytes=3) if invalid == "input_limit" else None,
+    )
+    branch = invocation(
+        store,
+        root,
+        ToolCall("reviewer", {"task": "too long"}, id=calls[0]),
+        child,
+        request.parent_wait,
+    )
+    if invalid == "statement_capacity":
+
+        async def capacity(self):
+            return 1
+
+        monkeypatch.setattr(type(store), "statement_capacity", capacity, raising=False)
+    elif invalid == "loop_tools":
+
+        @tool()
+        async def unused() -> str:
+            """Return a fixture."""
+            return "ok"
+
+        child.tools = [unused]
+        child._loop = SingleCall()
+    elif invalid == "depth":
+        branch = replace(branch, max_depth=-1)
+    try:
+        with pytest.raises(ValueError):
+            try:
+                await _run_entry.prepare_child_creation(child, branch)
+            except Exception as error:
+                await _managed._after_child_error(branch, error)
+        assert (await store.get_run(root)).status == "error"
+        assert await store.get_run(branch.child_run_id) is None
+        assert await store.get_tool_calls(root) == []
+    finally:
+        await child.close()
+
+
+async def test_fix1_mismatched_child_refused(store):
+    from dendrux.errors import ManagedStateError
+
+    root, calls = await fanout_parent(store, 2)
+    request = batch(root, calls)
+    original = Agent(name="reviewer", prompt="p", provider=MockLLM([]))
+    other = Agent(name="other", prompt="p", provider=MockLLM([]))
+    branch = invocation(
+        store,
+        root,
+        ToolCall("reviewer", {"task": "clean"}, id=calls[0]),
+        original,
+        request.parent_wait,
+    )
+    try:
+        with pytest.raises(ManagedStateError) as error:
+            await _run_entry.prepare_child_creation(other, branch)
+        assert error.value.reason == "child_mismatch"
+        assert error.value.run_id == branch.child_run_id
+    finally:
+        await original.close()
+        await other.close()
+
+
+async def test_fix1_prepared_specs_do_not_share_mutable_values(store):
+    from dataclasses import fields, is_dataclass
+
+    def mutable_ids(value):
+        ids = {id(value)} if isinstance(value, (dict, list, set)) else set()
+        if isinstance(value, dict):
+            children = value.values()
+        elif isinstance(value, (list, tuple, set)):
+            children = value
+        elif is_dataclass(value):
+            children = [getattr(value, f.name) for f in fields(value)]
+        else:
+            children = ()
+        for item in children:
+            ids |= mutable_ids(item)
+        return ids
+
+    root, calls = await fanout_parent(store, 2)
+    request = batch(root, calls)
+    child = Agent(name="reviewer", prompt="p", provider=MockLLM([]))
+    shared = {"task": "clean"}
+    try:
+        specs = []
+        for call in calls:
+            branch = invocation(
+                store, root, ToolCall("reviewer", shared, id=call), child, request.parent_wait
+            )
+            prepared = await _run_entry.prepare_child_creation(child, branch)
+            specs.append(getattr(prepared, "spec", prepared))
+        assert mutable_ids(specs[0]).isdisjoint(mutable_ids(specs[1]))
+        assert mutable_ids(specs[0]).isdisjoint(mutable_ids(shared))
+        specs[0].params["task"] = "changed"
+        assert specs[1].params == shared == {"task": "clean"}
+    finally:
+        await child.close()
+
+
+async def test_fix1_cancel_before_bind_task_first_step(store, monkeypatch):
+    real_create = asyncio.create_task
+    touched = []
+    root = generate_ulid()
+
+    async def operation():
+        touched.append("bind")
+        return tokens()
+
+    def cut_before_first_step(coro, *args, **kwargs):
+        task = real_create(coro, *args, **kwargs)
+        if getattr(getattr(coro, "cr_code", None), "co_name", None) == "_without_live_flush":
+            task.cancel()
+            caller.cancel("first")
+        return task
+
+    monkeypatch.setattr(asyncio, "create_task", cut_before_first_step)
+    caller = real_create(handoff()(store, operation, run_id=root))
+    with pytest.raises(asyncio.CancelledError) as error:
+        await asyncio.wait_for(caller, 5)
+    assert error.value.args == ("first",)
+    assert touched == []
+
+
+async def test_fix1_cancel_during_success_flush_finalizes_claims(store, monkeypatch):
+    root, calls = await fanout_parent(store, 2)
+    request = batch(root, calls)
+    entered = asyncio.Event()
+    armed = True
+
+    async def flush(native):
+        nonlocal armed
+        if armed:
+            armed = False
+            entered.set()
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(durability, "_flush_live_updates", flush)
+    caller = asyncio.create_task(
+        handoff()(store, lambda: store.bind_managed_children(request), run_id=root)
+    )
+    await wait_for_gate(entered, task=caller)
+    caller.cancel("first")
+    with pytest.raises(asyncio.CancelledError) as error:
+        await asyncio.wait_for(caller, 5)
+    assert error.value.args == ("first",)
+    for child in request.children:
+        assert (await store.get_run(child.child_run_id)).status == "cancelled"
+
+
+async def test_fix1_strategy_name_comes_from_strategy_type(store, monkeypatch):
+    from dendrux.strategies.native import NativeToolCalling
+
+    class NamedStrategy(NativeToolCalling):
+        pass
+
+    monkeypatch.setattr(_run_entry, "NativeToolCalling", NamedStrategy)
+    root, calls = await fanout_parent(store, 2)
+    request = batch(root, calls)
+    child = Agent(name="reviewer", prompt="p", provider=MockLLM([]))
+    branch = invocation(
+        store,
+        root,
+        ToolCall("reviewer", {"task": "clean"}, id=calls[0]),
+        child,
+        request.parent_wait,
+    )
+    try:
+        prepared = await _run_entry.prepare_child_creation(child, branch)
+        spec = getattr(prepared, "spec", prepared)
+        assert spec.child_strategy == "NamedStrategy"
+    finally:
+        await child.close()

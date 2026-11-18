@@ -37,7 +37,7 @@ class FanoutLedger:
 
     def accept(self, i: int) -> bool:
         """Transfer entry i to its owner before that task's first await."""
-        if self._closed or self._states[i] != "untransferred":
+        if self._closed or not 0 <= i < len(self._states) or self._states[i] != "untransferred":
             return False
         self._states[i] = "accepted"
         return True
