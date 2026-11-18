@@ -28,7 +28,7 @@ from dendrux.runtime import _managed_budget, _managed_cancel, _managed_definitio
 from dendrux.runtime._bounds import MAX_PAGE
 from dendrux.runtime._entry_checks import entry_checks
 from dendrux.runtime._managed_limits import _saved_walk_limit
-from dendrux.runtime._managed_pending import fanout_children, fanout_wait
+from dendrux.runtime._managed_pending import fanout_children, fanout_wait, require_fanout
 from dendrux.runtime._managed_tree import LeafNode, WaitNode, WorkflowTree
 from dendrux.runtime._run_pending import _build_cached_result, attach_pendings
 from dendrux.runtime.state import (
@@ -158,7 +158,11 @@ class Route:
 
 
 async def walk(root_agent: Agent, store: Any, root_run_id: str) -> tuple[list[_Waiting], RunRecord]:
-    """Follow each v3 wait's exact child id, validating every hop; bounded."""
+    """Follow each v3 wait's exact child id, validating every hop; bounded.
+
+    A v4 fan-out wait ends the branch as its leaf (callers read its view); on a store
+    without fan-out it is refused (``fanout_capability``) before anything is claimed.
+    """
     record = await store.get_run(root_run_id)
     if record is None:
         raise RunNotFoundError(root_run_id)
@@ -168,6 +172,8 @@ async def walk(root_agent: Agent, store: Any, root_run_id: str) -> tuple[list[_W
     limit = await _saved_walk_limit(store, record)
     for index in range(limit):
         wait = await _outgoing(store, record)
+        if wait is not None and wait.managed_fanout is not None:
+            require_fanout(store, record.id)  # a fan-out ends this branch walk (0.8)
         if wait is None or wait.managed_wait is None:
             return waiting, record
         if index + 1 == limit:

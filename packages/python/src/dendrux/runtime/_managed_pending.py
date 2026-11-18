@@ -166,6 +166,15 @@ def checked_child(
 # ---------------------------------------------------------------------------
 
 
+def require_fanout(state: Any, run_id: str) -> None:
+    """Refuse v4 fan-out data on a store that does not declare fan-out (``fanout_capability``).
+
+    Called before anything below the wait is read or claimed.
+    """
+    if not fanout_support(unclaimed_store(state)).capable:
+        raise ManagedStateError(reason="fanout_capability", run_id=run_id)
+
+
 def fanout_wait(state: Any, run_id: str, raw: object, binding: object) -> ManagedFanout:
     """The ordered bindings of a v4 wait, checked against the parent's checkpoint record.
 
@@ -173,8 +182,7 @@ def fanout_wait(state: Any, run_id: str, raw: object, binding: object) -> Manage
     declare fan-out, ``wait_invalid`` for an envelope the strict decoder refuses, and
     ``fanout_invalid`` when the pause envelope and the checkpoint binding disagree.
     """
-    if not fanout_support(unclaimed_store(state)).capable:
-        raise ManagedStateError(reason="fanout_capability", run_id=run_id)
+    require_fanout(state, run_id)
     decoded = decode_managed_binding(raw, run_id=run_id)
     if not isinstance(decoded, ManagedFanout) or not isinstance(raw, dict):
         raise ManagedStateError(reason="fanout_invalid", run_id=run_id)
