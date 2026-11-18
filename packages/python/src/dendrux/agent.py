@@ -1764,7 +1764,7 @@ class Agent:
                 "Pass database_url or state_store to the constructor."
             )
 
-        def submit(agent: Agent, target: str) -> Awaitable[RunResult]:
+        def submit(agent: Agent, target: str, manager: Any = None) -> Awaitable[RunResult]:
             return agent._resume_on(
                 store,
                 target,
@@ -1869,7 +1869,7 @@ class Agent:
         tenant_id: TenantScope,
         expected_pause_id: str | None,
         notifier: LoopNotifier | None,
-        submit: Callable[[Agent, str], Awaitable[RunResult]],
+        submit: Callable[..., Awaitable[RunResult]],
         *,
         adopt_terminal: bool = False,
         **fields: Any,
@@ -1969,7 +1969,7 @@ class Agent:
         if store is None:
             raise PersistenceNotConfiguredError()
 
-        def submit(agent: Agent, target: str) -> Awaitable[RunResult]:
+        def submit(agent: Agent, target: str, manager: Any = None) -> Awaitable[RunResult]:
             return agent._submit_tool_results_to(
                 store,
                 target,
@@ -1977,7 +1977,7 @@ class Agent:
                 notifier=notifier,
                 expected_pause_id=expected_pause_id,
                 tenant_explicit=tenant_explicit,
-                manager=self._task_manager,
+                manager=manager or self._task_manager,
             )
 
         if self._subagents:
@@ -2006,21 +2006,20 @@ class Agent:
         manager: Any,
     ) -> RunResult:
         """Validate with this Agent's definition, claim ``run_id`` and continue it."""
+        from dendrux.runtime._run_resume_prep import results_for_generation
         from dendrux.runtime.runner import resume_claimed
         from dendrux.runtime.submit import (
             claim_or_raise,
             prepare_client_results,
+            require_pause_id,
             serialize_tool_results,
-            validate_tool_results,
         )
         from dendrux.types import RunStatus
 
         provider = self._require_provider()
         skill_session = await continuation(self, store, run_id)
         with skill_session.bind(), await _continuation_projection(self, store, run_id):
-            pause = await validate_tool_results(store, run_id, results)
-            from dendrux.runtime.submit import require_pause_id
-
+            pause = await results_for_generation(store, run_id, results, expected_pause_id)
             require_pause_id(self, expected_pause_id, pause_id=pause.pause_id, run_id=run_id)
             results = await prepare_client_results(self, run_id, pause, results)
             claim_kwargs: dict[str, Any] = {}
@@ -2110,7 +2109,7 @@ class Agent:
         if store is None:
             raise PersistenceNotConfiguredError()
 
-        def submit(agent: Agent, target: str) -> Awaitable[RunResult]:
+        def submit(agent: Agent, target: str, manager: Any = None) -> Awaitable[RunResult]:
             return agent._submit_input_to(
                 store,
                 target,
@@ -2118,7 +2117,7 @@ class Agent:
                 notifier=notifier,
                 expected_pause_id=expected_pause_id,
                 tenant_explicit=tenant_explicit,
-                manager=self._task_manager,
+                manager=manager or self._task_manager,
             )
 
         if self._subagents:
@@ -2291,7 +2290,7 @@ class Agent:
         if store is None:
             raise PersistenceNotConfiguredError()
 
-        def submit(agent: Agent, target: str) -> Awaitable[RunResult]:
+        def submit(agent: Agent, target: str, manager: Any = None) -> Awaitable[RunResult]:
             return agent._submit_approval_to(
                 store,
                 target,
@@ -2301,7 +2300,7 @@ class Agent:
                 notifier=notifier,
                 expected_pause_id=expected_pause_id,
                 tenant_explicit=tenant_explicit,
-                manager=self._task_manager,
+                manager=manager or self._task_manager,
             )
 
         if self._subagents:
@@ -2907,14 +2906,14 @@ class Agent:
         self._require_provider()
         store = await self._require_state_store()
 
-        def submit(agent: Agent, target: str) -> Awaitable[RunResult]:
+        def submit(agent: Agent, target: str, manager: Any = None) -> Awaitable[RunResult]:
             return agent._submit_resume_to(
                 store,
                 target,
                 notifier=notifier,
                 expected_pause_id=expected_pause_id,
                 tenant_explicit=tenant_explicit,
-                manager=self._task_manager,
+                manager=manager or self._task_manager,
             )
 
         if self._subagents:

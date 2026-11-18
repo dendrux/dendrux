@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from dendrux import _codes
 from dendrux._lifecycle import PAUSE_STATUSES, TERMINAL_STATUS_VALUES
@@ -28,7 +28,12 @@ from dendrux.runtime import _managed_budget, _managed_cancel, _managed_definitio
 from dendrux.runtime._bounds import MAX_PAGE
 from dendrux.runtime._entry_checks import entry_checks
 from dendrux.runtime._managed_limits import _saved_walk_limit
-from dendrux.runtime._managed_pending import fanout_children, fanout_wait, require_fanout
+from dendrux.runtime._managed_pending import (
+    fanout_children,
+    fanout_wait,
+    require_allowance,
+    require_fanout,
+)
 from dendrux.runtime._managed_tree import LeafNode, WaitNode, WorkflowTree
 from dendrux.runtime._run_pending import _build_cached_result, attach_pendings
 from dendrux.runtime.state import (
@@ -42,7 +47,7 @@ from dendrux.runtime.submit import _pause_id_required
 from dendrux.types import PauseState, RunResult, RunStatus, ToolCall, UsageStats
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import Awaitable, Callable, Coroutine
 
     from dendrux.agent import Agent
     from dendrux.runtime._entry_checks import EntryPoint
@@ -50,6 +55,7 @@ if TYPE_CHECKING:
     from dendrux.runtime.state import RunRecord, StateStore, TenantScope
 
 logger = logging.getLogger(__name__)
+T = TypeVar("T")
 
 MANAGED_WAIT_REASON = "managed_wait"
 
@@ -347,14 +353,11 @@ class _TreeWalk:
 
     def __init__(self, root_agent: Agent, store: Any, root: RunRecord, limit: int) -> None:
         self.root_agent, self.store, self.root, self.limit = root_agent, store, root, limit
-        self.visited = 0
+        self.fetched = 1  # the root
 
     async def node(
         self, seen: _Seen, agent: Agent, path: tuple[str, ...], call: ToolCall | None
     ) -> WaitNode | LeafNode:
-        self.visited += 1
-        if self.visited > self.limit:
-            raise ManagedStateError(reason="binding_conflict", run_id=self.root.id)
         raw = await self._pause(seen)
         wait = _managed_wait_of(seen, raw)
         if wait is None:
@@ -411,6 +414,7 @@ class _TreeWalk:
         binding = wait.managed_wait
         if binding is None:
             raise ManagedStateError(reason="wait_invalid", run_id=seen.run_id)
+        self._admit(1, seen.run_id)
         child, child_path, state = await _bound_child_state(
             self.store, seen.run_id, seen.tenant_id, binding, self.root.id, path
         )
@@ -427,6 +431,7 @@ class _TreeWalk:
         path: tuple[str, ...],
     ) -> tuple[WaitNode | LeafNode, ...]:
         fanout = fanout_wait(self.store, seen.run_id, raw, seen.binding)
+        self._admit(len(fanout.bindings), seen.run_id)
         rows = await fanout_children(
             self.store, seen.run_id, seen.tenant_id, fanout.bindings, self.root.id, path
         )
@@ -439,6 +444,11 @@ class _TreeWalk:
                 await self.node(_Seen.of_row(row), child_agent, child_path, calls[call_id])
             )
         return tuple(children)
+
+    def _admit(self, batch: int, run_id: str) -> None:
+        """Count ``batch`` runs against the root's saved cap before reading them."""
+        require_allowance(batch, self.limit - self.fetched, run_id)
+        self.fetched += batch
 
     def _agent(self, parent: Agent, path: tuple[str, ...], parent_run_id: str) -> Agent:
         child = _registered(parent, path[-1], parent_run_id)
@@ -547,7 +557,7 @@ async def submit_routed(
     found: Route,
     operation: EntryPoint,
     expected_pause_id: str | None,
-    submit: Callable[[Agent, str], Awaitable[RunResult]],
+    submit: Callable[[Agent, str, Any], Awaitable[RunResult]],
     notifier: Any,
     **fields: Any,
 ) -> RunResult:
@@ -565,8 +575,22 @@ async def submit_routed(
     entry_checks(
         leaf.agent, operation, tree.tenant_id, default_tenant=UNSCOPED, run_id=leaf.run_id, **fields
     )
-    result = await submit(leaf.agent, leaf.run_id)
+    result = await submit(leaf.agent, leaf.run_id, _InlineTasks())
     return await unwind_tree(tree, leaf, store, result, notifier=notifier)
+
+
+class _InlineTasks:
+    """Runs a claimed leaf continuation in the caller's task (spec §8.2 step 3).
+
+    Takes the place of the Agent's task manager for one routed submit: ``spawn``
+    returns the continuation itself, which the submit then awaits in this task, so the
+    leaf's provider calls, tools and ContextVars are the caller's. The runner still
+    registers this task as the run's owner, so in-process cancellation reaches it.
+    """
+
+    def spawn(self, run_id: str, continuation: Coroutine[Any, Any, T]) -> Coroutine[Any, Any, T]:
+        del run_id
+        return continuation
 
 
 async def unwind_tree(

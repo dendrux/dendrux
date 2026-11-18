@@ -17,6 +17,7 @@ from dendrux._lifecycle import (
     StoredEventType,
 )
 from dendrux.errors import (
+    InvalidToolResultError,
     RunFencedError,
 )
 from dendrux.loops.react import ReActLoop
@@ -40,6 +41,8 @@ from dendrux.runtime.submit import (
     _claimed_submission_view,
     _release_supported,
     legacy_approval_denial,
+    pause_validator,
+    validate_tool_results,
 )
 from dendrux.skills._session import SkillSession, current
 from dendrux.types import (
@@ -718,3 +721,24 @@ async def _resume_submission(
             checkpoint=reads.checkpoint,
         )
     return store, expected_status, raw, tool_results, user_parts
+
+
+async def results_for_generation(
+    store: StateStore, run_id: str, results: list[ToolResult], expected_pause_id: str | None
+) -> PauseState:
+    """The pause ``results`` answer, validated; a stale token is reported before the results.
+
+    Call ids belong to one pause generation, so results checked against a newer pause
+    look wrong. When they do and the caller named a token, the generation is compared
+    first: a token for another pause raises ``PauseStatusMismatchError(reason="pause_id")``
+    naming the current one. The claim's locked comparison still follows on success.
+    """
+    try:
+        return await validate_tool_results(store, run_id, results)
+    except InvalidToolResultError:
+        if expected_pause_id is not None:
+            record = await store.get_run(run_id)
+            current = await store.get_pause_state(run_id) or {}
+            status = record.status if record is not None else RunStatus.PAUSED.value
+            pause_validator(run_id, expected_pause_id)({**current, "status": status})
+        raise

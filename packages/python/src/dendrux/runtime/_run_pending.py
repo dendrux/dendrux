@@ -97,10 +97,13 @@ def attach_pendings(result: RunResult, pendings: Sequence[PendingPause]) -> RunR
     """The one writer of a result's pause fields (spec §8.4).
 
     Non-empty: ``pendings`` in stable order, ``pending`` the first and ``pause_id`` its
-    token. Empty: all three are cleared. ``status`` is set by the caller from the same
-    read (``facing_status``; the first pending's status for a managed view), so it is
-    never None and never from another generation than ``pendings``.
+    token. Empty: all three are cleared. ``status`` is set first by the caller from the
+    same read (``facing_status``; the first pending's status for a managed view), so it
+    is never None and never from another generation than ``pendings``; a status that is
+    not a pause carries no pause fields at all.
     """
+    if result.status not in _PAUSE_STATUSES:
+        pendings = ()
     result.pendings = tuple(pendings)
     result.pending = result.pendings[0] if result.pendings else None
     result.pause_id = result.pending.pause_id if result.pending is not None else None
@@ -159,6 +162,8 @@ async def _reread_moved(store: StateStore, result: RunResult) -> None:
     result.error_info = _run_errors._error_info_from_meta(fresh.meta)
     if result.status in _PAUSE_STATUSES:
         await _load_persisted_pending(store, result, fresh)
+    else:
+        attach_pendings(result, ())  # it finished: no earlier read's pause survives
 
 
 async def _load_persisted_pending(store: StateStore, result: RunResult, record: Any) -> bool:

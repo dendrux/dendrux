@@ -34,6 +34,7 @@ def test_public_run_apis_expose_no_tenant_reassignment_slot():
             "get_pause_page",
             "get_pauses",
             "get_pending",
+            "get_pendings",
             "get_pii_mapping",
             "get_run",
             "get_subtree",

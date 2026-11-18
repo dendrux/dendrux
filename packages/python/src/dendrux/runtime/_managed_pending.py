@@ -166,6 +166,12 @@ def checked_child(
 # ---------------------------------------------------------------------------
 
 
+def require_allowance(batch: int, allowance: int, run_id: str) -> None:
+    """Refuse a walk's next read of ``batch`` runs when only ``allowance`` remain."""
+    if batch > allowance:
+        raise ManagedStateError(reason="binding_conflict", run_id=run_id)
+
+
 def require_fanout(state: Any, run_id: str) -> None:
     """Refuse v4 fan-out data on a store that does not declare fan-out (``fanout_capability``).
 
@@ -264,30 +270,40 @@ async def read_workflow(
     header = ManagedHeader.from_dict(start.header, run_id=run_id)
     stack = [(start, header.path)]
     leaves: list[tuple[ManagedHop, tuple[str, ...]]] = []
-    visited = 0
+    fetched = 1
     while stack:
-        visited += 1
-        if visited > MAX_MANAGED_WALK:
-            raise ManagedStateError(reason="binding_conflict", run_id=run_id)
         hop, path = stack.pop()
         if not hop.waiting:
             leaves.append((hop, path))
             continue
-        below = await _children(state, hop, header.root_run_id, path, read_hop)
+        allowance = MAX_MANAGED_WALK - fetched
+        below = await _children(state, hop, header.root_run_id, path, read_hop, allowance)
+        fetched += len(below)
         stack.extend(reversed(below))
     return Workflow(start, header.path, tuple(leaves))
 
 
 async def _children(
-    state: Any, hop: ManagedHop, root_run_id: str, path: tuple[str, ...], read_hop: ReadHop
+    state: Any,
+    hop: ManagedHop,
+    root_run_id: str,
+    path: tuple[str, ...],
+    read_hop: ReadHop,
+    allowance: int,
 ) -> list[tuple[ManagedHop, tuple[str, ...]]]:
-    """A waiting hop's bound children with their paths, in call order."""
+    """A waiting hop's bound children with their paths, in call order.
+
+    ``allowance`` is how many more runs the walk may read; a batch larger than that is
+    refused (``binding_conflict``) before it is read.
+    """
     if not hop.fanout:
+        require_allowance(1, allowance, hop.run_id)
         child = await read_hop(_bound_child_id(hop), UNSCOPED)
         return [_checked_child(hop, child, root_run_id, path)]
     store: Any = unclaimed_store(state)
     raw = await store.get_pause_state(hop.run_id)
     fanout = fanout_wait(state, hop.run_id, raw, hop.binding)
+    require_allowance(len(fanout.bindings), allowance, hop.run_id)
     rows = await fanout_children(
         state, hop.run_id, hop.tenant_id, fanout.bindings, root_run_id, path
     )

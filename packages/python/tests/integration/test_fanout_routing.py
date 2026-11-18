@@ -1145,3 +1145,331 @@ async def test_input_and_requested_pause_paths_attach_or_clear(
     )
     assert (resumed.status, resumed.pendings) == (RunStatus.SUCCESS, ())
     assert_coherent(resumed)
+
+
+async def test_a_refresh_that_sees_the_run_finish_clears_every_pause_field(
+    store: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """§8.4: the run moves client tool -> approval -> success while its result is attached.
+
+    The pending read sees the approval (the run moved), the refresh sees success: the
+    result is SUCCESS with no pending, pendings or token.
+    """
+    from dendrux.runtime import _run_pending
+    from dendrux.runtime._pending import _PendingReader
+
+    agent = solo(store, call("read_sheet", {"sheet": "S"}, "c1"), gated(), LLMResponse(text="ok"))
+    paused = await agent.run("go", tenant_id=TENANT)
+    record = await store.get_run(paused.run_id)
+    facing = _PendingReader.facing
+    raced: list[bool] = []
+
+    async def advancing(self: Any, run_id: str, *, tenant_id: Any) -> Any:
+        if raced:
+            return await facing(self, run_id, tenant_id=tenant_id)
+        raced.append(True)
+        call_id = paused.pending.tool_calls[0].id  # type: ignore[union-attr]
+        await agent.submit_tool_results(
+            run_id,
+            [ToolResult(name="read_sheet", call_id=call_id, payload='"v"')],
+            tenant_id=TENANT,
+            expected_pause_id=paused.pause_id,
+        )
+        view = await facing(self, run_id, tenant_id=tenant_id)  # the approval
+        await agent.submit_approval(
+            run_id, approved=True, tenant_id=TENANT, expected_pause_id=view.pending.pause_id
+        )
+        return view
+
+    monkeypatch.setattr(_PendingReader, "facing", advancing)
+    result = RunResult(run_id=paused.run_id, status=RunStatus.WAITING_CLIENT_TOOL)
+
+    attached = await _run_pending._attach_persisted_pending(store, result, record)
+
+    assert attached.status == RunStatus.SUCCESS
+    assert (attached.pending, attached.pendings, attached.pause_id) == (None, (), None)
+
+
+async def test_a_routed_fanout_leaf_runs_in_the_callers_task(store: Any) -> None:
+    """§8.2 step 3: the claimed leaf runs in the submitting task, with its ContextVars."""
+    import asyncio
+    from contextvars import ContextVar
+
+    request_id: ContextVar[str] = ContextVar("t5_request_id", default="MISSING")
+    seen: list[tuple[str, Any, str]] = []
+
+    class Watching(ScriptedLLM):
+        async def complete(self, messages: Any, tools: Any = None, **kwargs: Any) -> Any:
+            seen.append(("provider", asyncio.current_task(), request_id.get()))
+            return await super().complete(messages, tools, **kwargs)
+
+    @tool()
+    async def stamp(text: str) -> str:
+        """Stamp a draft."""
+        seen.append(("tool", asyncio.current_task(), request_id.get()))
+        return text
+
+    a = Agent(
+        name="a",
+        description="Stamps one draft.",
+        prompt="You stamp.",
+        provider=Watching([call("stamp", {"text": "x"}, "s1"), LLMResponse(text="a done")]),
+        tools=[stamp],
+        require_approval=["stamp"],
+    )
+    b = approver("b")
+    root = root_agent(store, a, b)
+    root_id = await start_root(store, root)
+    fan = await fan_out(store, root, root_id, [a, b])
+    seen.clear()
+
+    request_id.set("req-7")
+    await root.submit_approval(
+        root_id, approved=True, tenant_id=TENANT, expected_pause_id=pause_of(fan, 0)
+    )
+
+    caller = asyncio.current_task()
+    assert seen and [kind for kind, _, _ in seen] == ["tool", "provider"]
+    assert all(task is caller for _, task, _ in seen)
+    assert all(value == "req-7" for _, _, value in seen)
+
+
+def _asks_twice(name: str) -> Agent:
+    """A child that asks the human twice, then answers."""
+    return Agent(
+        name=name,
+        description=f"{name} asks.",
+        prompt="You ask.",
+        provider=ScriptedLLM(
+            [
+                LLMResponse(text="Which one?"),
+                LLMResponse(text="Which again?"),
+                LLMResponse(text="ok"),
+            ]
+        ),
+    )
+
+
+def _reads_twice(name: str) -> Agent:
+    """A child that waits for two client tools in turn, then answers."""
+    return Agent(
+        name=name,
+        description=f"{name} reads.",
+        prompt="You read.",
+        provider=ScriptedLLM(
+            [
+                call("read_sheet", {"sheet": "S1"}, f"{name}-1"),
+                call("read_sheet", {"sheet": "S2"}, f"{name}-2"),
+                LLMResponse(text="ok"),
+            ]
+        ),
+        tools=[read_sheet],
+    )
+
+
+@pytest.mark.parametrize("kind", ["client_tool", "input"])
+async def test_a_token_that_goes_stale_before_the_claim_on_every_submit_kind(
+    store: Any, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    """A3 for client results and input: another caller answers the same leaf after this
+    lookup and it pauses again the same way; the stale submit is a pause_id mismatch
+    naming the leaf's new token, never a payload error."""
+    from tests.integration.test_managed_routing import patch_questions
+
+    patch_questions(monkeypatch)
+    a = _reads_twice("a") if kind == "client_tool" else _asks_twice("a")
+    b = approver("b")
+    root = root_agent(store, a, b)
+    root_id = await start_root(store, root)
+    fan = await fan_out(store, root, root_id, [a, b])
+    first = fan.results[fan.child(0)]
+    assert first.pending is not None and first.pending.kind == kind
+
+    def answer(token: str) -> Any:
+        if kind == "client_tool":
+            call_id = first.pending.tool_calls[0].id  # type: ignore[union-attr]
+            return root.submit_tool_results(
+                root_id,
+                [ToolResult(name="read_sheet", call_id=call_id, payload='"v"')],
+                tenant_id=TENANT,
+                expected_pause_id=token,
+            )
+        return root.submit_input(root_id, "the first", tenant_id=TENANT, expected_pause_id=token)
+
+    walk = _managed_route._walk
+    raced: list[RunResult] = []
+
+    async def walk_then_race(*args: Any) -> Any:
+        walked = await walk(*args)
+        if not raced:
+            raced.append(RunResult(run_id=root_id, status=RunStatus.RUNNING))
+            raced[0] = await answer(pause_of(fan, 0))
+        return walked
+
+    monkeypatch.setattr(_managed_route, "_walk", walk_then_race)
+    with pytest.raises(PauseStatusMismatchError) as caught:
+        await answer(pause_of(fan, 0))
+
+    again = next(p for p in raced[0].pendings if p.origin_run_id == fan.child(0))
+    assert again.kind == kind and again.pause_id != pause_of(fan, 0)
+    assert caught.value.reason == "pause_id"
+    assert caught.value.current_pause_id == again.pause_id
+
+
+# ---------------------------------------------------------------------------
+# Walk bounds: runs are counted before a batch is read, never after
+# ---------------------------------------------------------------------------
+
+
+class _BranchingStore:
+    """A store-free tree of nested 32-way waits (each wait's first child waits again).
+
+    Counts every run id it projects; enough for both walks (pending and routing).
+    """
+
+    def __init__(self, depth: int, width: int = 32) -> None:
+        from types import SimpleNamespace
+
+        from dendrux.runtime._managed_fanout_store import ManagedChildRow
+
+        self.fetched = 0
+        self.pauses: dict[str, dict[str, Any]] = {}
+        self.rows: dict[str, ManagedChildRow] = {}
+        self.intents: dict[str, list[Any]] = {}
+        self.root = generate_ulid()
+        parent, path = self.root, ()
+        self.root_binding = None
+        for level in range(depth):
+            name = f"c{level}"
+            calls = [ToolCall(name=name, params={}, id=generate_ulid()) for _ in range(width)]
+            kids = [generate_ulid() for _ in range(width)]
+            wait = PauseState(
+                agent_name="lead",
+                pending_tool_calls=calls,
+                history=[],
+                steps=[],
+                iteration=1,
+                trace_order_offset=2,
+                usage=UsageStats(),
+                pending_targets={c.id: "agent" for c in calls},
+                pause_reason="managed_wait",
+                pause_id=generate_ulid(),
+                schema_version=4,
+                loop_state_ref=True,
+                managed_fanout=ManagedFanout(
+                    tuple(ManagedWait(c.id, k) for c, k in zip(calls, kids, strict=True))
+                ),
+            )
+            self.pauses[parent] = wait.to_dict()
+            binding = wait.managed_fanout.to_checkpoint(pause_id=str(wait.pause_id))  # type: ignore[union-attr]
+            if parent == self.root:
+                self.root_binding = binding
+            else:
+                self.rows[parent] = replace(
+                    self.rows[parent],
+                    status="paused",
+                    binding=binding,
+                    pause_reason="managed_wait",
+                    pause_id=wait.pause_id,
+                )
+            self.intents[parent] = [
+                SimpleNamespace(
+                    tool_call_id=c.id,
+                    target="agent",
+                    tool_name=c.name,
+                    params={"task": "t"},
+                    provider_tool_call_id=None,
+                )
+                for c in calls
+            ]
+            child_path = (*path, name)
+            for c, kid in zip(calls, kids, strict=True):
+                self.rows[kid] = ManagedChildRow(
+                    kid,
+                    parent,
+                    TENANT,
+                    "running",
+                    ManagedHeader(self.root, child_path, parent, c.id).to_dict(),
+                    None,
+                    "react",
+                    None,
+                    None,
+                )
+            parent, path = kids[0], child_path
+
+    async def get_pause_state(self, run_id: str) -> Any:
+        return self.pauses.get(run_id)
+
+    async def get_managed_children(self, parent: str, ids: Any, *, tenant_id: Any) -> list[Any]:
+        self.fetched += len(ids)
+        return [self.rows[i] for i in ids]
+
+    async def get_tool_calls(self, run_id: str, **kwargs: Any) -> list[Any]:
+        return self.intents[run_id] if kwargs.get("offset", 0) == 0 else []
+
+    async def get_loop_state(self, run_id: str) -> Any:
+        return {"managed_limits": {"max_managed_runs": 128}, "managed_wait": self.root_binding}
+
+
+def _capable(monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    from dendrux.runtime import _managed_pending
+
+    monkeypatch.setattr(
+        _managed_pending, "fanout_support", lambda store: SimpleNamespace(capable=True)
+    )
+
+
+async def test_the_pending_walk_counts_runs_before_reading_a_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Nine nested 32-way waits hold 289 runs: the walk refuses before reading past 257."""
+    from dendrux.errors import ManagedStateError
+    from dendrux.runtime._managed_pending import MAX_MANAGED_WALK, ManagedHop, read_workflow
+
+    _capable(monkeypatch)
+    store = _BranchingStore(depth=9)
+    start = ManagedHop(
+        store.root,
+        "paused",
+        TENANT,
+        None,
+        "lead",
+        ManagedHeader(store.root, ()).to_dict(),
+        store.root_binding,
+    )
+
+    async def read_hop(run_id: str, tenant_id: Any) -> Any:
+        return start
+
+    with pytest.raises(ManagedStateError) as caught:
+        await read_workflow(store, store.root, TENANT, read_hop=read_hop)
+
+    assert caught.value.reason == "binding_conflict"
+    assert 1 + store.fetched <= MAX_MANAGED_WALK
+
+
+async def test_the_route_walk_counts_runs_before_reading_a_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The routing walk's bound is the root's saved cap (128): refused before 4 x 32 reads."""
+    from types import SimpleNamespace
+
+    from dendrux.errors import ManagedStateError
+
+    _capable(monkeypatch)
+    store = _BranchingStore(depth=9)
+    agents = [finisher(f"c{level}") for level in range(9)]
+    for parent, child in zip(agents, agents[1:], strict=False):
+        parent._subagents = [child]  # type: ignore[attr-defined]
+    root = Agent(name="lead", prompt="l", provider=ScriptedLLM([]), subagents=[agents[0]])
+    record = SimpleNamespace(
+        id=store.root, tenant_id=TENANT, status="paused", storage_format=2, parent_run_id=None
+    )
+
+    with pytest.raises(ManagedStateError) as caught:
+        await _managed_route._walk(root, store, record)  # type: ignore[arg-type]
+
+    assert caught.value.reason == "binding_conflict"
+    assert 1 + store.fetched <= 128
