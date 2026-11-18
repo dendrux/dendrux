@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 from sqlalchemy import select
 
 from dendrux._lifecycle import STORAGE_FORMAT_CHECKPOINTED
+from dendrux._managed_wait import _compact_json_bytes
 from dendrux._meta_keys import STORE_SESSION_KEY
 from dendrux.db.models import AgentRun, ToolCallRecord
 from dendrux.errors import ManagedStateError
@@ -45,7 +46,6 @@ from dendrux.types import (
     MANAGED_PROTOCOL_VERSION,
     MANAGED_WAIT_MAX_BYTES,
     RunStatus,
-    _compact_json_bytes,
     _validate_persistable,
     generate_ulid,
 )
