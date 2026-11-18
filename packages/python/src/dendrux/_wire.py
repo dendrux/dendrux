@@ -174,11 +174,14 @@ def _pending_origin(pending: Any) -> dict[str, Any]:
     }
 
 
-def _wire_pendings(result: RunResult, pending: Any) -> tuple[Any, ...]:
-    """Every pause, in ``RunResult.pendings`` order; an old single pause is one item."""
+def _wire_pendings(result: RunResult, pending: Any, mapping: Any) -> list[Any]:
+    """Every pause rendered like ``pending``, in ``RunResult.pendings`` order.
+
+    An old single pause is one item; a run that is not paused has none.
+    """
     if pending is None:
-        return ()
-    return tuple(result.pendings) or (pending,)
+        return []
+    return [_pending_wire(p, mapping) for p in tuple(result.pendings) or (pending,)]
 
 
 def _result_mapping(result: RunResult) -> Any:
@@ -189,7 +192,6 @@ def result_to_dict(result: RunResult) -> dict[str, Any]:
     """Browser DTO, deliberately independent of dataclass/package versions."""
     mapping = _result_mapping(result)
     pending = result.pending if result.status.value in _PAUSED else None
-    pendings = _wire_pendings(result, pending)
     answer = _wire_answer(result)
     omitted = (
         isinstance(result.answer, str)
@@ -208,7 +210,7 @@ def result_to_dict(result: RunResult) -> dict[str, Any]:
         "run_id": result.run_id,
         "status": result.status.value,
         "pending": _pending_wire(pending, mapping) if pending else None,
-        "pendings": [_pending_wire(p, mapping) for p in pendings],
+        "pendings": _wire_pendings(result, pending, mapping),
         "answer": answer,
         "answer_omitted": omitted,
         "output": _structured_output(result.output),
