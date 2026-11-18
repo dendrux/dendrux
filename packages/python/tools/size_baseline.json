@@ -1,6 +1,6 @@
 {
  "dendrux.agent": 3856,
- "dendrux.agent:Agent.__init__": 134,
+ "dendrux.agent:Agent.__init__": 132,
  "dendrux.agent:Agent._ensure_discovered": 106,
  "dendrux.agent:Agent._submit_approval_to": 158,
  "dendrux.agent:Agent.cancel_run": 151,
@@ -38,7 +38,7 @@
  "dendrux.llm.openrouter:OpenRouterProvider.__init__": 113,
  "dendrux.loops._images": 1078,
  "dendrux.loops._images:prepare_request": 219,
- "dendrux.loops.react": 3583,
+ "dendrux.loops.react": 3580,
  "dendrux.loops.react:ReActLoop.run": 203,
  "dendrux.loops.react:ReActLoop.run_stream": 125,
  "dendrux.loops.react:_execute_tool": 206,
