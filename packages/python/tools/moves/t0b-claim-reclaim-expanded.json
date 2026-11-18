@@ -1,0 +1,11 @@
+{
+ "dendrux.runtime._reclaim": {
+  "_ManagedPending": "dendrux.runtime._reclaim_managed",
+  "_finish_saved_adoption": "dendrux.runtime._reclaim_managed",
+  "_handed_off": "dendrux.runtime._reclaim_managed",
+  "_managed_handoff": "dendrux.runtime._reclaim_managed",
+  "_pending_adoption": "dendrux.runtime._reclaim_managed",
+  "_refuse_bound_pending": "dendrux.runtime._reclaim_managed",
+  "_refuse_recovered_managed_results": "dendrux.runtime._reclaim_managed"
+ }
+}
