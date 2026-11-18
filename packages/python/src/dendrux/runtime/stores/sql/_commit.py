@@ -81,9 +81,12 @@ def _comparable(actual: Any, value: Any) -> tuple[Any, Any]:
     return actual, value
 
 
+_BINDS = frozenset({"bind_managed_child", "bind_managed_children"})
+
+
 def _bind_request(name: str, arguments: dict[str, Any]) -> tuple[Any, Any]:
-    """bind_managed_child names its runs in a typed request, not run_id/claim_epoch."""
-    bind = arguments.get("request") if name == "bind_managed_child" else None
+    """Managed binds name their runs in a typed request, not run_id/claim_epoch."""
+    bind = arguments.get("request") if name in _BINDS else None
     return bind, (arguments.get("run_id") if bind is None else bind.parent_run_id)
 
 

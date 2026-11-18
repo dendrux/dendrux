@@ -169,6 +169,7 @@ from dendrux.runtime.stores.sql._sql_claims import _SqlClaims
 from dendrux.runtime.stores.sql._sql_claims import _write_release_event as _write_release_event
 from dendrux.runtime.stores.sql._sql_events import _SqlEvents
 from dendrux.runtime.stores.sql._sql_evidence import _SqlEvidence
+from dendrux.runtime.stores.sql._sql_fanout import _SqlFanout
 from dendrux.runtime.stores.sql._sql_host import _StoreHost
 from dendrux.runtime.stores.sql._sql_leases import _SqlLeases
 from dendrux.runtime.stores.sql._sql_lifecycle import _SqlLifecycle
@@ -297,6 +298,7 @@ def _validated_store_writes(cls: Any) -> Any:
 @_validated_store_writes
 class SQLStateStore(
     _SqlRuns,
+    _SqlFanout,
     _SqlManaged,
     _SqlTree,
     _SqlPause,
@@ -357,6 +359,7 @@ class SQLStateStore(
         atomic_completion=True,
         recovery=True,
         managed_subagents=True,
+        managed_fanout=True,
     )
 
     def _insert(self, table: Any) -> Any:

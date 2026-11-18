@@ -26,7 +26,10 @@ if TYPE_CHECKING:
 
     from sqlalchemy.ext.asyncio import AsyncSession
 
+    from dendrux.runtime._managed_fanout_store import BindManagedChildrenRequest
     from dendrux.runtime.state import BindManagedChildRequest, TenantScope
+
+    _AnyBind = BindManagedChildRequest | BindManagedChildrenRequest
 
 
 def _counted_member(
@@ -57,9 +60,7 @@ def _managed_members(rows: Sequence[Any], root_run_id: str, visited: set[str]) -
 class ManagedReads:
     """Supply managed scope/control reads and bind admission through SQL dialect hooks."""
 
-    async def _lock_managed_root(
-        self: Any, session: AsyncSession, request: BindManagedChildRequest
-    ) -> None:
+    async def _lock_managed_root(self: Any, session: AsyncSession, request: _AnyBind) -> None:
         """Serialize all binders root-first, including those with different parents."""
         await self.reserve_parent_writer(session, request.root_run_id)
         await session.execute(
@@ -77,6 +78,14 @@ class ManagedReads:
     ) -> ManagedHeader:
         """Keep replay free; certify admission after ordinary bind eligibility checks."""
         header = self._bind_admit(request, parent)
+        await self._admit_managed_capacity(session, request, parent, extra=1)
+        # The dynamic mixin self resolves _SqlManaged._bind_admit's typed header.
+        return cast("ManagedHeader", header)
+
+    async def _admit_managed_capacity(
+        self: Any, session: AsyncSession, request: _AnyBind, parent: Any, *, extra: int
+    ) -> None:
+        """Refuse unless ``extra`` more runs fit the root's ``max_managed_runs`` (saturating)."""
         root_state = (
             parent.loop_state
             if request.root_run_id == request.parent_run_id
@@ -91,10 +100,8 @@ class ManagedReads:
         if type(cap) is not int or cap < 1:
             raise ManagedRunLimitError(run_id=request.parent_run_id)
         count = await self._managed_run_count(session, request.root_run_id, cap, request.tenant_id)
-        if count is None or count >= cap:
+        if count is None or count + extra > cap:
             raise ManagedRunLimitError(run_id=request.parent_run_id)
-        # The dynamic mixin self resolves _SqlManaged._bind_admit's typed header.
-        return cast("ManagedHeader", header)
 
     async def _managed_run_count(
         self: Any, session: AsyncSession, root_run_id: str, limit: int, tenant_id: str | None
