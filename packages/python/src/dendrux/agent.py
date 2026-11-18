@@ -43,7 +43,7 @@ from dendrux._lifecycle import TERMINAL_STATUSES as _TERMINAL_STATUSES
 from dendrux._lifecycle import WAITING_STATUSES as _WAITING_STATUS_VALUES
 from dendrux._sentinel import _OMITTED, _OmittedType, _UnsetType
 from dendrux.media._store import DEFAULT_GC_AGE, DEFAULT_GC_LIMIT
-from dendrux.runtime import _managed, _managed_budget, _managed_cancel
+from dendrux.runtime import _managed, _managed_budget, _managed_cancel, _managed_route
 from dendrux.runtime._blob_catalog import MIN_GC_AGE
 from dendrux.runtime._continuation_guardrails import _continuation_projection
 from dendrux.runtime._entry_checks import entry_checks, require_boolean
@@ -1874,19 +1874,20 @@ class Agent:
         adopt_terminal: bool = False,
         **fields: Any,
     ) -> RunResult:
-        """Route a root-id continuation of a managed workflow to its active leaf (0.7).
+        """Route a root-id continuation of a managed workflow to the leaf it answers.
 
-        With ``adopt_terminal`` (a payload-free ``resume``), a finished subagent's
+        Tenant scope is checked at the root; the leaf is reached through the persisted
+        bindings (a fan-out leaf by its token) and validated, claimed and continued with
+        its own registered definition. Finished outcomes then unwind through adoption
+        toward the root, which returns its result or the workflow's next pauses. With
+        ``adopt_terminal`` (a payload-free ``resume`` of a chain), a finished subagent's
         saved outcome is adopted without a token instead.
-
-        Tenant scope is checked at the root; the leaf is reached through the
-        persisted bindings and validated, claimed and continued with the
-        leaf's own registered definition. Finished outcomes then unwind
-        through adoption to the root, which returns its result or the next
-        external pause.
         """
-
-        found = await _managed.route(self, store, run_id, tenant_id=tenant_id)
+        found = await _managed_route.route_tree(self, store, run_id, tenant_id=tenant_id)
+        if not isinstance(found, _managed_route.Route):  # a fan-out in the workflow (0.8)
+            return await _managed_route.submit_routed(
+                found, store, operation, expected_pause_id, submit, notifier=notifier, **fields
+            )
         if adopt_terminal:
             adopted = await _managed.adopt_terminal_leaf(found, store, notifier=notifier)
             if adopted is not None:

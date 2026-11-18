@@ -15,7 +15,7 @@ Runs on SQLite and Postgres (``DENDRUX_TEST_PG_URL``, a private ``*_test`` datab
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -24,8 +24,8 @@ from sqlalchemy import event
 from dendrux import Agent, tool
 from dendrux._lifecycle import TERMINAL_STATUS_VALUES, StoredEventType
 from dendrux._managed_wait import ManagedFanout, ManagedWait
-from dendrux.errors import RunNotFoundError
-from dendrux.runtime import _managed_budget, _managed_route
+from dendrux.errors import PauseStatusMismatchError, RunNotFoundError, RunNotPausedError
+from dendrux.runtime import _managed_budget, _managed_route, _reclaim
 from dendrux.runtime._managed_fanout_store import BindManagedChildrenRequest, ManagedChildSpec
 from dendrux.runtime._reclaim import continue_claimed
 from dendrux.runtime._trace_shared import message_trace
@@ -39,6 +39,7 @@ from dendrux.runtime.state import (
 )
 from dendrux.store import RunStore
 from dendrux.types import (
+    ApprovalDecision,
     LLMResponse,
     Message,
     PauseState,
@@ -402,10 +403,31 @@ class FakeSettle:
 
 @pytest.fixture
 def settle(monkeypatch: pytest.MonkeyPatch) -> FakeSettle:
-    """Route every v4 settle through a fake adoption (the real one is T4c)."""
+    """Route every v4 settle through a fake adoption (the real one is the fan-in task).
+
+    A parent continued after a v4 adoption still holds its old v4 envelope in its pause
+    data. The 0.7 continuation reads only a stale v3 wait there; the fan-in task extends
+    ``_reclaim._continuation_base`` to v4 (contract gap), mirrored here for the test.
+    """
     fake = FakeSettle()
     protocol: SettleParent = fake
     monkeypatch.setattr(_managed_route, "settle_fanout", protocol)
+    base = _reclaim._continuation_base
+
+    def continuation_base(raw: dict[str, Any], run_id: str) -> PauseState:
+        if raw.get("schema_version") != 4:
+            return base(raw, run_id)
+        wait = PauseState.from_managed_dict(raw, run_id=run_id)
+        return replace(
+            wait,
+            managed_fanout=None,
+            schema_version=2,
+            pause_reason=None,
+            pending_tool_calls=[],
+            pending_targets={},
+        )
+
+    monkeypatch.setattr(_reclaim, "_continuation_base", continuation_base)
     return fake
 
 
@@ -703,3 +725,303 @@ async def test_fanout_root_views_attach_every_pause(store: Any) -> None:
         assert [p.origin_run_id for p in result.pendings] == fan.children
         assert result.status == RunStatus.WAITING_APPROVAL
         assert_coherent(result)
+
+
+# ---------------------------------------------------------------------------
+# Routing a root continuation (F1): A2, A3, A4, A8, A14 routing part
+# ---------------------------------------------------------------------------
+
+
+def pause_of(fan: Fan, index: int) -> str:
+    pause_id = fan.results[fan.child(index)].pause_id
+    assert pause_id is not None
+    return pause_id
+
+
+def client_call_id(fan: Fan, index: int) -> str:
+    pending = fan.results[fan.child(index)].pending
+    assert pending is not None
+    return pending.tool_calls[0].id
+
+
+async def test_answers_in_any_order_adopt_once_and_finish_the_root(
+    store: Any, settle: FakeSettle
+) -> None:
+    """A2: approval in one child, a client tool in another; answer the second first."""
+    a, b = approver("a"), client_child("b")
+    root = root_agent(store, a, b)
+    root_id = await start_root(store, root)
+    fan = await fan_out(store, root, root_id, [a, b])
+
+    first = await root.submit_tool_results(
+        root_id,
+        [ToolResult(name="read_sheet", call_id=client_call_id(fan, 1), payload='"v"')],
+        tenant_id=TENANT,
+        expected_pause_id=pause_of(fan, 1),
+    )
+
+    assert first.run_id == root_id and first.status == RunStatus.WAITING_APPROVAL
+    assert [p.origin_run_id for p in first.pendings] == [fan.child(0)]
+    assert first.pause_id == pause_of(fan, 0)
+    assert_coherent(first)
+    assert (settle.calls, settle.adoptions) == ([(root_id, False)], 0)
+
+    final = await root.submit_approval(
+        root_id, approved=True, tenant_id=TENANT, expected_pause_id=pause_of(fan, 0)
+    )
+
+    assert (final.run_id, final.status, final.answer) == (root_id, RunStatus.SUCCESS, ROOT_TEXT)
+    assert_coherent(final)
+    assert (settle.calls[-1], settle.adoptions) == ((root_id, True), 1)
+    assert published == ["a"]
+    assert root.provider.calls == 1  # type: ignore[union-attr]
+
+
+async def test_a_stale_token_at_lookup_names_the_first_pending(store: Any) -> None:
+    """A3, stale at lookup: no leaf has the token; nothing changes."""
+    a, b = approver("a"), approver("b")
+    root = root_agent(store, a, b)
+    root_id = await start_root(store, root)
+    fan = await fan_out(store, root, root_id, [a, b])
+    before = await snapshot(store, root_id, *fan.children)
+
+    with pytest.raises(PauseStatusMismatchError) as caught:
+        await root.submit_approval(
+            root_id, approved=True, tenant_id=TENANT, expected_pause_id=generate_ulid()
+        )
+
+    assert caught.value.reason == "pause_id"
+    assert caught.value.current_pause_id == pause_of(fan, 0)
+    assert await snapshot(store, root_id, *fan.children) == before
+    assert published == []
+
+
+async def test_a_token_that_goes_stale_before_the_claim_names_the_leaf_token(
+    store: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A3, stale inside the leaf's claim: the 0.7 claim error with the leaf's new token."""
+    a = approver("a", call("publish", {"text": "again"}, "a-p2"), LLMResponse(text="a done"))
+    b = approver("b")
+    root = root_agent(store, a, b)
+    root_id = await start_root(store, root)
+    fan = await fan_out(store, root, root_id, [a, b])
+    walk = _managed_route._walk
+    raced: list[RunResult] = []
+    racing: list[bool] = []
+
+    async def walk_then_race(*args: Any) -> Any:
+        walked = await walk(*args)
+        if not racing:  # another caller answers the same leaf after this lookup
+            racing.append(True)
+            raced.append(
+                await root.submit_approval(
+                    root_id, approved=True, tenant_id=TENANT, expected_pause_id=pause_of(fan, 0)
+                )
+            )
+        return walked
+
+    monkeypatch.setattr(_managed_route, "_walk", walk_then_race)
+    with pytest.raises(PauseStatusMismatchError) as caught:
+        await root.submit_approval(
+            root_id, approved=True, tenant_id=TENANT, expected_pause_id=pause_of(fan, 0)
+        )
+
+    leaf_now = raced[0].pendings[0]
+    assert leaf_now.origin_run_id == fan.child(0) and leaf_now.pause_id != pause_of(fan, 0)
+    assert caught.value.reason == "pause_id"
+    assert caught.value.current_pause_id == leaf_now.pause_id
+    assert published == ["a"]  # the racing answer applied once; the stale one never ran
+
+
+async def test_a_denial_in_one_child_affects_only_that_call(store: Any) -> None:
+    """A4: the denied call never runs; the sibling keeps its own pause and token."""
+    a, b = approver("a"), approver("b")
+    root = root_agent(store, a, b)
+    root_id = await start_root(store, root)
+    fan = await fan_out(store, root, root_id, [a, b])
+
+    result = await root.submit_approval(
+        root_id, approved=False, tenant_id=TENANT, expected_pause_id=pause_of(fan, 0)
+    )
+
+    assert published == []
+    child = await store.get_run(fan.child(0))
+    assert child.status == RunStatus.SUCCESS.value
+    assert [(p.origin_run_id, p.pause_id) for p in result.pendings] == [
+        (fan.child(1), pause_of(fan, 1))
+    ]
+    assert_coherent(result)
+    sibling = await store.get_run(fan.child(1))
+    assert (sibling.status, sibling.claim_epoch) == (RunStatus.WAITING_APPROVAL.value, 0)
+
+
+async def test_per_call_decisions_route_to_their_leaf_only(store: Any) -> None:
+    """A14 (routing): decisions name the leaf's own gated calls; the sibling is untouched."""
+    a = Agent(
+        name="a",
+        description="Publishes two drafts.",
+        prompt="You publish.",
+        provider=ScriptedLLM(
+            [
+                LLMResponse(
+                    tool_calls=[
+                        ToolCall(name="publish", params={"text": "x"}, provider_tool_call_id="x"),
+                        ToolCall(name="publish", params={"text": "y"}, provider_tool_call_id="y"),
+                    ]
+                ),
+                LLMResponse(text="a done"),
+            ]
+        ),
+        tools=[publish],
+        require_approval=["publish"],
+    )
+    b = approver("b")
+    root = root_agent(store, a, b)
+    root_id = await start_root(store, root)
+    fan = await fan_out(store, root, root_id, [a, b])
+    gated_calls = [c.id for c in fan.results[fan.child(0)].pending.tool_calls]  # type: ignore[union-attr]
+
+    result = await root.submit_approval(
+        root_id,
+        decisions={
+            gated_calls[0]: ApprovalDecision.approve(),
+            gated_calls[1]: ApprovalDecision.deny("no"),
+        },
+        tenant_id=TENANT,
+        expected_pause_id=pause_of(fan, 0),
+    )
+
+    assert published == ["x"]
+    assert [p.origin_run_id for p in result.pendings] == [fan.child(1)]
+    assert (await store.get_run(fan.child(0))).status == RunStatus.SUCCESS.value
+
+
+async def test_a_fanout_continuation_needs_a_token_and_a_paused_leaf(store: Any) -> None:
+    a, b = approver("a"), finisher("b")
+    root = root_agent(store, a, b)
+    root_id = await start_root(store, root)
+    fan = await fan_out(store, root, root_id, [a, b])
+    before = await snapshot(store, root_id, *fan.children)
+
+    with pytest.raises(ValueError, match="pause_id"):
+        await root.submit_approval(root_id, approved=True, tenant_id=TENANT)
+    assert await snapshot(store, root_id, *fan.children) == before
+
+    running = await start_root(store, root)
+    await fan_out(store, root, running, [finisher("a"), finisher("b")], run=())
+    with pytest.raises(RunNotPausedError):
+        await root.submit_resume(running, tenant_id=TENANT)
+
+
+SUBMITS = {
+    "submit_approval": lambda agent, run_id, tenant, pid: agent.submit_approval(
+        run_id, approved=True, tenant_id=tenant, expected_pause_id=pid
+    ),
+    "submit_tool_results": lambda agent, run_id, tenant, pid: agent.submit_tool_results(
+        run_id,
+        [ToolResult(name="read_sheet", call_id="c", payload='"v"')],
+        tenant_id=tenant,
+        expected_pause_id=pid,
+    ),
+    "submit_input": lambda agent, run_id, tenant, pid: agent.submit_input(
+        run_id, "yes", tenant_id=tenant, expected_pause_id=pid
+    ),
+    "submit_resume": lambda agent, run_id, tenant, pid: agent.submit_resume(
+        run_id, tenant_id=tenant, expected_pause_id=pid
+    ),
+    "resume": lambda agent, run_id, tenant, pid: agent.resume(
+        run_id, tenant_id=tenant, expected_pause_id=pid
+    ),
+}
+
+
+@pytest.mark.parametrize("operation", sorted(SUBMITS))
+async def test_foreign_tenant_submits_are_not_found_before_disclosure(
+    store: Any, operation: str
+) -> None:
+    """A8: a foreign scope cannot submit to, or learn anything about, a fan-out leaf."""
+    a, b = approver("a"), approver("b")
+    root = root_agent(store, a, b)
+    root_id = await start_root(store, root)
+    fan = await fan_out(store, root, root_id, [a, b])
+    before = await snapshot(store, root_id, *fan.children)
+
+    with pytest.raises(RunNotFoundError) as caught:
+        await SUBMITS[operation](root, root_id, OTHER_TENANT, pause_of(fan, 0))
+
+    assert await snapshot(store, root_id, *fan.children) == before
+    shown = str(caught.value)
+    assert not any(secret in shown for secret in (*fan.children, pause_of(fan, 0), BRIEF))
+    assert published == []
+
+
+# ---------------------------------------------------------------------------
+# Leaf-first unwind (§8.2 step 4), proven with the fake settle_parent
+# ---------------------------------------------------------------------------
+
+
+async def test_unwind_settles_the_leafs_parent_first_then_its_parent(
+    store: Any, settle: FakeSettle
+) -> None:
+    """R waits on A and B; A waits on A1 and A2. Answering A2 settles A first, continues
+    A to its end, then settles R (B still paused: R keeps waiting). Answering B then
+    settles R and finishes the root."""
+    a1, a2 = finisher("a1"), approver("a2")
+    middle = Agent(
+        name="middle",
+        description="Delegates twice.",
+        prompt="m",
+        provider=ScriptedLLM([LLMResponse(text="middle done")]),
+        subagents=[a1, a2],
+    )
+    b = approver("b")
+    root = root_agent(store, middle, b)
+    root_id = await start_root(store, root)
+    fan = await fan_out(store, root, root_id, [middle, b], run=(1,))
+    inner = await fan_out(store, root, fan.child(0), [a1, a2], root_id=root_id, path=("middle",))
+
+    first = await root.submit_approval(
+        root_id, approved=True, tenant_id=TENANT, expected_pause_id=pause_of(inner, 1)
+    )
+
+    assert settle.calls == [(fan.child(0), True), (root_id, False)]
+    assert (await store.get_run(fan.child(0))).status == RunStatus.SUCCESS.value
+    assert [p.origin_run_id for p in first.pendings] == [fan.child(1)]
+    assert_coherent(first)
+
+    final = await root.submit_approval(
+        root_id, approved=True, tenant_id=TENANT, expected_pause_id=pause_of(fan, 1)
+    )
+
+    assert settle.calls[-1] == (root_id, True) and settle.adoptions == 2
+    assert (final.status, final.answer) == (RunStatus.SUCCESS, ROOT_TEXT)
+    assert_coherent(final)
+    assert published == ["a2", "b"]
+
+
+async def test_unwind_stops_at_a_parent_with_an_unsettled_child(
+    store: Any, settle: FakeSettle
+) -> None:
+    """A1 still paused: answering A2 settles A (not adoptable) and never reaches R."""
+    a1, a2 = approver("a1"), approver("a2")
+    middle = Agent(
+        name="middle",
+        description="Delegates.",
+        prompt="m",
+        provider=ScriptedLLM([]),
+        subagents=[a1, a2],
+    )
+    b = finisher("b")
+    root = root_agent(store, middle, b)
+    root_id = await start_root(store, root)
+    fan = await fan_out(store, root, root_id, [middle, b], run=(1,))
+    inner = await fan_out(store, root, fan.child(0), [a1, a2], root_id=root_id, path=("middle",))
+
+    result = await root.submit_approval(
+        root_id, approved=True, tenant_id=TENANT, expected_pause_id=pause_of(inner, 1)
+    )
+
+    assert settle.calls == [(fan.child(0), False)]
+    assert [p.origin_run_id for p in result.pendings] == [inner.child(0)]
+    assert result.status == RunStatus.WAITING_APPROVAL
+    assert_coherent(result)
