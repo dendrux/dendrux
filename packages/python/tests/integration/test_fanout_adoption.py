@@ -776,7 +776,7 @@ async def test_adoption_statements_are_a_constant_per_call(store: Any, engine: A
 
 
 # ---------------------------------------------------------------------------
-# Review fix P1-1: only truthful evidence makes a row resolved
+# Only truthful stored evidence makes a row resolved
 # ---------------------------------------------------------------------------
 
 
@@ -879,7 +879,7 @@ async def test_recovery_refuses_a_digestless_row(store: Any, engine: Any, monkey
 
 
 # ---------------------------------------------------------------------------
-# Review fix P1-2: the validated tenant scopes the parent and every child
+# The validated tenant scopes the parent and every child
 # ---------------------------------------------------------------------------
 
 
