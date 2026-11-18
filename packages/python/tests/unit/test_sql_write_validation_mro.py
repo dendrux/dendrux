@@ -74,6 +74,7 @@ EXPECTED_MRO = {
     "SQLStateStore": [
         "SQLStateStore",
         "_SqlRuns",
+        "_SqlFanout",
         "_SqlManaged",
         "_SqlTree",
         "_SqlPause",
@@ -94,6 +95,7 @@ EXPECTED_MRO = {
         "SQLiteStateStore",
         "SQLStateStore",
         "_SqlRuns",
+        "_SqlFanout",
         "_SqlManaged",
         "_SqlTree",
         "_SqlPause",
@@ -114,6 +116,7 @@ EXPECTED_MRO = {
         "PostgresStateStore",
         "SQLStateStore",
         "_SqlRuns",
+        "_SqlFanout",
         "_SqlManaged",
         "_SqlTree",
         "_SqlPause",
@@ -134,6 +137,7 @@ EXPECTED_MRO = {
         "MySQLStateStore",
         "SQLStateStore",
         "_SqlRuns",
+        "_SqlFanout",
         "_SqlManaged",
         "_SqlTree",
         "_SqlPause",
@@ -154,12 +158,14 @@ EXPECTED_MRO = {
 
 # Original member snapshots plus the reviewed _parent_run_query hook: inherited
 # from SQLStateStore on SQLite/Postgres, overridden on MySQL. No other member changed.
+# 0.8 (T3): the _SqlFanout mixin adds bind_managed_children and get_managed_children (two
+# more wrapped public members) and its private batch-bind helpers.
 # Readable snapshots are retained in the task evidence, not loaded by this test.
 BASELINE = {
-    "SQLStateStore": (104, "cbc48d017b771b4f6ad88c4a9237b5e43652bf833a86d9c133f4fb186cb73f8a"),
-    "SQLiteStateStore": (103, "ecdff91bc8169e0df0e724377b6768354916274e231b00e2f34b003065acf695"),
-    "PostgresStateStore": (104, "19ec2821b54cee9bc7b0b28a88d18fbd3351a8e7619de104935bd032cdca975f"),
-    "MySQLStateStore": (103, "87e8210e771e1fbb60532363c3171d57200b87c4563662e96539b40e84cb92b0"),
+    "SQLStateStore": (106, "2d3e1b43e10db40a98575a5eee91c89afc1a37339d72096934ed9114e7cce202"),
+    "SQLiteStateStore": (105, "db0159d9a9dfb658e67d9a054603cbb1dc53f8557a127c8b3bf6e61c68a4c1e2"),
+    "PostgresStateStore": (106, "9130b01e059e94b29880449089602f4aeac152503cc50ba42ec104bffb11b4b4"),
+    "MySQLStateStore": (105, "68d2aaa85b9ca0a2620e6a3fcdd3a994b70eadf693aa585cd304e685e4bfa117"),
 }
 
 
