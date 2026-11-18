@@ -92,11 +92,9 @@ def batch(children: list[Agent]) -> LLMResponse:
 
 
 async def collect(stream: Any, *, timeout: float = DEADLOCK_S) -> list[Any]:
-    async def run() -> list[Any]:
-        async with stream:
-            return [event async for event in stream]
-
-    return await asyncio.wait_for(run(), timeout)
+    """Iterate in this task (``wait_for`` runs its coroutine in another task on 3.11)."""
+    async with asyncio.timeout(timeout), stream:
+        return [event async for event in stream]
 
 
 async def close_all(*agents: Agent) -> None:
@@ -330,15 +328,15 @@ def _full_gate(monkeypatch: Any) -> _FullGate:
     """Set once a producer finds the stream queue full (it is about to block)."""
     full = _FullGate()
     full.blocked = set()
-    original = _managed_stream.FanoutStream._put
+    original = asyncio.Queue.put
 
-    async def put(self: Any, event: Any) -> None:
-        if self.queue.full():
+    async def put(queue: Any, event: Any) -> None:
+        if queue.maxsize == _managed_stream.QUEUE_EVENTS and queue.full():
             full.blocked.add(event.run_id)
             full.set()
-        await original(self, event)
+        await original(queue, event)
 
-    monkeypatch.setattr(_managed_stream.FanoutStream, "_put", put)
+    monkeypatch.setattr(asyncio.Queue, "put", put)
     return full
 
 
@@ -373,16 +371,19 @@ async def test_q2_more_than_the_queue_bound_before_the_next_step(
                 events.append(event)
                 if len(child_events(events, events[0].run_id)) == 1:
                     # Hold the consumer until producers block on the bound.
-                    await asyncio.wait_for(full.wait(), DEADLOCK_S)
+                    async with asyncio.timeout(DEADLOCK_S):
+                        await full.wait()
         return events
 
     try:
         if schedule == "join_first":
             with pytest.raises(TimeoutError):
-                await asyncio.wait_for(consume(), DEADLOCK_S)
+                async with asyncio.timeout(DEADLOCK_S):
+                    await consume()
             assert not owner_tasks_left()
             return
-        events = await asyncio.wait_for(consume(), 4 * DEADLOCK_S)
+        async with asyncio.timeout(4 * DEADLOCK_S):
+            events = await consume()
         assert full.is_set()
         final = events[-1].run_result
         assert (final.status, final.answer) == (RunStatus.SUCCESS, "done")
@@ -481,7 +482,8 @@ async def test_q5_slow_consumer_receives_every_event(store, live_adoption):
                     events.append(event)
                     await asyncio.sleep(0.005)
 
-        await asyncio.wait_for(consume(), 4 * DEADLOCK_S)
+        async with asyncio.timeout(4 * DEADLOCK_S):
+            await consume()
         final = events[-1].run_result
         assert final.status == RunStatus.SUCCESS
         assert len(child_events(events, final.run_id)) == 2 * 5 * 3
@@ -537,32 +539,29 @@ async def test_q5_q6_close_runs_the_exit_path_without_awaiting_the_queue(
                 events.append(event)
                 if child_events(events, events[0].run_id):
                     break  # stop advancing once a child's progress arrived
-            if how == "queue_full":
-                await asyncio.wait_for(full.wait(), DEADLOCK_S)
-            else:
-                for provider in providers:
-                    await wait_for_gate(provider.first_sent, timeout=DEADLOCK_S)
+            async with asyncio.timeout(DEADLOCK_S):
+                if how == "queue_full":
+                    await full.wait()
+                else:
+                    for provider in providers:
+                        await provider.first_sent.wait()
             assert not runs[0].owners_done()
-            await asyncio.wait_for(stream.aclose(), DEADLOCK_S)
+            async with asyncio.timeout(DEADLOCK_S):
+                await stream.aclose()
         root_id = events[0].run_id
         assert stream.result is not None and stream.result.status == RunStatus.CANCELLED
         assert runs[0].owners_done() and not owner_tasks_left()
         assert all(owner.cancelling() <= 1 for owner in runs[0].owners)
         statuses = await _rows(store, root_id)
         ids = await child_ids(store, root_id, ["alpha", "beta"])
-        # A child that finished before the close keeps its success; a producer that
-        # was blocked on the full queue, or any still-running child, is cancelled.
-        blocked = {
-            name
-            for name, child_id in zip(["alpha", "beta"], ids, strict=True)
-            if child_id in full.blocked
-        }
+        # A child whose run finished before the close keeps its success, even when its
+        # owner was still putting that run's events on the full queue; the root and any
+        # still-running child are cancelled.
         assert statuses["root"] == "cancelled"
-        assert {statuses[name] for name in blocked} <= {"cancelled"}
         if how == "abandoned":
             assert statuses == {"root": "cancelled", "alpha": "cancelled", "beta": "cancelled"}
         else:
-            assert blocked and "cancelled" in {statuses["alpha"], statuses["beta"]}
+            assert full.blocked & set(ids)
             assert {statuses["alpha"], statuses["beta"]} <= {"success", "cancelled"}
         for child_id in ids:
             assert not root._task_manager.is_running(child_id)
@@ -841,5 +840,185 @@ async def test_a_stream_that_does_not_own_the_bind_drives_nothing(store, monkeyp
         assert [effects.counts().provider_calls(c.name) for c in children] == [1, 1]
         state = await store.get_loop_state(view.run_id)
         assert state.get("managed_admitted")  # nobody adopted: recovery takes it from here
+    finally:
+        await close_all(root, *children)
+
+
+# ---------------------------------------------------------------------------
+# Cancellation during the exit path, and owner-only production
+# ---------------------------------------------------------------------------
+
+
+def gated_finalize(run: Any, monkeypatch: Any) -> tuple[asyncio.Event, asyncio.Event]:
+    """Hold the driver's retained cleanup (finalize) until ``release``; ``entered`` is set
+    once the exit path is inside it."""
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = run.ledger.finalize
+
+    async def finalize(store: Any, indices: Any) -> None:
+        entered.set()
+        await release.wait()
+        await original(store, indices)
+
+    monkeypatch.setattr(run.ledger, "finalize", finalize)
+    return entered, release
+
+
+async def test_a_cancel_during_the_close_cleanup_still_cancels_the_workflow(
+    store, live_adoption, monkeypatch
+):
+    runs = captured_runs(monkeypatch)
+    pairs = [gated_child("alpha"), gated_child("beta")]
+    children, providers = [c for c, _ in pairs], [p for _, p in pairs]
+    root = lead(store, ScriptedLLM([batch(children), LLMResponse(text="done")]), children)
+    stream = root.stream("go", tenant_id=TENANT)
+    seen: list[Any] = []
+    gates: list[tuple[asyncio.Event, asyncio.Event]] = []
+
+    async def consume() -> None:
+        async with stream:
+            iterator = aiter(stream)
+            async for event in iterator:
+                seen.append(event)
+                if len({e.run_id for e in child_events(seen, seen[0].run_id)}) == 2:
+                    break
+            for provider in providers:
+                await provider.first_sent.wait()
+            gates.append(gated_finalize(runs[0], monkeypatch))
+            await stream.aclose()
+
+    caller = asyncio.create_task(consume())
+    try:
+        async with asyncio.timeout(DEADLOCK_S):
+            while not gates:
+                await asyncio.sleep(0)
+            entered, release = gates[0]
+            await entered.wait()
+        caller.cancel("first")
+        await asyncio.sleep(0)
+        release.set()
+        with pytest.raises(asyncio.CancelledError) as caught:
+            async with asyncio.timeout(DEADLOCK_S):
+                await caller
+        assert caught.value.args == ("first",)
+        statuses = await _rows(store, seen[0].run_id)
+        # The root and every child are finished: nothing is left for an adopter.
+        assert statuses == {"root": "cancelled", "alpha": "cancelled", "beta": "cancelled"}
+        assert not owner_tasks_left()
+    finally:
+        for provider in providers:
+            provider.gate.set()
+        await asyncio.gather(caller, return_exceptions=True)
+        await close_all(root, *children)
+
+
+async def test_a_second_cancellation_in_the_cleanup_keeps_the_first(
+    store, live_adoption, monkeypatch
+):
+    runs = captured_runs(monkeypatch)
+    pairs = [gated_child("alpha"), gated_child("beta")]
+    children, providers = [c for c, _ in pairs], [p for _, p in pairs]
+    root = lead(store, ScriptedLLM([batch(children), LLMResponse(text="done")]), children)
+    seen: list[Any] = []
+
+    async def consume() -> None:
+        async with root.stream("go", tenant_id=TENANT) as stream:
+            async for event in stream:
+                seen.append(event)
+
+    caller = asyncio.create_task(consume())
+    try:
+        async with asyncio.timeout(DEADLOCK_S):
+            for provider in providers:
+                await provider.first_sent.wait()
+            while not runs:
+                await asyncio.sleep(0)
+        entered, release = gated_finalize(runs[0], monkeypatch)
+        caller.cancel("first")  # the consumer waits on wake
+        async with asyncio.timeout(DEADLOCK_S):
+            await entered.wait()
+        caller.cancel("second")  # lands in the retained cleanup
+        await asyncio.sleep(0)
+        release.set()
+        with pytest.raises(asyncio.CancelledError) as caught:
+            async with asyncio.timeout(DEADLOCK_S):
+                await caller
+        assert caught.value.args == ("first",)
+        assert not owner_tasks_left()
+    finally:
+        for provider in providers:
+            provider.gate.set()
+        await asyncio.gather(caller, return_exceptions=True)
+        await close_all(root, *children)
+
+
+def queue_spy(monkeypatch: Any) -> list[tuple[str, str]]:
+    """Record ``(operation, task name)`` for every stream-queue operation."""
+    calls: list[tuple[str, str]] = []
+    put, get = asyncio.Queue.put, asyncio.Queue.get_nowait
+
+    def ours(queue: Any) -> bool:
+        return queue.maxsize == _managed_stream.QUEUE_EVENTS
+
+    async def spy_put(queue: Any, item: Any) -> None:
+        if ours(queue):
+            calls.append(("put", asyncio.current_task().get_name()))
+        await put(queue, item)
+
+    def spy_get(queue: Any) -> Any:
+        if ours(queue):
+            calls.append(("get", asyncio.current_task().get_name()))
+        return get(queue)
+
+    monkeypatch.setattr(asyncio.Queue, "put", spy_put)
+    monkeypatch.setattr(asyncio.Queue, "get_nowait", spy_get)
+    return calls
+
+
+async def test_parallel_tools_hand_their_events_to_the_owner_task(
+    store, live_adoption, monkeypatch
+):
+    calls = queue_spy(monkeypatch)
+    observer = CompletionOrder()
+    children = [noting("alpha", 2), noting("beta", 2)]  # two parallel tools per child
+    root = lead(store, ScriptedLLM([batch(children), LLMResponse(text="done")]), children)
+    try:
+        events = await collect(root.stream("go", tenant_id=TENANT, notifier=observer))
+        final = events[-1].run_result
+        assert (final.status, final.answer) == (RunStatus.SUCCESS, "done")
+        puts = [task for op, task in calls if op == "put"]
+        assert puts and all(task.startswith("fanout:") for task in puts)
+        progress = child_events(events, final.run_id)
+        assert len(progress) == 2 * 2 * 3  # nothing lost
+        for child_id in await child_ids(store, final.run_id, ["alpha", "beta"]):
+            own = [e for e in progress if e.run_id == child_id]
+            assert [e.tool_call_id for e in own if e.type == RunEventType.TOOL_RESULT] == (
+                observer.completed[child_id]
+            )
+    finally:
+        await close_all(root, *children)
+
+
+async def test_closing_a_full_queue_leaves_the_queue_alone(store, live_adoption, monkeypatch):
+    calls = queue_spy(monkeypatch)
+    full = _full_gate(monkeypatch)
+    children = [noting("alpha", Q2_CALLS), noting("beta", Q2_CALLS)]
+    root = lead(store, ScriptedLLM([batch(children), LLMResponse(text="done")]), children)
+    stream = root.stream("go", tenant_id=TENANT)
+    try:
+        async with stream:
+            iterator = aiter(stream)
+            async for _ in iterator:
+                if any(op == "get" for op, _ in calls):
+                    break
+            async with asyncio.timeout(DEADLOCK_S):
+                await full.wait()
+            before = len(calls)
+            async with asyncio.timeout(DEADLOCK_S):
+                await stream.aclose()
+        # The exit path neither drains nor fills the queue; owners were cancelled.
+        assert [op for op, _ in calls[before:]] == []
+        assert not owner_tasks_left()
+        assert stream.result is not None and stream.result.status == RunStatus.CANCELLED
     finally:
         await close_all(root, *children)
