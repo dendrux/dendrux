@@ -45,6 +45,7 @@ _NUMBERS = frozenset(
         "cap",
         "inspected",
         "count",
+        "requested",
         "timeout_seconds",
         "timeout_s",
         "zombie_threads",
@@ -151,6 +152,9 @@ _ENUMS = {
             "recovery_state_missing",
             "recovery_state_invalid",
             "sibling_failed",
+            "client_call",
+            "fanout_limit",
+            "exclusive",
             "skill_mismatch",
             "store_capability",
         ]
@@ -160,6 +164,9 @@ _ENUMS = {
             "binding_conflict",
             "binding_missing",
             "binding_outstanding",
+            "fanout_limit",
+            "fanout_capability",
+            "fanout_invalid",
             "child_mismatch",
             "child_missing",
             "header_invalid",
@@ -899,9 +906,25 @@ MANAGED_BATCH_UNSUPPORTED = Code(
     "managed_batch_unsupported",
     logging.WARNING,
     "subagent",
-    _BASE_FIELDS | frozenset(["count"]),
-    "A model turn asks for two subagents, or a subagent together with a client tool.",
+    _BASE_FIELDS | frozenset(["count", "reason", "limit", "requested"]),
+    "A model turn asks for an unsupported batch of subagent calls.",
     "Nothing in the batch ran; the model sees one error per call and may call them one by one.",
+)
+MANAGED_FANOUT_LIMIT = Code(
+    "managed_fanout_limit",
+    logging.WARNING,
+    "subagent",
+    _BASE_FIELDS | frozenset({"requested", "limit", "store_capability"}),
+    "A subagent batch exceeds the turn limit or store capability.",
+    "Reduce the batch or use a store that supports managed fan-out.",
+)
+MANAGED_FANOUT_BRANCH_ERROR = Code(
+    "managed_fanout_branch_error",
+    logging.WARNING,
+    "subagent",
+    _BASE_FIELDS | frozenset({"error_type"}),
+    "A managed fan-out branch raised an error collected by its owner.",
+    "Inspect safe exception diagnostics for the child run.",
 )
 MANAGED_CHILD_FAILED = Code(
     "managed_child_failed",
@@ -2215,6 +2238,8 @@ REGISTRY = MappingProxyType(
             SUBAGENT_TREE_TOO_LARGE,
             SUBAGENT_FANOUT,
             MANAGED_BATCH_UNSUPPORTED,
+            MANAGED_FANOUT_LIMIT,
+            MANAGED_FANOUT_BRANCH_ERROR,
             MANAGED_CHILD_FAILED,
             MANAGED_CHILD_CANCELLED,
             MANAGED_REPORT_INVALID,
@@ -2294,7 +2319,7 @@ def _valid_field(name: str, value: Any) -> bool:
         )
     if name in _NUMBERS:
         return type(value) in (int, float) and (type(value) is int or math.isfinite(value))
-    if name in {"retryable", "truncated"}:
+    if name in {"retryable", "truncated", "store_capability"}:
         return type(value) is bool
     return _valid_text_field(name, value)
 
