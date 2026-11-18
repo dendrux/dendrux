@@ -1,29 +1,52 @@
-"""Managed subagents: turning one terminal child's saved outcome into its parent's report.
+"""Managed subagents: turning terminal children's saved outcomes into their parent's reports.
 
 The parent admits a child's outcome as it admits any tool result: the report
 is built from the saved terminal record (codes and counts only on failure),
 passed through the parent's ``tool_result_transform``, size-checked and then
-projected through the parent's guardrails. The claim and the completion
-transaction that make the report durable stay in :mod:`dendrux.runtime._managed`.
+projected through the parent's guardrails. For one child (0.7) the claim and
+completion stay in :mod:`dendrux.runtime._managed`; for a fan-out wait (0.8)
+this module claims first and then completes each call in call order.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 from dendrux import _codes
-from dendrux.runtime._managed_route import _Waiting  # noqa: TC001 - move-proof binding
-from dendrux.types import RunStatus, ToolResult
+from dendrux._lifecycle import TERMINAL_STATUSES
+from dendrux._managed_wait import MANAGED_FANOUT_SCHEMA_VERSION
+from dendrux.errors import ManagedStateError, RunNotFoundError
+from dendrux.runtime import _managed_budget, _managed_persistence
+from dendrux.runtime._blocked_content import _blocked_evidence
+from dendrux.runtime._bounds import MAX_PAGE
+from dendrux.runtime._digest import content_digest
+from dendrux.runtime._fanout_adoption_state import (
+    RESOLVED_OUTCOMES,
+    IntentRow,
+    adoption_payload,
+    fanout_adoption,
+    resolved_prefix,
+)
+from dendrux.runtime._managed_claim import claim_fanout_adoption, scoped_run
+from dendrux.runtime._managed_route import (
+    _registered,
+    _Waiting,
+)
+from dendrux.runtime._pending import _accepts_tenant
+from dendrux.runtime.state import MANAGED_HEADER_KEY, ClaimResult, ManagedHeader, claimed_store
+from dendrux.types import PauseState, RunStatus, ToolCall, ToolResult, ToolTarget
 
 if TYPE_CHECKING:
     from dendrux.agent import Agent
-    from dendrux.runtime.state import RunRecord
-    from dendrux.types import ToolCall
+    from dendrux.runtime._managed_tree import WaitNode
+    from dendrux.runtime.state import RunRecord, ToolCallReadRecord
 
 logger = logging.getLogger("dendrux.runtime._managed")
+_TERMINAL = frozenset(status.value for status in TERMINAL_STATUSES)
 
 REPORT_TOO_LARGE = "managed_report_too_large"
 CHILD_FAILED = "managed_child_failed"
@@ -107,11 +130,19 @@ async def accept_report(waiting: _Waiting, record: RunRecord, store: Any) -> Acc
     parent's guardrails project it (PII placeholders) or block it. Only this
     representation becomes durable; recovery never repeats the transform.
     """
-    parent = waiting.parent_agent
+    return await _accept(
+        waiting.parent_agent, waiting.call, waiting.child, record, store, waiting.parent_run_id
+    )
+
+
+async def _accept(
+    parent: Agent, call: ToolCall, child: Agent, record: RunRecord, store: Any, run_id: str
+) -> AcceptedReport:
+    """Report, transform, size check and projection of one terminal child, in that order."""
     limit = parent._limits.max_tool_result_bytes
-    report = replace(child_report(record, waiting.child, limit=limit), call_id=waiting.call.id)
-    report = await _transformed(parent, waiting.call, report, limit, record.id)
-    return await project_report(parent, store, waiting.parent_run_id, report)
+    report = replace(child_report(record, child, limit=limit), call_id=call.id)
+    report = await _transformed(parent, call, report, limit, record.id)
+    return await project_report(parent, store, run_id, report)
 
 
 async def _transformed(
@@ -162,3 +193,307 @@ async def project_report(
 
 
 AcceptedReport.__module__ = "dendrux.runtime._managed"
+
+
+# ---------------------------------------------------------------------------
+# 0.8: adopting a fan-out wait's N terminal children (spec §7.3)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class FanoutCall:
+    """One call of a fan-out wait as adoption completes it: the call and its bound child."""
+
+    call: ToolCall
+    child: Agent
+    child_path: tuple[str, ...]
+    child_run_id: str
+
+
+@dataclass(frozen=True)
+class _FanoutParent:
+    """The adopting parent and its wait's calls, in call order."""
+
+    agent: Agent
+    run_id: str
+    root_run_id: str
+    tenant_id: str | None
+    calls: tuple[FanoutCall, ...]
+
+
+async def adopt_settled(store: Any, node: WaitNode) -> ClaimResult | None:
+    """Claim a settled v4 wait, then complete each call in call order; the claim, or None.
+
+    The caller has read every child of ``node`` terminal in a transaction that
+    began after its own terminal commit (spec §7.2). Claim first: no report is
+    built, transformed or projected before the claim, and a caller that does not
+    win it (the parent is outside the node's tenant: ``RunNotFoundError``; or it
+    is cancelled, moved on, or another caller adopted: None) runs nothing. The
+    returned claim owns the parent's continuation.
+    """
+    parent = _parent_of(node)
+    claim = await claim_fanout_adoption(
+        store,
+        node.run_id,
+        agent=node.agent,
+        pause_id=node.pause_id,
+        bindings=node.bindings,
+        tenant_id=node.tenant_id,
+    )
+    if not isinstance(claim, ClaimResult):
+        return None
+    return await _adopt(store, parent, claim, node.iteration)
+
+
+async def adopt_fanout(store: Any, node: WaitNode, claim: ClaimResult) -> ClaimResult:
+    """Complete a claimed v4 adoption's unresolved rows in call order (``AdoptFanout``).
+
+    Runs under ``claim``, the parent's adoption claim. Returns the claim with the
+    checkpoint after the last completion: wait, admitted calls and marker cleared.
+
+    Raises:
+        ManagedStateError: ``binding_conflict`` when ``claim`` is not this wait's
+            v4 adoption or its rows are not a resolved prefix; ``child_mismatch``
+            when a child is not terminal or is bound elsewhere.
+    """
+    parent = _parent_of(node)
+    await _require_parent(store, parent.run_id, parent.tenant_id)
+    return await _adopt(store, parent, claim, node.iteration)
+
+
+async def finish_fanout_adoption(
+    agent: Agent, owned: Any, run_id: str, claim: ClaimResult, *, tenant_id: str | None
+) -> ClaimResult:
+    """Recovery: complete a claimed v4 adoption from its persisted state, rows still started only.
+
+    ``owned`` is bound to ``claim``, a new claim of the parent whose checkpoint
+    holds the v4 adoption marker (``fanout_adoption``). Call order comes from the
+    claimed pause's ``bindings`` list, which must equal the marker's calls and the
+    claim payload's; each call is rebuilt from its intent row and the parent's
+    registered subagents. Resolved rows are never recomputed. ``tenant_id`` is
+    the workflow's validated tenant: the parent and every child are read within it.
+    """
+    await _require_parent(owned, run_id, tenant_id)
+    state = claim.loop_state or {}
+    ids = fanout_adoption(state, run_id=run_id)
+    if ids is None:
+        raise ManagedStateError(reason=_CONFLICT, run_id=run_id)
+    wait = await _claimed_wait(owned, run_id, ids)
+    header = ManagedHeader.from_dict(state.get(MANAGED_HEADER_KEY), run_id=run_id)
+    rows = await _iteration_rows(owned, run_id, wait.iteration, tenant_id)
+    calls = _recovered_calls(agent, header.path, wait, rows, run_id)
+    parent = _FanoutParent(agent, run_id, header.root_run_id, tenant_id, calls)
+    return await _complete_calls(claimed_store(owned, run_id, claim), parent, claim, rows)
+
+
+_CONFLICT = "binding_conflict"
+
+
+def _parent_of(node: WaitNode) -> _FanoutParent:
+    if node.version != MANAGED_FANOUT_SCHEMA_VERSION:
+        raise ManagedStateError(reason=_CONFLICT, run_id=node.run_id)
+    calls = tuple(
+        FanoutCall(child.call, child.agent, child.agent_path, child.run_id)
+        for child in node.children
+        if child.call is not None
+    )
+    return _FanoutParent(node.agent, node.run_id, node.root_run_id, node.tenant_id, calls)
+
+
+async def _require_parent(store: Any, run_id: str, tenant_id: str | None) -> None:
+    """The adopting parent exists within the workflow's validated tenant."""
+    if await scoped_run(store, run_id, tenant_id) is None:
+        raise RunNotFoundError(run_id)
+
+
+async def _adopt(
+    store: Any, parent: _FanoutParent, claim: ClaimResult, iteration: int
+) -> ClaimResult:
+    owned = claimed_store(store, parent.run_id, claim)
+    rows = await _iteration_rows(owned, parent.run_id, iteration, parent.tenant_id)
+    return await _complete_calls(owned, parent, claim, rows)
+
+
+async def _complete_calls(
+    owned: Any, parent: _FanoutParent, claim: ClaimResult, rows: list[ToolCallReadRecord]
+) -> ClaimResult:
+    """Every call after the resolved prefix, in call order, each from the previous checkpoint."""
+    run_id = parent.run_id
+    bindings = [(item.call.id, item.child_run_id) for item in parent.calls]
+    if fanout_adoption(claim.loop_state, run_id=run_id) != tuple(c for c, _ in bindings):
+        raise ManagedStateError(reason=_CONFLICT, run_id=run_id)
+    _check_bound_rows(rows, {c for c, _ in bindings}, run_id)
+    done = resolved_prefix(_intent_rows(rows), bindings, run_id=run_id)
+    state = dict(claim.loop_state or {})
+    _check_pending(state, [c for c, _ in bindings[done:]], run_id)
+    for item in parent.calls[done:]:
+        state = await _complete_call(owned, parent, item, claim.claim_epoch, state)
+    return ClaimResult(claim.claim_epoch, claim.storage_format, state, None)
+
+
+async def _complete_call(
+    owned: Any, parent: _FanoutParent, item: FanoutCall, epoch: int, state: dict[str, Any]
+) -> dict[str, Any]:
+    """Read, report, transform, project and commit one call; the parent checkpoint after it.
+
+    The projection's engine starts from the parent's persisted PII mapping, which
+    holds every earlier completion's placeholders. A blocked report marks the
+    parent in this call's own completion transaction.
+    """
+    record, child_state = await _terminal_child(owned, parent, item)
+    accepted = await _accept(parent.agent, item.call, item.child, record, owned, parent.run_id)
+    provenance = _managed_budget.child_fault(child_state, record, accepted.result, record.id)
+    blocked = accepted.blocked is not None
+    async with _blocked_evidence(owned, parent.run_id) if blocked else nullcontext():
+        return await _managed_persistence.adopt_fanout_result(
+            owned,
+            parent.run_id,
+            claim_epoch=epoch,
+            state=state,
+            call_id=item.call.id,
+            report=accepted.result,
+            child_run_id=item.child_run_id,
+            agent_path=item.child_path,
+            provenance=provenance,
+            observation=accepted.observation,
+            pii_mapping=accepted.pii_mapping,
+        )
+
+
+async def _terminal_child(
+    owned: Any, parent: _FanoutParent, item: FanoutCall
+) -> tuple[RunRecord, dict[str, Any]]:
+    """The child's terminal record and checkpoint; it must answer this call of this parent.
+
+    The child is read within the parent's tenant, and its checkpoint only after its
+    run proves the parent link: a child outside the tenant is refused unread.
+    """
+    record = await scoped_run(owned, item.child_run_id, parent.tenant_id)
+    if record is None or record.parent_run_id != parent.run_id:
+        raise ManagedStateError(reason="child_mismatch", run_id=parent.run_id)
+    state = await owned.get_loop_state(item.child_run_id)
+    if state is None:
+        raise ManagedStateError(reason="child_missing", run_id=parent.run_id)
+    header = ManagedHeader.from_dict(state.get(MANAGED_HEADER_KEY), run_id=item.child_run_id)
+    if record.status not in _TERMINAL or (
+        header.root_run_id,
+        header.parent_run_id,
+        header.tool_call_id,
+    ) != (parent.root_run_id, parent.run_id, item.call.id):
+        raise ManagedStateError(reason="child_mismatch", run_id=parent.run_id)
+    return record, state
+
+
+async def _claimed_wait(owned: Any, run_id: str, ids: tuple[str, ...]) -> PauseState:
+    """The claimed v4 wait; its bindings and the claim payload name ``ids``, in call order."""
+    raw = await owned.get_pause_state(run_id) or {}
+    try:
+        wait = PauseState.from_managed_dict(raw, run_id=run_id)
+    except ManagedStateError:
+        raise ManagedStateError(reason=_CONFLICT, run_id=run_id) from None
+    fanout = wait.managed_fanout
+    order = () if fanout is None else tuple(b.tool_call_id for b in fanout.bindings)
+    submission = raw.get("submission")
+    payload = submission.get("payload") if isinstance(submission, dict) else None
+    if order != ids or payload != adoption_payload(ids):
+        raise ManagedStateError(reason=_CONFLICT, run_id=run_id)
+    return wait
+
+
+def _recovered_calls(
+    agent: Agent,
+    parent_path: tuple[str, ...],
+    wait: PauseState,
+    rows: list[ToolCallReadRecord],
+    run_id: str,
+) -> tuple[FanoutCall, ...]:
+    """Each binding's call as its intent row recorded it, with the registered child."""
+    by_call = {row.tool_call_id: row for row in rows}
+    calls: list[FanoutCall] = []
+    for binding in wait.managed_fanout.bindings if wait.managed_fanout else ():
+        row = by_call.get(binding.tool_call_id)
+        if row is None:
+            raise ManagedStateError(reason="binding_missing", run_id=run_id)
+        if row.target != ToolTarget.AGENT.value:
+            raise ManagedStateError(reason=_CONFLICT, run_id=run_id)
+        call = ToolCall(
+            name=row.tool_name,
+            params=dict(row.params or {}),
+            id=row.tool_call_id,
+            provider_tool_call_id=row.provider_tool_call_id,
+        )
+        child = _registered(agent, row.tool_name, run_id)
+        calls.append(FanoutCall(call, child, (*parent_path, row.tool_name), binding.child_run_id))
+    return tuple(calls)
+
+
+def _check_bound_rows(records: list[ToolCallReadRecord], calls: set[str], run_id: str) -> None:
+    """Every bound call's row is a managed (``agent``) intent, and a resolved one carries
+    its completion's digest, not the digest its intent was written with."""
+    for record in records:
+        if record.tool_call_id not in calls:
+            continue
+        if record.target != ToolTarget.AGENT.value or (
+            record.outcome in RESOLVED_OUTCOMES and record.content_digest == _intent_digest(record)
+        ):
+            raise ManagedStateError(reason=_CONFLICT, run_id=run_id)
+
+
+def _intent_digest(record: ToolCallReadRecord) -> str:
+    """The digest a started intent row is written with (``start_tool_call`` and the bind)."""
+    return content_digest(
+        dict(
+            tool_call_id=record.tool_call_id,
+            tool_name=record.tool_name,
+            target=record.target,
+            params=record.params,
+        )
+    )
+
+
+def _check_pending(state: dict[str, Any], unresolved: list[str], run_id: str) -> None:
+    """The checkpoint's pending calls are exactly the unresolved calls, in call order.
+
+    The last completion clears the marker in its own transaction, so a claimed
+    adoption always has at least one unresolved call. Extra, repeated or
+    malformed entries refuse.
+    """
+    entries = state.get("pending")
+    ids = (
+        [entry.get("call_id") if isinstance(entry, dict) else None for entry in entries]
+        if isinstance(entries, list)
+        else None
+    )
+    if not unresolved or ids != unresolved:
+        raise ManagedStateError(reason=_CONFLICT, run_id=run_id)
+
+
+def _intent_rows(records: list[ToolCallReadRecord]) -> list[IntentRow]:
+    """The prefix check's view of the iteration's rows: only what the store read back.
+
+    A row counts as resolved only with its persisted digest and its persisted
+    binding; a store that does not return them makes every such row refuse.
+    """
+    return [
+        IntentRow(r.tool_call_id, r.outcome, r.content_digest, r.managed_child_run_id)
+        for r in records
+    ]
+
+
+async def _iteration_rows(
+    store: Any, run_id: str, iteration: int, tenant_id: str | None
+) -> list[ToolCallReadRecord]:
+    """The wait's own iteration rows (one model batch, bounded by ``max_pending_calls``).
+
+    Scoped to ``tenant_id`` when the store's read takes a scope; the parent's own
+    scoped read has already established its identity either way.
+    """
+    scope = {"tenant_id": tenant_id} if _accepts_tenant(store.get_tool_calls) else {}
+    rows: list[ToolCallReadRecord] = []
+    while True:
+        page = await store.get_tool_calls(
+            run_id, iteration_index=iteration, limit=MAX_PAGE, offset=len(rows), **scope
+        )
+        rows.extend(page)
+        if len(page) < MAX_PAGE:
+            return rows
