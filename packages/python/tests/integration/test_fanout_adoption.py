@@ -1046,8 +1046,3 @@ async def test_a_foreign_node_is_refused_whether_or_not_its_parent_is_cancelled(
         await adopt_settled(store, replace(node_of(fanout, root), tenant_id="t2"))
     assert order[:1] == ["get_run"] and "get_managed_run_control" not in order
     await _assert_no_completion(engine, fanout, effects)
-
-
-@pytest.fixture
-def v4_continuation():
-    """Keep fixture imports compatible while exercising the real continuation reader."""

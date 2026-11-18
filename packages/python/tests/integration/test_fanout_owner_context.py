@@ -9,13 +9,11 @@ import pytest
 from dendrux import Agent, tool
 from dendrux.types import LLMResponse, RunStatus, ToolCall
 from tests._helpers.scripted_provider import ScriptedLLM
-from tests.integration.test_fanout_driver import v4_continuation  # noqa: F401
 
 pytestmark = pytest.mark.parametrize("engine", ["sqlite_file", "postgres"], indirect=True)
 request_id: ContextVar[str] = ContextVar("request_id", default="MISSING")
 
 
-@pytest.mark.usefixtures("v4_continuation")
 @pytest.mark.parametrize("n", [1, 2])
 async def test_developer_contextvar_reaches_every_child_tool(store, n):
     seen = []

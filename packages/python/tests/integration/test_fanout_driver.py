@@ -1850,8 +1850,3 @@ async def test_child_failure_uses_the_same_durable_error_at_each_width(store, wi
         await parent.close()
         for child in children:
             await child.close()
-
-
-@pytest.fixture
-def v4_continuation():
-    """Keep fixture imports compatible while exercising the real continuation reader."""
