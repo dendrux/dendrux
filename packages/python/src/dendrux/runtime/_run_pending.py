@@ -225,8 +225,8 @@ def _ensure_pause_generation(
                 for k, v in (provider_kwargs or pause.provider_kwargs).items()
                 if k in {"model", "max_tokens", "temperature", "thinking", "effort"}
             }
-            pending = _in_memory_pending(result)
-            attach_pendings(result, (pending,) if pending is not None else ())
+            result.pending = _in_memory_pending(result)
+            attach_pendings(result, _own_pendings(result))
 
 
 def _pause_event_data(result: RunResult, pause_state: PauseState) -> dict[str, Any]:
