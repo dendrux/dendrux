@@ -342,16 +342,12 @@ class _TreeWalk:
     Reads: the root's record and checkpoint; per v3 wait its pause, the child's record
     and checkpoint and one intent page; per v4 wait its pause envelope, one
     ``get_managed_children`` and one intent read of its iteration; per paused v3 leaf
-    its pause (a fan-out child's token comes with its row). ``chain`` keeps the 0.7
-    waiting list while no v4 wait has been seen.
+    its pause (a fan-out child's token comes with its row).
     """
 
     def __init__(self, root_agent: Agent, store: Any, root: RunRecord, limit: int) -> None:
         self.root_agent, self.store, self.root, self.limit = root_agent, store, root, limit
         self.visited = 0
-        self.fanout = False
-        self.chain: list[_Waiting] = []
-        self.chain_leaf: RunRecord = root
 
     async def node(
         self, seen: _Seen, agent: Agent, path: tuple[str, ...], call: ToolCall | None
@@ -397,8 +393,6 @@ class _TreeWalk:
         call: ToolCall | None,
         raw: dict[str, Any] | None,
     ) -> LeafNode:
-        if seen.record is not None:
-            self.chain_leaf = seen.record
         pause = raw or {}
         return LeafNode(
             run_id=seen.run_id,
@@ -422,9 +416,6 @@ class _TreeWalk:
         )
         child_agent = self._agent(agent, child_path, seen.run_id)
         call = await _intent_call(self.store, seen.run_id, binding.tool_call_id, wait.iteration)
-        self.chain.append(
-            _Waiting(agent, seen.run_id, child_agent, child_path, call, child.id, state.get("loop"))
-        )
         return (await self.node(_Seen.of_record(child, state), child_agent, child_path, call),)
 
     async def _fanout(
@@ -435,7 +426,6 @@ class _TreeWalk:
         agent: Agent,
         path: tuple[str, ...],
     ) -> tuple[WaitNode | LeafNode, ...]:
-        self.fanout = True
         fanout = fanout_wait(self.store, seen.run_id, raw, seen.binding)
         rows = await fanout_children(
             self.store, seen.run_id, seen.tenant_id, fanout.bindings, self.root.id, path
@@ -454,13 +444,6 @@ class _TreeWalk:
         child = _registered(parent, path[-1], parent_run_id)
         return _managed_budget.inherit(child, self.root_agent)
 
-    def route(self) -> Route:
-        """The 0.7 route of a tree whose waits all bind one child (a chain)."""
-        leaf_agent = self.chain[-1].child if self.chain else self.root_agent
-        return Route(
-            self.root.id, self.root.tenant_id, tuple(self.chain), self.chain_leaf, leaf_agent
-        )
-
 
 def _managed_wait_of(seen: _Seen, raw: dict[str, Any] | None) -> PauseState | None:
     """A parked parent's managed wait, decoded strictly; None for any other run.
@@ -475,12 +458,12 @@ def _managed_wait_of(seen: _Seen, raw: dict[str, Any] | None) -> PauseState | No
     return PauseState.from_managed_dict(raw, run_id=seen.run_id)
 
 
-async def _walk(root_agent: Agent, store: Any, root: RunRecord) -> tuple[WorkflowTree, _TreeWalk]:
+async def _walk(root_agent: Agent, store: Any, root: RunRecord) -> WorkflowTree:
     memo = _StateMemo(store)
     limit = await _saved_walk_limit(memo, root)
     walker = _TreeWalk(root_agent, store, root, limit)
     node = await walker.node(_Seen.of_record(root, memo.state), root_agent, (), None)
-    return WorkflowTree(root.id, root.tenant_id, node), walker
+    return WorkflowTree(root.id, root.tenant_id, node)
 
 
 async def walk_tree(
@@ -493,8 +476,7 @@ async def walk_tree(
     run limit. Read-only.
     """
     record = await _scoped_root(store, root_run_id, tenant_id)
-    tree, _ = await _walk(root_agent, store, record)
-    return tree
+    return await _walk(root_agent, store, record)
 
 
 async def _scoped_root(store: Any, run_id: str, tenant_id: Any) -> RunRecord:
@@ -504,10 +486,8 @@ async def _scoped_root(store: Any, run_id: str, tenant_id: Any) -> RunRecord:
     return record
 
 
-async def route_tree(
-    root_agent: Agent, store: Any, run_id: str, *, tenant_id: Any
-) -> Route | WorkflowTree:
-    """Resolve a root-id control: the 0.7 route of a chain, or the tree of a fan-out.
+async def route_tree(root_agent: Agent, store: Any, run_id: str, *, tenant_id: Any) -> WorkflowTree:
+    """Resolve a root-id control to its workflow tree (v3 and v4 waits, every leaf).
 
     The same entry rules as 0.7 routing, before anything below the root is read: a
     missing or foreign run is not found, a managed child id is refused
@@ -517,8 +497,15 @@ async def route_tree(
     if await _managed_cancel.managed_child_header(store, record):
         raise ManagedChildControlError(run_id)
     await _managed_budget.route_checkpoint(root_agent, store, record)
-    tree, walked = await _walk(root_agent, store, record)
-    return tree if walked.fanout else walked.route()
+    return await _walk(root_agent, store, record)
+
+
+async def reaches_fanout(store: Any, found: Route) -> bool:
+    """The 0.7 branch walk stopped at a v4 fan-out wait: it is the route's leaf (0.8)."""
+    if found.leaf.status != RunStatus.PAUSED.value:
+        return False
+    wait = await _outgoing(store, found.leaf)
+    return wait is not None and wait.managed_fanout is not None
 
 
 def find_leaf(tree: WorkflowTree, pause_id: str) -> LeafNode:
@@ -555,20 +542,23 @@ def _required_leaf(tree: WorkflowTree, pause_id: str | None) -> LeafNode:
 
 
 async def submit_routed(
-    tree: WorkflowTree,
+    root_agent: Agent,
     store: Any,
+    found: Route,
     operation: EntryPoint,
     expected_pause_id: str | None,
     submit: Callable[[Agent, str], Awaitable[RunResult]],
-    *,
     notifier: Any,
     **fields: Any,
 ) -> RunResult:
     """Continue the leaf a fan-out workflow's token names, then unwind leaf-first.
 
-    The leaf is validated with its own registered definition (paused leaves continue as
-    ReAct), checked against its own entry rules, claimed and run in the caller's task.
+    ``found`` is the 0.7 route that stopped at the fan-out (its root already in scope).
+    The whole tree is walked from the root again (entry rules first); the leaf is
+    validated with its own registered definition (a paused leaf continues as ReAct),
+    checked against its own entry rules, claimed and run in the caller's task.
     """
+    tree = await route_tree(root_agent, store, found.root_run_id, tenant_id=found.tenant_id)
     leaf = _required_leaf(tree, expected_pause_id)
     parent = tree.ancestors(leaf.run_id)[0]
     _managed_definitions._require_supported_loop(parent.agent, leaf.agent, paused=True)

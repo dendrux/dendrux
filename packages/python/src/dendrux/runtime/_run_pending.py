@@ -96,15 +96,14 @@ async def _read_recovery_info(store: StateStore, record: Any, *, best_effort: bo
 def attach_pendings(result: RunResult, pendings: Sequence[PendingPause]) -> RunResult:
     """The one writer of a result's pause fields (spec §8.4).
 
-    Non-empty: ``pendings`` in stable order, ``pending`` the first, ``pause_id`` its token
-    and ``status`` its waiting status. Empty: ``pending``, ``pendings`` and ``pause_id``
-    are cleared and ``status`` keeps what the caller restored from the record (never None).
+    Non-empty: ``pendings`` in stable order, ``pending`` the first and ``pause_id`` its
+    token. Empty: all three are cleared. ``status`` is set by the caller from the same
+    read (``facing_status``; the first pending's status for a managed view), so it is
+    never None and never from another generation than ``pendings``.
     """
     result.pendings = tuple(pendings)
     result.pending = result.pendings[0] if result.pendings else None
     result.pause_id = result.pending.pause_id if result.pending is not None else None
-    if result.pending is not None:
-        result.status = RunStatus(result.pending.status)
     return result
 
 

@@ -768,8 +768,10 @@ class _PendingReader:
         Depth-first, siblings in their parent batch's call order; the first is what
         :meth:`get_pending` returns. Same scope rules and errors as :meth:`get_pending`.
         """
-        await self.get_pending(run_id, tenant_id=tenant_id)  # one read; it keeps the view
-        return list(self.last_view.pendings) if self.last_view is not None else []
+        pending = await self.get_pending(run_id, tenant_id=tenant_id)  # one read; keeps the view
+        if self.last_view is not None:
+            return list(self.last_view.pendings)
+        return [pending] if pending is not None else []
 
     async def _pending_of(
         self,

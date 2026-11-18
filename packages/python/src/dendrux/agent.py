@@ -1883,10 +1883,10 @@ class Agent:
         ``adopt_terminal`` (a payload-free ``resume`` of a chain), a finished subagent's
         saved outcome is adopted without a token instead.
         """
-        found = await _managed_route.route_tree(self, store, run_id, tenant_id=tenant_id)
-        if not isinstance(found, _managed_route.Route):  # a fan-out in the workflow (0.8)
+        found = await _managed.route(self, store, run_id, tenant_id=tenant_id)
+        if await _managed_route.reaches_fanout(store, found):  # a fan-out below (0.8)
             return await _managed_route.submit_routed(
-                found, store, operation, expected_pause_id, submit, notifier=notifier, **fields
+                self, store, found, operation, expected_pause_id, submit, notifier, **fields
             )
         if adopt_terminal:
             adopted = await _managed.adopt_terminal_leaf(found, store, notifier=notifier)
