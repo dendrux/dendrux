@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import aclosing
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from dendrux._lifecycle import PAUSE_STATUSES, TERMINAL_STATUSES, CancelReason
@@ -41,6 +41,16 @@ QUEUE_EVENTS = 256
 """Bound of one fan-out's stream queue; a full queue blocks the producing owner task."""
 
 
+class _NoFanout:
+    """No fan-out is live: closing has no owner tasks to stop."""
+
+    async def close(self) -> None:
+        return None
+
+
+_NO_FANOUT = _NoFanout()
+
+
 @dataclass
 class _StreamState:
     """What the workflow stream's cleanup needs (mutable, one stream)."""
@@ -56,7 +66,7 @@ class _StreamState:
     """The active leg is the root's own: closing it cancels the root by itself."""
     unstarted: tuple[str, Any] | None = None
     """``(run_id, claim)`` of a claimed continuation whose stream has not started yet."""
-    fanout: FanoutStream | None = None
+    fanout: FanoutStream | _NoFanout = field(default_factory=lambda: _NO_FANOUT)
     """The fan-out whose owner tasks are live: closing the stream runs its exit path first."""
 
 
@@ -162,23 +172,33 @@ class _Terminal:
 
 
 async def _paused_or_failed(
-    state: _StreamState, waiting: list[_Waiting | WaitNode], result: RunResult, terminal: Any
+    state: _StreamState, waiting: list[_Waiting], result: RunResult, terminal: Any
 ) -> RunResult:
     """A leaf that stopped short of terminal: its pause through the root, or a failed attempt.
 
     A continuation attempt that failed and released its claim reports the
-    root-facing state with the attempt's error (the leaf keeps waiting). Under a
-    fan-out the view is read again from the root, so every sibling's pause is in it.
+    root-facing state with the attempt's error (the leaf keeps waiting).
     """
     root_run_id = str(state.root_run_id)
-    failed = getattr(getattr(terminal, "type", None), "value", None) == "run_error"
-    chain = [w for w in waiting if isinstance(w, _Waiting)]
-    if not failed and len(chain) == len(waiting):
-        return await _managed_route._projected_pause(state.store, root_run_id, chain, result)
-    view = await _managed_route.root_view(state.store, root_run_id)
-    if failed:
+    if getattr(getattr(terminal, "type", None), "value", None) == "run_error":
+        view = await _managed_route.root_view(state.store, root_run_id)
         view.error = result.error
         view.error_info = result.error_info
+        return view
+    return await _managed_route._projected_pause(state.store, root_run_id, waiting, result)
+
+
+async def _paused_view(
+    state: _StreamState, waiting: list[_Waiting | WaitNode], result: RunResult, terminal: Any
+) -> RunResult:
+    """``_paused_or_failed`` for any chain: under a fan-out wait the view is read again
+    from the root, so every sibling's pause is in it (and a failed attempt's error)."""
+    chain = [w for w in waiting if isinstance(w, _Waiting)]
+    if len(chain) == len(waiting):
+        return await _paused_or_failed(state, chain, result, terminal)
+    view = await _managed_route.root_view(state.store, str(state.root_run_id))
+    if getattr(getattr(terminal, "type", None), "value", None) == "run_error":
+        view.error, view.error_info = result.error, result.error_info
     return view
 
 
@@ -204,8 +224,7 @@ async def _close_workflow(state: _StreamState) -> RunResult | None:
     continuation, close the active run's stream, then cancel a waiting root with its
     descendants."""
     result = None
-    if state.fanout is not None:
-        await state.fanout.close()
+    await state.fanout.close()
     if state.unstarted is not None:
         await _cancel_unstarted(state)
     if state.current is not None:
@@ -415,7 +434,7 @@ class FanoutStream:
             raise
         finally:
             await run.aexit()
-            state.fanout = None
+            state.fanout = _NO_FANOUT
         while not self.queue.empty():
             yield self.queue.get_nowait()
         run.outcomes()  # the first collected branch error, after every event
@@ -469,6 +488,13 @@ class FanoutStream:
         while not self.queue.empty():
             self.queue.get_nowait()
 
+    async def leg_events(self, state: _StreamState, leg: _Leg) -> AsyncGenerator[RunEvent, None]:
+        """This fan-out as one leg of the workflow stream: its events, then its outcome."""
+        async with aclosing(self.events(state)) as fanned:
+            async for event in fanned:
+                yield event
+        leg.result = self.result
+
     async def close(self) -> None:
         """Abandon the queue, then run the driver's exit path (idempotent)."""
         self._discard()
@@ -511,7 +537,7 @@ async def settle_wait(state: _StreamState, leg: _Leg, wait: WaitNode, notifier: 
     waiting = state.waiting or []
     joined = isinstance(leg.stream, FanoutStream)
     if not joined and leg.result.status not in TERMINAL_STATUSES:
-        return _event(await _paused_or_failed(state, waiting, leg.result, leg.terminal))
+        return _event(await _paused_view(state, waiting, leg.result, leg.terminal))
     claim = await _managed_fanout.settle_parent(state.store, wait)
     if claim is None:
         return _event(await _managed_route.root_view(state.store, str(state.root_run_id)))

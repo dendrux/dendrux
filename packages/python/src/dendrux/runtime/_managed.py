@@ -763,19 +763,20 @@ async def _drain(
     yield _Terminal(terminal)
 
 
+def _leg_events(leg: _Leg, state: _StreamState, *, first: bool) -> Any:
+    """One leg's events: a run's own stream, or a fan-out's owner progress."""
+    if isinstance(leg.stream, _managed_stream.FanoutStream):
+        return leg.stream.leg_events(state, leg)
+    return _run_leg(leg, state, first=first)
+
+
 async def _run_leg(leg: _Leg, state: _StreamState, *, first: bool) -> Any:
-    """Forward one run's events (or one fan-out's) and record its outcome on ``leg``.
+    """Forward one run's events and record its outcome on ``leg``.
 
     A run is the root's own leg only when nothing waits and no child is
     binding. Before its bind a child is not a run: its failure decides for its
     parent, exactly as for ``run()``.
     """
-    if isinstance(leg.stream, _managed_stream.FanoutStream):
-        async with aclosing(leg.stream.events(state)) as fanned:
-            async for event in fanned:
-                yield event
-        leg.result = leg.stream.result
-        return
     root_level = not state.waiting and leg.invocation is None
     state.current, state.root_active = leg.stream, root_level
     try:
@@ -810,7 +811,7 @@ async def _drive_stream(first: Any, state: _StreamState, *, notifier: Any) -> An
     state.waiting = state.waiting if state.waiting is not None else []
     leg = _Leg(first)
     for step in range(_MAX_STEPS):
-        async with aclosing(_run_leg(leg, state, first=step == 0)) as items:
+        async with aclosing(_leg_events(leg, state, first=step == 0)) as items:
             async for item in items:
                 yield item
         if state.root_run_id is None:
@@ -840,7 +841,7 @@ async def _next_leg(leg: _Leg, state: _StreamState, notifier: Any) -> Any:
         return await _managed_stream.settle_wait(state, leg, parent, notifier)
     if result.status not in TERMINAL_STATUSES:
         return _managed_stream._event(
-            await _managed_stream._paused_or_failed(state, waiting, result, leg.terminal)
+            await _managed_stream._paused_view(state, waiting, result, leg.terminal)
         )
     return await _adopt_next(waiting, parent, state, notifier)
 
