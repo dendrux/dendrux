@@ -32,6 +32,7 @@ from dendrux.runtime._trace_shared import message_trace
 from dendrux.runtime.persistence import seed_trace_kwargs
 from dendrux.runtime.state import (
     MANAGED_HEADER_KEY,
+    BindManagedChildRequest,
     ClaimResult,
     EventWrite,
     LoopStatePatch,
@@ -308,6 +309,57 @@ def _child_spec(
         child_seed_traces=tuple(seeds),
         child_model="scripted",
     )
+
+
+async def bind_one(
+    store: Any, root: Agent, parent_id: str, child: Agent, *, root_id: str | None = None
+) -> tuple[str, ClaimResult]:
+    """Park ``parent_id`` on a 0.7 (v3) wait over one child; return the child and its claim."""
+    root_id = root_id or parent_id
+    call_ = ToolCall(name=child.name, params={"task": BRIEF}, id=generate_ulid())
+    await _checkpoint_parent(store, parent_id, root_id, [call_], epoch=0)
+    spec = _child_spec(store, call_, child, ())
+    wait = PauseState(
+        agent_name=root.name,
+        pending_tool_calls=[ToolCall(name=call_.name, params={}, id=call_.id)],
+        history=[],
+        steps=[],
+        iteration=1,
+        trace_order_offset=2,
+        usage=UsageStats(),
+        pending_targets={call_.id: "agent"},
+        pause_reason="managed_wait",
+        pause_id=generate_ulid(),
+        schema_version=3,
+        loop_state_ref=True,
+        managed_wait=ManagedWait(call_.id, spec.child_run_id),
+    )
+    bound = await store.bind_managed_child(
+        BindManagedChildRequest(
+            tenant_id=TENANT,
+            root_run_id=root_id,
+            parent_run_id=parent_id,
+            parent_claim_epoch=0,
+            tool_call_id=call_.id,
+            row_id=spec.row_id,
+            provider_tool_call_id=None,
+            tool_name=call_.name,
+            params=dict(call_.params),
+            iteration_index=1,
+            child_run_id=spec.child_run_id,
+            child_agent_name=child.name,
+            child_path=spec.child_path,
+            child_input_data=spec.child_input_data,
+            child_loop_state=spec.child_loop_state,
+            parent_wait=wait,
+            parent_patch=LoopStatePatch(set_fields={"iteration": 1}),
+            intent_event=spec.intent_event,
+            child_seed_traces=spec.child_seed_traces,
+            child_model="scripted",
+        )
+    )
+    assert bound.child_claim is not None
+    return spec.child_run_id, bound.child_claim
 
 
 class FakeSettle:
@@ -1025,3 +1077,47 @@ async def test_unwind_stops_at_a_parent_with_an_unsettled_child(
     assert [p.origin_run_id for p in result.pendings] == [inner.child(0)]
     assert result.status == RunStatus.WAITING_APPROVAL
     assert_coherent(result)
+
+
+async def test_a_chain_above_a_fanout_shows_every_pause_and_unwinds_through_0_7_adoption(
+    store: Any, settle: FakeSettle
+) -> None:
+    """R waits (v3) on M; M fans out to A and B. Reads re-address both pauses to R; the
+    last answer settles M (v4), continues M, then adopts M into R the 0.7 way."""
+    a, b = approver("a"), approver("b")
+    middle = Agent(
+        name="middle",
+        description="Delegates twice.",
+        prompt="m",
+        provider=ScriptedLLM([LLMResponse(text="middle done")]),
+        subagents=[a, b],
+    )
+    root = root_agent(store, middle)
+    root_id = await start_root(store, root)
+    middle_id, _ = await bind_one(store, root, root_id, middle)
+    fan = await fan_out(store, root, middle_id, [a, b], root_id=root_id, path=("middle",))
+
+    for view in (
+        await root.get_result(root_id, tenant_id=TENANT),
+        await root.reclaim(root_id, tenant_id=TENANT),
+    ):
+        assert [p.origin_run_id for p in view.pendings] == fan.children
+        assert [p.agent_path for p in view.pendings] == [
+            ["lead", "middle", "a"],
+            ["lead", "middle", "b"],
+        ]
+        assert {p.run_id for p in view.pendings} == {root_id}
+        assert_coherent(view)
+
+    first = await root.submit_approval(
+        root_id, approved=True, tenant_id=TENANT, expected_pause_id=pause_of(fan, 1)
+    )
+    assert [p.origin_run_id for p in first.pendings] == [fan.child(0)]
+    final = await root.submit_approval(
+        root_id, approved=True, tenant_id=TENANT, expected_pause_id=pause_of(fan, 0)
+    )
+
+    assert settle.calls == [(middle_id, False), (middle_id, True)]
+    assert (final.run_id, final.status, final.answer) == (root_id, RunStatus.SUCCESS, ROOT_TEXT)
+    assert (await store.get_run(middle_id)).status == RunStatus.SUCCESS.value
+    assert_coherent(final)
