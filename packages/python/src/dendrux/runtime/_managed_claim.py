@@ -22,6 +22,7 @@ from dendrux.errors import (
     RunNotFoundError,
     RunNotReclaimableError,
 )
+from dendrux.runtime import _managed_cancel
 from dendrux.runtime._fanout_adoption_state import (
     FANOUT_ADOPTION_KEY,
     adoption_marker,
@@ -267,9 +268,9 @@ async def claim_fanout_adoption(
 
     Nothing is built, transformed or projected here: the claim records only the
     call ids. ``tenant_id`` is the workflow's validated tenant: the parent is
-    admitted only within it, before its pause is read. Returns False when the
-    parent is no longer at that wait or another caller won the claim (a loser
-    writes nothing).
+    admitted only within it, before its cancellation mark or pause is read.
+    Returns False when the parent is being cancelled, is no longer at that wait,
+    or another caller won the claim (a loser writes nothing).
 
     Raises:
         RunNotFoundError: the parent does not exist within ``tenant_id``.
@@ -281,6 +282,9 @@ async def claim_fanout_adoption(
     )
 
     governance = await _admit_managed_parent(agent, store, run_id, tenant_id=tenant_id)
+    # Only after the scoped admission: a foreign parent never reaches its control row.
+    if await _managed_cancel.cancellation_requested(store, run_id):
+        return False
     raw = await store.get_pause_state(run_id)
     if (
         raw is None
