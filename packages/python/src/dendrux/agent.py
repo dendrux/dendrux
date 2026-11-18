@@ -434,6 +434,7 @@ class Agent:
         description: str = ...,
         tools: list[Callable[..., Any]] = ...,
         subagents: Sequence[Agent] | None = ...,
+        exclusive_subagents: Sequence[str] | None = ...,
         tool_sources: list[MCPServer | MCPSource | MCPHost | MCPToolView] | None = ...,
         max_iterations: int = ...,
         max_delegation_depth: int | None = ...,
@@ -472,6 +473,7 @@ class Agent:
         prompt: str = ...,
         tools: list[Callable[..., Any]] = ...,
         subagents: Sequence[Agent] | None = ...,
+        exclusive_subagents: Sequence[str] | None = ...,
         tool_sources: list[MCPServer | MCPSource | MCPHost | MCPToolView] | None = ...,
         max_iterations: int = ...,
         max_delegation_depth: int | None = ...,
@@ -508,6 +510,7 @@ class Agent:
         prompt: str | _UnsetType = _UNSET,
         tools: list[Callable[..., Any]] | _UnsetType = _UNSET,
         subagents: Sequence[Agent] | None = None,
+        exclusive_subagents: Sequence[str] | None = None,
         tool_sources: list[MCPServer | MCPSource | MCPHost | MCPToolView] | None = None,
         max_iterations: int | _UnsetType = _UNSET,
         max_delegation_depth: int | None | _UnsetType = _UNSET,
@@ -572,7 +575,6 @@ class Agent:
         )
 
         self._configure_persistence(database_url, database_options, state_store)
-
         from dendrux.runtime.tasks import RunTaskManager
 
         self._task_manager: RunTaskManager = RunTaskManager()
@@ -595,7 +597,6 @@ class Agent:
                 f"got {type(before_tool).__name__}."
             )
         self._before_tool: BeforeToolHook | None = before_tool
-
         self._configure_trust(strict_tenancy, limits, tool_threads, on_governance_change)
         self._configure_images(images, blob_store)
         self._configure_tool_sources(tool_sources)
@@ -629,8 +630,7 @@ class Agent:
         self._validate_skill_contents(self._explicit_skills or [])
 
         self._validate()
-        self._configure_subagents(subagents)
-
+        self._configure_subagents(subagents, exclusive_subagents)
         from dendrux import pricing as _pricing
 
         _pricing.check_budget_config(self)
@@ -660,21 +660,21 @@ class Agent:
             _validate_max_delegation_depth(max_delegation_depth)
             self.max_delegation_depth = max_delegation_depth
 
-    def _configure_subagents(self, subagents: Sequence[Agent] | None) -> None:
+    def _configure_subagents(self, subagents: Sequence[Agent] | None, exclusive: Any) -> None:
         """Store ``subagents`` (never mutating them) after the tree checks pass."""
         from dendrux.runtime import _subagents
 
         self._subagents: tuple[Agent, ...] = _subagents.normalize_subagents(self.name, subagents)
-        if not self._subagents:
-            return
-        from dendrux.loops.single import SingleCall
+        if self._subagents:
+            from dendrux.loops.single import SingleCall
 
-        if isinstance(self._loop, SingleCall):
-            _subagents.refuse(
-                _subagents.SubagentDefinitionError(self.name, reason="single_call_parent")
-            )
-        _managed_budget.validate_definitions(self, agent_type=Agent)
-        _subagents.warn_fanout(self)
+            if isinstance(self._loop, SingleCall):
+                _subagents.refuse(
+                    _subagents.SubagentDefinitionError(self.name, reason="single_call_parent")
+                )
+            _managed_budget.validate_definitions(self, agent_type=Agent)
+            _subagents.warn_fanout(self)
+        self._exclusive_subagents = _subagents.normalize_exclusive(self, exclusive)
 
     def _configure_persistence(
         self,

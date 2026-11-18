@@ -35,6 +35,7 @@ __all__ = [
     "SUBAGENT_TASK_FIELD",
     "SubagentDefinitionError",
     "check_subagent_tree",
+    "normalize_exclusive",
     "normalize_subagents",
     "refuse",
     "subagent_tool_def",
@@ -86,6 +87,37 @@ def normalize_subagents(owner_name: str, subagents: Any) -> tuple[Any, ...]:
     if not isinstance(subagents, (list, tuple)):
         refuse(SubagentDefinitionError(owner_name, reason="not_a_list"))
     return tuple(subagents)
+
+
+def normalize_exclusive(owner: Any, exclusive: Any) -> frozenset[str]:
+    """The ``exclusive_subagents=`` names of ``owner`` as a new frozenset.
+
+    Refuses anything but a list or tuple of strings (``exclusive_invalid``), a
+    repeated name (``exclusive_duplicate``) and a name that is not the name of
+    one of ``owner``'s subagents (``exclusive_unknown``; a tool name does not count).
+    """
+    owner_name = owner.name
+    if exclusive is None:
+        return frozenset()
+    if not isinstance(exclusive, (list, tuple)) or not all(isinstance(n, str) for n in exclusive):
+        refuse(SubagentDefinitionError(owner_name, reason="exclusive_invalid"))
+    registered = {child.name for child in owner._subagents}
+    seen: set[str] = set()
+    for index, name in enumerate(exclusive):
+        if name in seen:
+            refuse(
+                SubagentDefinitionError(
+                    owner_name, reason="exclusive_duplicate", subagent_name=name, index=index
+                )
+            )
+        if name not in registered:
+            refuse(
+                SubagentDefinitionError(
+                    owner_name, reason="exclusive_unknown", subagent_name=name, index=index
+                )
+            )
+        seen.add(name)
+    return frozenset(seen)
 
 
 def warn_fanout(agent: Any) -> None:

@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 from sqlalchemy import select
 
 from dendrux._lifecycle import STORAGE_FORMAT_CHECKPOINTED
+from dendrux._managed_wait import _compact_json_bytes
 from dendrux._meta_keys import STORE_SESSION_KEY
 from dendrux.db.models import AgentRun, ToolCallRecord
 from dendrux.errors import ManagedStateError
@@ -41,7 +42,13 @@ from dendrux.runtime.state import (
 )
 from dendrux.runtime.stores.sql import _sql_support
 from dendrux.runtime.stores.sql._sql_managed import _bound_child_id, _SqlManaged
-from dendrux.types import MANAGED_PROTOCOL_VERSION, RunStatus, _validate_persistable, generate_ulid
+from dendrux.types import (
+    MANAGED_PROTOCOL_VERSION,
+    MANAGED_WAIT_MAX_BYTES,
+    RunStatus,
+    _validate_persistable,
+    generate_ulid,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -71,6 +78,13 @@ def _refuse_batch_size(request: BindManagedChildrenRequest) -> None:
     """A batch is 2..32 calls; anything else is refused before any read or write."""
     if not MIN_FANOUT <= len(request.children) <= MAX_FANOUT:
         raise ManagedStateError(reason="fanout_limit", run_id=request.parent_run_id)
+
+
+def _refuse_oversized_wait(plan: BindManagedChildrenRequest) -> None:
+    """The stored wait is bounded like every managed wait: compact UTF-8 JSON, 32 KiB."""
+    wait = plan.encoded_wait
+    if wait is None or _compact_json_bytes(wait) > MANAGED_WAIT_MAX_BYTES:
+        raise ManagedStateError(reason="wait_invalid", run_id=plan.parent_run_id)
 
 
 def _row_bindings(rows: Sequence[Any], request: BindManagedChildrenRequest) -> _Bindings:
@@ -155,6 +169,15 @@ def _existing_wait_id(
     state = parent.loop_state or {}
     intents = [IntentRow(r.tool_call_id, r.outcome, r.content_digest, ch) for r, (_, ch) in rows]
     calls = tuple(c for c, _ in bindings)
+    # Historical first: a fully resolved batch the checkpoint no longer names reads back as
+    # itself, whatever later batch the parent is waiting on or adopting now.
+    historical = not any(row.outcome == ROW_STARTED for row, _ in rows)
+    if (
+        historical
+        and not _names_any(state, set(calls))
+        and resolved_prefix(intents, bindings, run_id=parent_id) == len(bindings)
+    ):
+        return None
     adoption = fanout_adoption(state, run_id=parent_id)
     if adoption is not None:
         outgoing = state.get(MANAGED_BINDING_KEY) or {}
@@ -171,10 +194,6 @@ def _existing_wait_id(
         wait_id = _parked_at(parent, bindings)
         if wait_id is not None:
             return wait_id
-    elif resolved_prefix(intents, bindings, run_id=parent_id) == len(bindings) and not _names_any(
-        state, set(calls)
-    ):
-        return None
     raise ManagedStateError(reason=_CONFLICT, run_id=parent_id)
 
 
@@ -213,6 +232,7 @@ class _SqlFanout(_SqlManaged):
             ):
                 _validate_persistable(value, name)
         plan = request.detached()
+        _refuse_oversized_wait(plan)
         for child in plan.children:
             _sql_support._check_create_identifiers(
                 child.child_run_id, child.child_agent_name, plan.tenant_id, None, child.child_model
@@ -347,7 +367,7 @@ class _SqlFanout(_SqlManaged):
         calls = [_BatchCall.of(plan, child) for child in plan.children]
         for call, state in zip(calls, states, strict=True):
             await self._bind_intent(session, call, nonce)
-            await self._bind_child(session, call, parent, state)
+            await self._bind_child(session, call, parent, state, blocked=call.child_blocked)
         for call in calls:
             await self._bind_seeds(session, call)
             await self._bind_event(session, call)

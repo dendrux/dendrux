@@ -488,8 +488,13 @@ class _SqlManaged(_SqlEvidence, ManagedReads):
         request: _ManagedCall,
         parent: Any,
         child_state: dict[str, Any],
+        *,
+        blocked: bool = False,
     ) -> None:
-        """Create the child running at epoch 0 with its managed header."""
+        """Create the child running at epoch 0 with its managed header.
+
+        ``blocked`` is trusted per-child block evidence (a batch child's ``child_blocked``).
+        """
 
         child_id = request.child_run_id
         session.add(
@@ -506,7 +511,9 @@ class _SqlManaged(_SqlEvidence, ManagedReads):
                 parent_run_id=request.parent_run_id,
                 delegation_level=int(parent.delegation_level or 0) + 1,
                 tenant_id=parent.tenant_id,
-                meta=_sql_support._creation_metadata(session, self, child_id, request.child_meta),
+                meta=_sql_support._creation_metadata(
+                    session, self, child_id, request.child_meta, blocked=blocked
+                ),
                 last_progress_at=_dt.datetime.now(_dt.UTC),
                 claim_epoch=0,
             )

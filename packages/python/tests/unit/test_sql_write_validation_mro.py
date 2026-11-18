@@ -159,13 +159,14 @@ EXPECTED_MRO = {
 # Original member snapshots plus the reviewed _parent_run_query hook: inherited
 # from SQLStateStore on SQLite/Postgres, overridden on MySQL. No other member changed.
 # 0.8 (T3): the _SqlFanout mixin adds bind_managed_children and get_managed_children (two
-# more wrapped public members) and its private batch-bind helpers.
+# more wrapped public members) and its private batch-bind helpers; _bind_child takes the
+# keyword-only trusted ``blocked`` evidence of a batch child.
 # Readable snapshots are retained in the task evidence, not loaded by this test.
 BASELINE = {
-    "SQLStateStore": (106, "2d3e1b43e10db40a98575a5eee91c89afc1a37339d72096934ed9114e7cce202"),
-    "SQLiteStateStore": (105, "db0159d9a9dfb658e67d9a054603cbb1dc53f8557a127c8b3bf6e61c68a4c1e2"),
-    "PostgresStateStore": (106, "9130b01e059e94b29880449089602f4aeac152503cc50ba42ec104bffb11b4b4"),
-    "MySQLStateStore": (105, "68d2aaa85b9ca0a2620e6a3fcdd3a994b70eadf693aa585cd304e685e4bfa117"),
+    "SQLStateStore": (106, "3cce8c685f7013262e17f0e68c579ca2487c7b6cf60a179f869b450f57468821"),
+    "SQLiteStateStore": (105, "781aa7f7fc25badf805b95c7bbce74692037ec45cf892404e8f2763940646662"),
+    "PostgresStateStore": (106, "b8b243254ef4fe7cd36ace4455c0287257d752850ba6c1a43aa6f81906e9c39c"),
+    "MySQLStateStore": (105, "f67c47e67b1ed2379447bda73e86ecd2142976c5e2d9dc09d0c54889dc11c9a2"),
 }
 
 

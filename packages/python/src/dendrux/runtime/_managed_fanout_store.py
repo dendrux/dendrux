@@ -62,8 +62,14 @@ class ManagedChildSpec:
     child_strategy: str | None = None
     child_meta: dict[str, Any] | None = None
     child_pii_mapping: dict[str, str] | None = None
+    child_blocked: bool = False
+    """Trusted guardrail-block evidence for this child, set only by runtime preparation after
+    projecting the brief; the store marks the child's creation metadata with it. A blocked
+    marker inside ``child_meta`` is caller data and is always dropped."""
 
     def __post_init__(self) -> None:
+        if type(self.child_blocked) is not bool:
+            raise ValueError("child_blocked must be a bool")
         object.__setattr__(self, "child_path", tuple(self.child_path))
         object.__setattr__(self, "child_seed_traces", tuple(self.child_seed_traces))
         for name in ("row_id", "child_run_id"):
