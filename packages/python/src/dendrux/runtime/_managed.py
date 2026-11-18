@@ -1,8 +1,4 @@
-"""Drive single-child workflows inline through durable bind, adoption and continuation.
-
-Routing, reports and stream cleanup live in the managed helper modules. Fan-out
-claim ownership lives in ``_managed_fanout``; the N=1 driver stays in this task.
-"""
+"""Drive managed workflows; single children stay in the caller's task."""
 
 from __future__ import annotations
 
@@ -403,7 +399,9 @@ async def _trampoline(
                 # Cycle: fan-out delegates N=1 descendants back to this driver.
                 from dendrux.runtime import _managed_fanout
 
-                result = await _managed_fanout.drive_fanout(invocation, notifier=notifier)
+                result = await _managed_fanout.drive_fanout(
+                    invocation, notifier=notifier, adopt_settled=_managed_adoption.adopt_settled
+                )
                 continue
             result, bound = await _run_child(invocation, notifier)
             if bound:

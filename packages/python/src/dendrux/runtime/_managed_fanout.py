@@ -18,8 +18,10 @@ from dendrux.loops._managed_batch import MANAGED_HANDOFF_KEY, ManagedHandoff
 from dendrux.loops.base import BaseNotifier, LoopNotifier
 from dendrux.runtime import (
     _managed,
+    _managed_adoption,
     _managed_budget,
     _managed_cancel,
+    _managed_fanout_store,
     _reclaim,
     _run_events,
     _run_execute,
@@ -29,7 +31,6 @@ from dendrux.runtime._capabilities import capabilities, fanout_support
 from dendrux.runtime._fanout_ledger import FanoutLedger
 from dendrux.runtime._managed import ManagedInvocation
 from dendrux.runtime._managed_definitions import require_bindable
-from dendrux.runtime._managed_fanout_store import BindManagedChildrenRequest, ManagedFanoutStore
 from dendrux.runtime._managed_tree import BranchSpec, FanoutInvocation, LeafNode, WaitNode
 from dendrux.runtime._run_entry import PreparedChild, prepare_child_creation
 from dendrux.runtime.durability import _fanout_ownership_handoff
@@ -123,7 +124,7 @@ async def start_fanout(
     branches = branch_invocations(invocation)
     try:
         prepared = await _prepare_batch(invocation.store, branches)
-        request = BindManagedChildrenRequest(
+        request = _managed_fanout_store.BindManagedChildrenRequest(
             tenant_id=invocation.tenant_id,
             root_run_id=invocation.root_run_id,
             parent_run_id=invocation.parent_run_id,
@@ -139,7 +140,9 @@ async def start_fanout(
         )
         bound = await _fanout_ownership_handoff(
             invocation.store,
-            lambda: cast("ManagedFanoutStore", invocation.store).bind_managed_children(request),
+            lambda: cast(
+                "_managed_fanout_store.ManagedFanoutStore", invocation.store
+            ).bind_managed_children(request),
             run_id=invocation.parent_run_id,
         )
     except Exception as error:  # noqa: BLE001, RUF100 - pre-bind isolation preserves the single-child refusal policy.
@@ -420,7 +423,7 @@ async def settle_parent(
     This driver never transforms or writes a report itself.
     """
     # fanout_support validates this optional protocol before the driver binds.
-    rows = await cast("ManagedFanoutStore", store).get_managed_children(
+    rows = await cast("_managed_fanout_store.ManagedFanoutStore", store).get_managed_children(
         node.run_id, [b.child_run_id for b in node.bindings], tenant_id=node.tenant_id
     )
     if len(rows) != len(node.bindings) or {r.run_id for r in rows} != {
@@ -443,7 +446,7 @@ async def settle_parent(
     if any(r.status not in _TERMINAL for r in rows):
         return None
 
-    return await (adopt_settled or _adopt_settled)(store, node)
+    return await (adopt_settled or _managed_adoption.adopt_settled)(store, node)
 
 
 class _PreparationStore:
@@ -538,7 +541,7 @@ async def drive_fanout(
 ) -> RunResult:
     """Join the owned branches, adopt through the Protocol, and continue in this task.
 
-    Claim and completion are injected until T4c merges. A not-owner marker lets
+    The adopter owns the claim and per-call completions. A not-owner marker lets
     the enclosing trampoline return its fresh root view without executing a child.
     """
     try:
@@ -648,11 +651,6 @@ def _handoff_branches(
             )
         )
     return tuple(branches)
-
-
-async def _adopt_settled(store: StateStore, node: WaitNode) -> ClaimResult | None:
-    # TODO(T4c merge): replace this line with _managed_adoption.adopt_settled(store, node).
-    raise ManagedStateError(reason="fanout_invalid", run_id=node.run_id)
 
 
 async def continue_parent(
