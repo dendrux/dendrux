@@ -1,0 +1,150 @@
+{
+  "version": 1,
+  "base": "f60cb1f879dd4d9bb03c4ab4bfc0eef54f8f957c",
+  "old": "src/dendrux/runtime/persistence.py",
+  "source_sha256": "f55c966edad500cf97ac79ec523edf1c9c7745ea2afdf2d0558e412e8dfde65a",
+  "sources": {
+    "src/dendrux/runtime/persistence.py": "db5de91b04cdaf613617b9f265d773b9bf17bd9f38f86546d9ca8eae6b6a99db",
+    "src/dendrux/runtime/_managed_persistence.py": "056c2917c175df0fc82665d922e4718cae8d0e4454c739baefe97faf0abf1f35",
+    "src/dendrux/runtime/_trace_shared.py": "573a1ba941011218bdcf23bb1d5bcfb5e34020af724f16a9d7bf9011bcaefb74"
+  },
+  "owners": {
+    "logger": "src/dendrux/runtime/persistence.py",
+    "_paused_call": "src/dendrux/runtime/persistence.py",
+    "_pause_pending": "src/dendrux/runtime/persistence.py",
+    "_tool_call_evidence": "src/dendrux/runtime/_trace_shared.py",
+    "_serialize_message": "src/dendrux/runtime/persistence.py",
+    "image_dict": "src/dendrux/runtime/persistence.py",
+    "_SURFACE_FAMILY": "src/dendrux/runtime/persistence.py",
+    "provider_family": "src/dendrux/runtime/persistence.py",
+    "image_stats": "src/dendrux/runtime/persistence.py",
+    "message_trace": "src/dendrux/runtime/_trace_shared.py",
+    "_message_trace": "src/dendrux/runtime/_trace_shared.py",
+    "_MessagePlan": "src/dendrux/runtime/persistence.py",
+    "_planned_call": "src/dendrux/runtime/persistence.py",
+    "_plan_assistant": "src/dendrux/runtime/persistence.py",
+    "_message_position": "src/dendrux/runtime/persistence.py",
+    "_plan_message": "src/dendrux/runtime/persistence.py",
+    "seed_trace_kwargs": "src/dendrux/runtime/persistence.py",
+    "_view_identity": "src/dendrux/runtime/persistence.py",
+    "PersistenceRecorder": "src/dendrux/runtime/persistence.py",
+    "PersistenceRecorder.__init__": "src/dendrux/runtime/persistence.py",
+    "PersistenceRecorder._blocked_evidence": "src/dendrux/runtime/persistence.py",
+    "PersistenceRecorder._pause_summary_bytes": "src/dendrux/runtime/persistence.py",
+    "PersistenceRecorder.restore_history": "src/dendrux/runtime/persistence.py",
+    "PersistenceRecorder._remember": "src/dendrux/runtime/persistence.py",
+    "PersistenceRecorder._remember_observation": "src/dendrux/runtime/persistence.py",
+    "PersistenceRecorder._mapping": "src/dendrux/runtime/persistence.py",
+    "PersistenceRecorder._pii_patch": "src/dendrux/runtime/persistence.py",
+    "PersistenceRecorder.bind_loop": "src/dendrux/runtime/persistence.py",
+    "PersistenceRecorder._restore_budget": "src/dendrux/runtime/persistence.py",
+    "PersistenceRecorder._state_ref": "src/dendrux/runtime/persistence.py",
+    "PersistenceRecorder._snapshot": "src/dendrux/runtime/persistence.py",
+    "PersistenceRecorder._checkpoint": "src/dendrux/runtime/persistence.py",
+    "PersistenceRecorder.finalization_trace": "src/dendrux/runtime/persistence.py",
+    "PersistenceRecorder.execution_counts": "src/dendrux/runtime/persistence.py",
+    "PersistenceRecorder.configure_tools": "src/dendrux/runtime/persistence.py",
+    "PersistenceRecorder._submitted_client_counts": "src/dendrux/runtime/persistence.py",
+    "PersistenceRecorder._submission_traces": "src/dendrux/runtime/persistence.py",
+    "PersistenceRecorder.consume_resume": "src/dendrux/runtime/persistence.py",
+    "PersistenceRecorder.mark_managed_refusal": "src/dendrux/runtime/persistence.py",
+    "PersistenceRecorder.order_observations": "src/dendrux/runtime/persistence.py",
+    "PersistenceRecorder.checkpoint_view": "src/dendrux/runtime/persistence.py",
+    "PersistenceRecorder._rebase_pending": "src/dendrux/runtime/persistence.py",
+    "PersistenceRecorder._edited_view": "src/dendrux/runtime/persistence.py",
+    "PersistenceRecorder.on_llm_call_started": "src/dendrux/runtime/persistence.py",
+    "PersistenceRecorder.checkpoint_outcome": "src/dendrux/runtime/persistence.py",
+    "PersistenceRecorder.prepare_clarification": "src/dendrux/runtime/persistence.py",
+    "PersistenceRecorder._checkpoint_clarification": "src/dendrux/runtime/persistence.py",
+    "PersistenceRecorder.check_lease": "src/dendrux/runtime/persistence.py",
+    "PersistenceRecorder.lease_scope": "src/dendrux/runtime/persistence.py",
+    "PersistenceRecorder._edge_kwargs": "src/dendrux/runtime/persistence.py",
+    "PersistenceRecorder._edges": "src/dendrux/runtime/persistence.py",
+    "PersistenceRecorder._emit_event": "src/dendrux/runtime/persistence.py",
+    "PersistenceRecorder.on_message_appended": "src/dendrux/runtime/persistence.py",
+    "PersistenceRecorder._apply_message_plan": "src/dendrux/runtime/persistence.py",
+    "PersistenceRecorder._append_legacy_message": "src/dendrux/runtime/persistence.py",
+    "PersistenceRecorder.on_llm_call_completed": "src/dendrux/runtime/persistence.py",
+    "PersistenceRecorder.resolve_observation": "src/dendrux/runtime/persistence.py",
+    "PersistenceRecorder.on_tool_started": "src/dendrux/runtime/persistence.py",
+    "PersistenceRecorder._check_custom_dispatch": "src/dendrux/runtime/persistence.py",
+    "PersistenceRecorder._write_tool_intent": "src/dendrux/runtime/persistence.py",
+    "PersistenceRecorder._touch_tool_progress": "src/dendrux/runtime/persistence.py",
+    "PersistenceRecorder._start_checkpointed_tool": "src/dendrux/runtime/persistence.py",
+    "PersistenceRecorder._record_tool_intent": "src/dendrux/runtime/persistence.py",
+    "PersistenceRecorder.on_llm_call_failed": "src/dendrux/runtime/persistence.py",
+    "PersistenceRecorder.format_observation": "src/dendrux/runtime/persistence.py",
+    "PersistenceRecorder.take_observation": "src/dendrux/runtime/persistence.py",
+    "PersistenceRecorder.observation_scope": "src/dendrux/runtime/persistence.py",
+    "PersistenceRecorder.on_projected_tool_completed": "src/dendrux/runtime/persistence.py",
+    "PersistenceRecorder.on_tool_completed": "src/dendrux/runtime/persistence.py",
+    "PersistenceRecorder._complete_observation": "src/dendrux/runtime/persistence.py",
+    "PersistenceRecorder.on_governance_event": "src/dendrux/runtime/persistence.py",
+    "ResolutionAction": "src/dendrux/runtime/persistence.py",
+    "resolve_pending": "src/dendrux/runtime/persistence.py",
+    "adopt_managed_result": "src/dendrux/runtime/_managed_persistence.py"
+  },
+  "lexical": [
+    {
+      "root": "adopt_managed_result",
+      "module": "src/dendrux/runtime/_managed_persistence.py",
+      "name": "message_trace",
+      "target": "dendrux.runtime._trace_shared.message_trace",
+      "count": 1
+    }
+  ],
+  "hoists": [
+    {
+      "root": "adopt_managed_result",
+      "module": "src/dendrux/runtime/_managed_persistence.py",
+      "statement": "from dendrux.errors import ManagedStateError",
+      "comment": ""
+    },
+    {
+      "root": "adopt_managed_result",
+      "module": "src/dendrux/runtime/_managed_persistence.py",
+      "statement": "from dendrux.runtime.state import EventWrite, _apply_loop_patch",
+      "comment": "",
+      "eager": [
+        {
+          "module": "dendrux.runtime._capabilities",
+          "path": "src/dendrux/runtime/_capabilities.py",
+          "source": "\"\"\"Validate explicit StateStore promises without inferring legacy capabilities.\"\"\"\n\nfrom __future__ import annotations\n\nimport inspect\nimport logging\nimport warnings\nimport weakref\nfrom typing import Any, NoReturn\n\nfrom dendrux import _codes\nfrom dendrux._warnings import _developer_stacklevel\nfrom dendrux.errors import StoreCapabilityError\nfrom dendrux.runtime.state import StoreCapabilities\n\n_REQUIREMENTS: dict[str, dict[str, tuple[str, ...]]] = {\n    \"fenced_writes\": {\n        name: (\"claim_epoch\",)\n        for name in (\n            \"save_trace\",\n            \"save_tool_call\",\n            \"save_usage\",\n            \"save_llm_interaction\",\n            \"save_run_event\",\n            \"add_note\",\n            \"mark_notes_delivered\",\n            \"update_run_meta\",\n            \"touch_progress\",\n        )\n    },\n    \"retry_ids\": {\n        \"save_trace\": (\"trace_id\",),\n        \"save_tool_call\": (\"row_id\",),\n        \"save_run_event\": (\"event_id\",),\n        \"save_usage\": (\"usage_id\",),\n        \"save_llm_interaction\": (\"interaction_id\",),\n    },\n    \"checkpointing\": {\n        \"create_run\": (\"seed_traces\", \"pii_mapping\"),\n        \"save_tool_call\": (\"outcome\",),\n        \"complete_tool_call\": (\"pii_mapping\",),\n        \"consume_submission\": (\"pii_mapping\",),\n        \"checkpoint_step\": (),\n        \"get_traces_after\": (),\n        \"conversation_traces\": (),\n        \"save_trace\": (\"trace_kind\",),\n        \"claim_paused_run\": (),\n        \"submit_and_claim\": (),\n    },\n    \"atomic_completion\": {\n        \"start_tool_call\": (),\n        \"complete_tool_call\": (),\n        \"finalize_with_event\": (\"trace\",),\n    },\n    \"recovery\": {\n        \"mark_lease_expired\": (\"finalise_unrecoverable\",),\n        \"get_lease_expired\": (),\n        \"reclaim_run\": (),\n        \"get_replayed_tool_calls\": (),\n    },\n    \"managed_subagents\": {\n        \"bind_managed_child\": (),\n        \"get_managed_cancel_children_page\": (\"after\", \"limit\", \"tenant_id\"),\n        \"is_managed_root_stopped\": (),\n        \"get_managed_run_control\": (),\n        \"get_run_control\": (),\n        \"mark_cancel_requested\": (),\n        \"get_children_page\": (),\n    },\n}\n# Managed subagents need every durability promise the bind and adoption rely on.\n_MANAGED_PREREQUISITES = (\n    \"fenced_writes\",\n    \"retry_ids\",\n    \"checkpointing\",\n    \"atomic_completion\",\n    \"recovery\",\n)\n_CACHE: dict[int, tuple[weakref.ReferenceType[Any], StoreCapabilities]] = {}\nlogger = logging.getLogger(__name__)\n\n\ndef validate_capabilities(store: Any) -> StoreCapabilities:\n    \"\"\"Validate each declared capability once per live store object.\"\"\"\n    key = id(store)\n    cached = _CACHE.get(key)\n    if cached is not None and cached[0]() is store:\n        return cached[1]\n    caps = inspect.getattr_static(store, \"capabilities\", None)\n    if caps is None:\n        return StoreCapabilities()\n    if not isinstance(caps, StoreCapabilities) or caps.version != 1:\n        _refuse(store, \"version\", \"capabilities\", (\"version=1\",))\n    if caps.deployment is None:\n        warnings.warn(\n            \"StateStore capabilities should declare deployment; legacy declaration is undeclared.\",\n            DeprecationWarning,\n            stacklevel=_developer_stacklevel(),\n        )\n    elif caps.deployment not in (\"single_process\", \"single_host\", \"multi_server\"):\n        _refuse(store, \"deployment\", \"capabilities\", (\"deployment\",))\n    for capability, methods in _REQUIREMENTS.items():\n        if getattr(caps, capability):\n            for method, keywords in methods.items():\n                _check_method(store, capability, method, keywords)\n    try:\n        ref = weakref.ref(store, lambda _ref: _CACHE.pop(key, None))\n    except TypeError:\n        return caps\n    _CACHE[key] = (ref, caps)\n    return caps\n\n\ndef _check_method(store: Any, capability: str, method: str, keywords: tuple[str, ...]) -> None:\n    # Signature inspection must not invoke application descriptors or spies.\n    target = inspect.getattr_static(store, method, None)\n    if not callable(target):\n        _refuse(store, capability, method, keywords or (method,))\n    try:\n        params = inspect.signature(target).parameters\n    except (TypeError, ValueError):\n        _refuse(store, capability, method, keywords or (method,))\n    missing = tuple(\n        k\n        for k in keywords\n        if k not in params or params[k].kind is not inspect.Parameter.KEYWORD_ONLY\n    )\n    if missing:\n        _refuse(store, capability, method, missing)\n\n\ndef require_managed_subagents(store: Any) -> StoreCapabilities:\n    \"\"\"Refuse before any managed write unless the store can bind managed children.\n\n    The store must declare ``managed_subagents`` and every durability capability\n    the bind and adoption rely on. Narrowing one of those (for example\n    ``recovery=False``) keeps the store valid for ordinary runs and turns\n    managed use off; it is not a construction error.\n    \"\"\"\n    validate_capabilities(store)\n    caps = capabilities(store)\n    if not caps.managed_subagents:\n        _refuse(store, \"managed_subagents\", \"bind_managed_child\", (\"bind_managed_child\",))\n    absent = tuple(name for name in _MANAGED_PREREQUISITES if not getattr(caps, name))\n    if absent:\n        _refuse(store, \"managed_subagents\", \"capabilities\", absent)\n    return caps\n\n\ndef _refuse(store: Any, capability: str, method: str, missing: tuple[str, ...]) -> NoReturn:\n    _codes.log_code(logger, _codes.STORE_CAPABILITY, run_id=None)\n    raise StoreCapabilityError(type(store).__name__, capability, method, missing)\n\n\ndef capabilities(store: Any) -> StoreCapabilities:\n    \"\"\"Read a declaration; absent means legacy regardless of method signatures.\"\"\"\n    declared = inspect.getattr_static(store, \"capabilities\", None)\n    if isinstance(declared, property):\n        declared = declared.__get__(store, type(store))\n    return declared if isinstance(declared, StoreCapabilities) else StoreCapabilities()\n",
+          "sha256": "82b88b37bbcd1d641d1ef36931ef0fafd243befdeeeb0661f9b7647717a93f41"
+        }
+      ]
+    },
+    {
+      "root": "adopt_managed_result",
+      "module": "src/dendrux/runtime/_managed_persistence.py",
+      "statement": "from dendrux.types import tool_result_message",
+      "comment": ""
+    },
+    {
+      "root": "_message_trace",
+      "module": "src/dendrux/runtime/_trace_shared.py",
+      "statement": "from dendrux.runtime.state import TraceWrite",
+      "comment": "",
+      "eager": [
+        {
+          "module": "dendrux.runtime._capabilities",
+          "path": "src/dendrux/runtime/_capabilities.py",
+          "source": "\"\"\"Validate explicit StateStore promises without inferring legacy capabilities.\"\"\"\n\nfrom __future__ import annotations\n\nimport inspect\nimport logging\nimport warnings\nimport weakref\nfrom typing import Any, NoReturn\n\nfrom dendrux import _codes\nfrom dendrux._warnings import _developer_stacklevel\nfrom dendrux.errors import StoreCapabilityError\nfrom dendrux.runtime.state import StoreCapabilities\n\n_REQUIREMENTS: dict[str, dict[str, tuple[str, ...]]] = {\n    \"fenced_writes\": {\n        name: (\"claim_epoch\",)\n        for name in (\n            \"save_trace\",\n            \"save_tool_call\",\n            \"save_usage\",\n            \"save_llm_interaction\",\n            \"save_run_event\",\n            \"add_note\",\n            \"mark_notes_delivered\",\n            \"update_run_meta\",\n            \"touch_progress\",\n        )\n    },\n    \"retry_ids\": {\n        \"save_trace\": (\"trace_id\",),\n        \"save_tool_call\": (\"row_id\",),\n        \"save_run_event\": (\"event_id\",),\n        \"save_usage\": (\"usage_id\",),\n        \"save_llm_interaction\": (\"interaction_id\",),\n    },\n    \"checkpointing\": {\n        \"create_run\": (\"seed_traces\", \"pii_mapping\"),\n        \"save_tool_call\": (\"outcome\",),\n        \"complete_tool_call\": (\"pii_mapping\",),\n        \"consume_submission\": (\"pii_mapping\",),\n        \"checkpoint_step\": (),\n        \"get_traces_after\": (),\n        \"conversation_traces\": (),\n        \"save_trace\": (\"trace_kind\",),\n        \"claim_paused_run\": (),\n        \"submit_and_claim\": (),\n    },\n    \"atomic_completion\": {\n        \"start_tool_call\": (),\n        \"complete_tool_call\": (),\n        \"finalize_with_event\": (\"trace\",),\n    },\n    \"recovery\": {\n        \"mark_lease_expired\": (\"finalise_unrecoverable\",),\n        \"get_lease_expired\": (),\n        \"reclaim_run\": (),\n        \"get_replayed_tool_calls\": (),\n    },\n    \"managed_subagents\": {\n        \"bind_managed_child\": (),\n        \"get_managed_cancel_children_page\": (\"after\", \"limit\", \"tenant_id\"),\n        \"is_managed_root_stopped\": (),\n        \"get_managed_run_control\": (),\n        \"get_run_control\": (),\n        \"mark_cancel_requested\": (),\n        \"get_children_page\": (),\n    },\n}\n# Managed subagents need every durability promise the bind and adoption rely on.\n_MANAGED_PREREQUISITES = (\n    \"fenced_writes\",\n    \"retry_ids\",\n    \"checkpointing\",\n    \"atomic_completion\",\n    \"recovery\",\n)\n_CACHE: dict[int, tuple[weakref.ReferenceType[Any], StoreCapabilities]] = {}\nlogger = logging.getLogger(__name__)\n\n\ndef validate_capabilities(store: Any) -> StoreCapabilities:\n    \"\"\"Validate each declared capability once per live store object.\"\"\"\n    key = id(store)\n    cached = _CACHE.get(key)\n    if cached is not None and cached[0]() is store:\n        return cached[1]\n    caps = inspect.getattr_static(store, \"capabilities\", None)\n    if caps is None:\n        return StoreCapabilities()\n    if not isinstance(caps, StoreCapabilities) or caps.version != 1:\n        _refuse(store, \"version\", \"capabilities\", (\"version=1\",))\n    if caps.deployment is None:\n        warnings.warn(\n            \"StateStore capabilities should declare deployment; legacy declaration is undeclared.\",\n            DeprecationWarning,\n            stacklevel=_developer_stacklevel(),\n        )\n    elif caps.deployment not in (\"single_process\", \"single_host\", \"multi_server\"):\n        _refuse(store, \"deployment\", \"capabilities\", (\"deployment\",))\n    for capability, methods in _REQUIREMENTS.items():\n        if getattr(caps, capability):\n            for method, keywords in methods.items():\n                _check_method(store, capability, method, keywords)\n    try:\n        ref = weakref.ref(store, lambda _ref: _CACHE.pop(key, None))\n    except TypeError:\n        return caps\n    _CACHE[key] = (ref, caps)\n    return caps\n\n\ndef _check_method(store: Any, capability: str, method: str, keywords: tuple[str, ...]) -> None:\n    # Signature inspection must not invoke application descriptors or spies.\n    target = inspect.getattr_static(store, method, None)\n    if not callable(target):\n        _refuse(store, capability, method, keywords or (method,))\n    try:\n        params = inspect.signature(target).parameters\n    except (TypeError, ValueError):\n        _refuse(store, capability, method, keywords or (method,))\n    missing = tuple(\n        k\n        for k in keywords\n        if k not in params or params[k].kind is not inspect.Parameter.KEYWORD_ONLY\n    )\n    if missing:\n        _refuse(store, capability, method, missing)\n\n\ndef require_managed_subagents(store: Any) -> StoreCapabilities:\n    \"\"\"Refuse before any managed write unless the store can bind managed children.\n\n    The store must declare ``managed_subagents`` and every durability capability\n    the bind and adoption rely on. Narrowing one of those (for example\n    ``recovery=False``) keeps the store valid for ordinary runs and turns\n    managed use off; it is not a construction error.\n    \"\"\"\n    validate_capabilities(store)\n    caps = capabilities(store)\n    if not caps.managed_subagents:\n        _refuse(store, \"managed_subagents\", \"bind_managed_child\", (\"bind_managed_child\",))\n    absent = tuple(name for name in _MANAGED_PREREQUISITES if not getattr(caps, name))\n    if absent:\n        _refuse(store, \"managed_subagents\", \"capabilities\", absent)\n    return caps\n\n\ndef _refuse(store: Any, capability: str, method: str, missing: tuple[str, ...]) -> NoReturn:\n    _codes.log_code(logger, _codes.STORE_CAPABILITY, run_id=None)\n    raise StoreCapabilityError(type(store).__name__, capability, method, missing)\n\n\ndef capabilities(store: Any) -> StoreCapabilities:\n    \"\"\"Read a declaration; absent means legacy regardless of method signatures.\"\"\"\n    declared = inspect.getattr_static(store, \"capabilities\", None)\n    if isinstance(declared, property):\n        declared = declared.__get__(store, type(store))\n    return declared if isinstance(declared, StoreCapabilities) else StoreCapabilities()\n",
+          "sha256": "82b88b37bbcd1d641d1ef36931ef0fafd243befdeeeb0661f9b7647717a93f41"
+        }
+      ]
+    },
+    {
+      "root": "_message_trace",
+      "module": "src/dendrux/runtime/_trace_shared.py",
+      "statement": "from dendrux.types import _message_to_dict",
+      "comment": ""
+    }
+  ],
+  "annotations": [],
+  "metadata": [],
+  "scaffolding": {},
+  "effects": [],
+  "seams": {},
+  "providers": {}
+}

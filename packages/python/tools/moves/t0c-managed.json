@@ -4,7 +4,7 @@
  "old": "src/dendrux/runtime/_managed.py",
  "source_sha256": "1d2bc47e57cabb49d08def5342e2d8ae2bcac2091943d34f1aea57fb5bb04472",
  "sources": {
-  "src/dendrux/runtime/_managed.py": "5cdd7a66980ee10fd4a1b28d5533d2dd825eeacb87bb1d765649d7f194152a67",
+  "src/dendrux/runtime/_managed.py": "28877f7ef193004fd6cbacc6f725b17bc6f43e847e43a2e45694b291ca2e0d5c",
   "src/dendrux/runtime/_managed_route.py": "b3199a1e922d1fccf10a1a44cf4046c37da11f5a87c74f9e7d12d6ee92bdedd6",
   "src/dendrux/runtime/_managed_adoption.py": "f428620e679c675bafa4729b81bb70cfdce49d28834c4ada79b827b1eb788c94",
   "src/dendrux/runtime/_managed_stream.py": "5ef7bdd9307d67fa8ef60551d61aff51c1e8b39ec80723a99a8656cc5e079bba"

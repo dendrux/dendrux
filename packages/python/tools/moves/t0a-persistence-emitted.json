@@ -1,0 +1,8 @@
+{
+ "dendrux.runtime.persistence": {
+  "_message_trace": "dendrux.runtime._trace_shared",
+  "_tool_call_evidence": "dendrux.runtime._trace_shared",
+  "adopt_managed_result": "dendrux.runtime._managed_persistence",
+  "message_trace": "dendrux.runtime._trace_shared"
+ }
+}
