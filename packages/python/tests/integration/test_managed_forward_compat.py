@@ -363,9 +363,8 @@ async def _enter(
         await agent.resume(root, tenant_id=TENANT, expected_pause_id=token)
     elif operation == "resume_stream":
         stream = agent.resume_stream(root, tenant_id=TENANT, expected_pause_id=token)
-        last = None
-        async for last in stream:
-            pass
+        events = [item async for item in stream]
+        last = events[-1] if events else None
         if last is not None and getattr(last.type, "value", last.type) == "run_error":
             raise RunControlError("the stream ended with run_error")
     elif operation == "input":
