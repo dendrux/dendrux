@@ -40,6 +40,7 @@ from dendrux.runtime import (
     _run_entry,
     _run_errors,
     _run_events,
+    _run_execute,
     _run_images,
     _run_outcome,
     _run_pending,
@@ -118,6 +119,12 @@ def _cached_stream_event(cached: RunResult, run_id: str) -> RunEvent:
         error=cached.error if event_type == RunEventType.RUN_ERROR else None,
         phase="final_answer" if cached.status == RunStatus.SUCCESS else None,
     )
+
+
+def _fanout_frame(recorder: Any, store: StateStore | None) -> Any:
+    """Set the streamed frame's fan-out flag explicitly: on exactly when run() would be."""
+    _run_execute._configure_fanout(recorder, store)
+    return recorder
 
 
 def _stream_claim(
@@ -561,7 +568,7 @@ def run_stream(
             # Lifecycle pair is now open. Stash recorder/notifier so the
             # cleanup callback can close it with a CANCELLED finish if the
             # consumer abandons the stream before a terminal event.
-            _shared["recorder"] = startup.recorder
+            _shared["recorder"] = _fanout_frame(startup.recorder, store)
             _shared["notifier"] = extra_notifier
 
             yield RunEvent(type=RunEventType.RUN_STARTED, run_id=run_id)

@@ -31,6 +31,7 @@ from dendrux.runtime import (
     _run_contracts,
     _run_errors,
     _run_events,
+    _run_execute,
     _run_images,
     _run_observers,
     _run_outcome,
@@ -129,6 +130,15 @@ async def _stream_resume_images(
         loop_method="run_stream",
     )
     return store, stream_results, user_parts, results_prepared
+
+
+def _fanout_frame(
+    ctx: _run_contracts._ResumeContext, store: StateStore
+) -> _run_contracts._ResumeContext:
+    """Set the streamed frame's fan-out flag explicitly: approval dispatch, recovery and
+    the loop fan out exactly when resume() would."""
+    _run_execute._configure_fanout(ctx.recorder, store)
+    return ctx
 
 
 async def _stream_resume_state(
@@ -600,7 +610,7 @@ def resume_stream(
                 pause_data=raw_pause,
             )
             image_runtime = _run_images._image_runtime(agent, store, run_tenant, run_id)
-            _shared["ctx"] = ctx
+            _shared["ctx"] = _fanout_frame(ctx, store)
             progress.submission = getattr(ctx.recorder, "_loop_state", {}).get("submission")
 
             # 5a. Fire run-level lifecycle hooks. The exception handler closes
