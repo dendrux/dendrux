@@ -625,6 +625,30 @@ def _pending_decision_map(pause_state: PauseState) -> dict[str, ApprovalDecision
     }
 
 
+def _is_approval_resume(
+    expected: str, results: list[ToolResult] | None, user_input: str | None
+) -> bool:
+    """True when a resume carries no client payload and the run waits for approval."""
+    return results is None and user_input is None and expected == RunStatus.WAITING_APPROVAL.value
+
+
+async def _batch_decision_map(
+    agent: Agent,
+    ctx: _run_contracts._ResumeContext,
+    run_id: str,
+    decisions: Any,
+    *,
+    approving: bool,
+    streaming: bool,
+) -> dict[str, ApprovalDecision] | None:
+    """Decisions for a held batch: the persisted ones, the caller's validated ones, or none."""
+    if not approving:
+        return _pending_decision_map(ctx.pause_state)
+    if streaming:
+        return None
+    return await _validated_decisions(agent, ctx, run_id, ctx.pause_state, decisions)
+
+
 async def _resume_approval_batch(
     agent: Agent,
     store: StateStore,
@@ -642,9 +666,7 @@ async def _resume_approval_batch(
     pause = ctx.pause_state
     if streaming and ctx.recorder is not None:
         _run_execute._configure_fanout(ctx.recorder, None)
-    approving = (
-        results is None and user_input is None and expected == RunStatus.WAITING_APPROVAL.value
-    )
+    approving = _is_approval_resume(expected, results, user_input)
     paused_batch = expected == RunStatus.PAUSED.value and bool(pause.pending_tool_calls)
     if not (approving or paused_batch):
         return None, approving
@@ -652,11 +674,9 @@ async def _resume_approval_batch(
         refused = await _refuse_stream_approval(agent, ctx, run_id)
         if refused is not None:
             return refused, approving
-    decision_map = None
-    if not approving:
-        decision_map = _pending_decision_map(pause)
-    elif not streaming:
-        decision_map = await _validated_decisions(agent, ctx, run_id, pause, decisions)
+    decision_map = await _batch_decision_map(
+        agent, ctx, run_id, decisions, approving=approving, streaming=streaming
+    )
     approval = await _execute_approved_tools(
         agent,
         pause,
