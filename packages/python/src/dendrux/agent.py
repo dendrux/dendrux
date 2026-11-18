@@ -2506,7 +2506,7 @@ class Agent:
         """One result read; ``moved`` when the pending read saw another public status."""
         from dendrux.errors import RunNotFoundError
         from dendrux.guardrails._engine import deanonymize_text
-        from dendrux.runtime._pending import _PendingReader, facing_status
+        from dendrux.runtime._run_pending import _PendingReader, attach_facing
         from dendrux.runtime.runner import _cached_output, _public_meta, _recovery_info
 
         facade = _PendingReader(store)
@@ -2527,11 +2527,7 @@ class Agent:
             result.meta.update(_public_meta({"pii_mapping": mapping}))
         if result.status.value == RunStatus.SUCCESS.value:
             result.output = _cached_output(record.answer, self._output_type, run_id)
-        result.pending = await facade.get_pending(run_id, tenant_id=tenant_id)
-        view = facade.last_view
-        # A root waiting on a subagent reports its active branch (0.7).
-        result.status = RunStatus(facing_status(result.status.value, view))
-        result.pause_id = result.pending.pause_id if result.pending else None
+        view = await attach_facing(result, facade, run_id, tenant_id)
         moved = view is not None and not view.managed and view.status != record.status
         return result, moved
 
