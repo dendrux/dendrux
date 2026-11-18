@@ -1137,3 +1137,80 @@ async def test_a_chain_above_a_fanout_shows_every_pause_and_unwinds_through_0_7_
     assert (final.run_id, final.status, final.answer) == (root_id, RunStatus.SUCCESS, ROOT_TEXT)
     assert (await store.get_run(middle_id)).status == RunStatus.SUCCESS.value
     assert_coherent(final)
+
+
+@pytest.mark.parametrize("nested", [False, True])
+async def test_route_walk_reads_are_counted(store: Any, engine: Any, nested: bool) -> None:
+    """§14 row 3: root 2 (run, saved cap) + the 0.7 route checkpoint 1, then 3 per v4 wait
+    (envelope, one child projection, one intent read); a fan-out child's pause token comes
+    with its row, so paused fan-out leaves cost nothing more. Read-only."""
+    a, b, c = approver("a"), approver("b"), finisher("c")
+    inner = Agent(
+        name="inner",
+        description="Delegates.",
+        prompt="i",
+        provider=ScriptedLLM([]),
+        subagents=[a, b],
+    )
+    root = root_agent(store, inner, c) if nested else root_agent(store, a, b, c)
+    root_id = await start_root(store, root)
+    if nested:
+        fan = await fan_out(store, root, root_id, [inner, c], run=(1,))
+        await fan_out(store, root, fan.child(0), [a, b], root_id=root_id, path=("inner",))
+    else:
+        fan = await fan_out(store, root, root_id, [a, b, c])
+    before = await snapshot(store, root_id, *fan.children)
+
+    statements, capture = _count_statements(engine)
+    try:
+        tree = await _managed_route.route_tree(root, store, root_id, tenant_id=TENANT)
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", capture)
+
+    waits = 2 if nested else 1
+    assert len(tree.paused_leaves()) == 2  # type: ignore[union-attr]
+    assert all(s.startswith("select") for s in statements)
+    assert not any("react_traces" in s for s in statements)
+    assert len(statements) == 2 + 1 + 3 * waits
+    assert await snapshot(store, root_id, *fan.children) == before
+
+
+async def test_input_and_requested_pause_paths_attach_or_clear(
+    store: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A13: submit_input and submit_resume (a requested pause) follow the same policy."""
+    from tests.integration.test_managed_routing import patch_questions
+
+    patch_questions(monkeypatch)
+    asking = solo(store, LLMResponse(text="Which draft?"), LLMResponse(text="ok"))
+    question = await asking.run("go", tenant_id=TENANT)
+    own_pause(question)
+    answered = await asking.submit_input(
+        question.run_id, "the first", tenant_id=TENANT, expected_pause_id=question.pause_id
+    )
+    assert answered.status == RunStatus.SUCCESS and answered.pendings == ()
+    assert_coherent(answered)
+
+    async def pause_me(index: int, run_id: str | None) -> None:
+        if index == 0 and run_id is not None:
+            await store.request_pause(run_id)
+
+    from tests.integration.test_managed_routing import ContextLLM
+
+    pausing = Agent(
+        name="solo",
+        prompt="You work.",
+        provider=ContextLLM(
+            [call("publish", {"text": "p"}, "c"), LLMResponse(text="ok")], on_call=pause_me
+        ),
+        state_store=store,
+        tools=[publish],
+    )
+    paused = await pausing.run("go", tenant_id=TENANT)
+    assert paused.status == RunStatus.PAUSED
+    own_pause(paused)
+    resumed = await pausing.submit_resume(
+        paused.run_id, tenant_id=TENANT, expected_pause_id=paused.pause_id
+    )
+    assert (resumed.status, resumed.pendings) == (RunStatus.SUCCESS, ())
+    assert_coherent(resumed)
