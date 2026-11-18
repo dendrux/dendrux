@@ -7,7 +7,6 @@ from contextvars import ContextVar
 import pytest
 
 from dendrux import Agent, tool
-from dendrux.errors import PersistenceError
 from dendrux.types import LLMResponse, RunStatus, ToolCall
 from tests._helpers.scripted_provider import ScriptedLLM
 
@@ -15,18 +14,7 @@ pytestmark = pytest.mark.parametrize("engine", ["sqlite_file", "postgres"], indi
 request_id: ContextVar[str] = ContextVar("request_id", default="MISSING")
 
 
-@pytest.mark.parametrize(
-    "n",
-    [
-        1,
-        pytest.param(
-            2,
-            marks=pytest.mark.xfail(
-                raises=PersistenceError, strict=True, reason="T6 owns the v4 continuation reader"
-            ),
-        ),
-    ],
-)
+@pytest.mark.parametrize("n", [1, 2])
 async def test_two_call_run_continues_only_with_the_v4_reader(store, n):
     seen = []
 

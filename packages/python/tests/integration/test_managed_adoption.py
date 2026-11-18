@@ -792,8 +792,21 @@ async def _crash_at(monkeypatch: Any, module: Any, name: str, run: Any) -> None:
             await run()
 
 
+@pytest.mark.parametrize(
+    "parallel_limit",
+    [
+        1,
+        pytest.param(
+            4,
+            marks=pytest.mark.xfail(
+                strict=True,
+                reason="T5 must configure the batch recovery frame before classification",
+            ),
+        ),
+    ],
+)
 async def test_recovered_unsupported_batch_is_refused_with_zero_effects(
-    store: Any, engine: Any, monkeypatch: Any
+    store: Any, engine: Any, monkeypatch: Any, parallel_limit: int
 ) -> None:
     """Crash at the assistant checkpoint (before live preflight), then recover."""
     from dendrux.loops import react
@@ -811,7 +824,8 @@ async def test_recovered_unsupported_batch_is_refused_with_zero_effects(
         ContextLLM([batch]),
         _named("reviewer", ContextLLM([])),
         _named("auditor", ContextLLM([])),
-        limits=Limits(max_parallel_subagents=1),
+        limits=Limits(max_parallel_subagents=parallel_limit),
+        exclusive_subagents=["reviewer"] if parallel_limit == 4 else None,
     )
     await _crash_at(
         monkeypatch, react, "_refuse_managed_batch", lambda: first.run("go", tenant_id=TENANT)
@@ -826,7 +840,8 @@ async def test_recovered_unsupported_batch_is_refused_with_zero_effects(
         root_llm,
         _named("reviewer", reviewer_llm),
         _named("auditor", auditor_llm),
-        limits=Limits(max_parallel_subagents=1),
+        limits=Limits(max_parallel_subagents=parallel_limit),
+        exclusive_subagents=["reviewer"] if parallel_limit == 4 else None,
     )
     result = await fresh.reclaim(root_id, tenant_id=TENANT, item=item)
 
@@ -836,6 +851,8 @@ async def test_recovered_unsupported_batch_is_refused_with_zero_effects(
     seen = [json.loads(m.content) for m in root_llm.messages[0] if m.role.value == "tool"]
     assert len(seen) == 3 and all("subagent" in o["error"] for o in seen)
     tool_rows = await rows(engine, ToolCallRecord, ToolCallRecord.agent_run_id == root_id)
+    if parallel_limit == 4:
+        assert all(r.meta.get("reason") == "exclusive" for r in tool_rows)
     assert {r.meta.get("code") for r in tool_rows} == {"managed_batch_unsupported"}
 
 
@@ -1251,8 +1268,21 @@ async def test_r4a_recorded_approval_gate_is_not_bound_on_recovery(
 
 
 @pytest.mark.parametrize("refused_before_crash", [1, 2])
+@pytest.mark.parametrize(
+    "parallel_limit",
+    [
+        1,
+        pytest.param(
+            4,
+            marks=pytest.mark.xfail(
+                strict=True,
+                reason="T5 must configure the batch recovery frame before classification",
+            ),
+        ),
+    ],
+)
 async def test_r4b_partial_batch_refusal_refuses_the_rest_on_recovery(
-    store: Any, engine: Any, monkeypatch: Any, refused_before_crash: int
+    store: Any, engine: Any, monkeypatch: Any, refused_before_crash: int, parallel_limit: int
 ) -> None:
     """Crash after each refusal, incl. the last managed one before the server call."""
     from dendrux.loops import react
@@ -1270,7 +1300,8 @@ async def test_r4b_partial_batch_refusal_refuses_the_rest_on_recovery(
         ContextLLM([batch]),
         _named("reviewer", ContextLLM([])),
         _named("auditor", ContextLLM([])),
-        limits=Limits(max_parallel_subagents=1),
+        limits=Limits(max_parallel_subagents=parallel_limit),
+        exclusive_subagents=["reviewer"] if parallel_limit == 4 else None,
     )
     original = react._ToolBatch.reject
     done = {"n": 0}
@@ -1294,12 +1325,15 @@ async def test_r4b_partial_batch_refusal_refuses_the_rest_on_recovery(
         root_llm,
         _named("reviewer", ContextLLM([])),
         _named("auditor", ContextLLM([])),
-        limits=Limits(max_parallel_subagents=1),
+        limits=Limits(max_parallel_subagents=parallel_limit),
+        exclusive_subagents=["reviewer"] if parallel_limit == 4 else None,
     )
     result = await fresh.reclaim(root_id, tenant_id=TENANT, item=item)
     assert result.status == RunStatus.SUCCESS and effects == []
     tool_rows = await rows(engine, ToolCallRecord, ToolCallRecord.agent_run_id == root_id)
     assert len(tool_rows) == 3
+    if parallel_limit == 4:
+        assert all(r.meta.get("reason") == "exclusive" for r in tool_rows)
     assert {r.meta.get("code") for r in tool_rows} == {"managed_batch_unsupported"}
     assert not await rows(engine, AgentRun, AgentRun.parent_run_id == root_id)
 
