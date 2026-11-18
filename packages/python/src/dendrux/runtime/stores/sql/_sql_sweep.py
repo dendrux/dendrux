@@ -104,21 +104,41 @@ class _SqlSweep(_SqlWrites):
         cursor: tuple[str, datetime, str] | None = None,
     ) -> tuple[list[SweptRun], tuple[str, datetime, str] | None]:
         # The database-call decorator retains the core's tuple result.
-        return cast(
-            "tuple[list[SweptRun], tuple[str, datetime, str] | None]",
-            await _collect_runs(
-                self,
-                older_than,
-                waiting=waiting,
-                batch_size=batch_size,
-                max_runs=max_runs,
-                cursor=cursor,
-            ),
+        return await _scan_runs_core(
+            self,
+            older_than,
+            waiting=waiting,
+            batch_size=batch_size,
+            max_runs=max_runs,
+            cursor=cursor,
         )
 
 
 @_safe_database_call
 async def _collect_runs(
+    store: _SqlSweep,
+    older_than: timedelta | None,
+    *,
+    waiting: bool,
+    batch_size: int,
+    max_runs: int,
+    cursor: tuple[str, datetime, str] | None = None,
+    adoptable_after: timedelta | None = None,
+    adoptable: list[str] | None = None,
+) -> tuple[list[SweptRun], tuple[str, datetime, str] | None]:
+    return await _scan_runs_core(
+        store,
+        older_than,
+        waiting=waiting,
+        batch_size=batch_size,
+        max_runs=max_runs,
+        cursor=cursor,
+        adoptable_after=adoptable_after,
+        adoptable=adoptable,
+    )
+
+
+async def _scan_runs_core(
     store: _SqlSweep,
     older_than: timedelta | None,
     *,

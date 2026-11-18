@@ -24,6 +24,7 @@ from dendrux.loops import _managed_batch
 from dendrux.loops._helpers import order_observations, project_message, record_message, record_tool
 from dendrux.runtime import _reclaim_managed
 from dendrux.runtime._bounds import MAX_PAGE
+from dendrux.runtime._reclaim_managed import _admit_recovered_call as _admit_recovered_call
 from dendrux.runtime._reclaim_managed import _finish_saved_adoption as _finish_saved_adoption
 from dendrux.runtime._reclaim_managed import _handed_off as _handed_off
 from dendrux.runtime._reclaim_managed import _managed_handoff as _managed_handoff
@@ -991,7 +992,10 @@ async def _recover_managed_calls(
         # The whole batch was refused durably; finish refusing what is left.
         original = _reclaim_managed._refused_batch(ctx.history, refused, pending)
         decision = _managed_batch.classify_batch(original, lookups, policy)
-        await _refuse_recovered_batch(ctx, run_id, pending, decision, limit=policy.limit)
+        decision, limit = _reclaim_managed._saved_refusal(
+            ctx.history, refused, decision, policy.limit
+        )
+        await _refuse_recovered_batch(ctx, run_id, pending, decision, limit=limit)
         return None
     managed = [
         tc for tc in pending if isinstance(lookups.fn.get(tc.name), _managed_batch.SubagentTool)
@@ -1017,18 +1021,6 @@ async def _admitted_arguments(
     batch = _recovery_batch(ctx, run_id)
     calls = await _restore_calls(engine, [tc], lookups, batch)
     return await _validate_calls(calls, lookups, frozenset(_pii_placeholders(engine)), batch)
-
-
-async def _admit_recovered_call(
-    ctx: _ResumeContext, run_id: str, found: _ManagedPending, outcome: Any, lookups: Any
-) -> list[ToolCall]:
-    """The managed call's recovered admission: brief size after policy, as live."""
-    from dendrux.loops.react import _admit_managed_briefs
-
-    ready = [tc for tc in outcome.pending_calls if tc.id in found.call_ids]
-    if not ready or outcome.approval_gates:
-        return list(outcome.pending_calls)
-    return await _admit_managed_briefs(ready, lookups, _recovery_batch(ctx, run_id))
 
 
 async def _refuse_recovered_batch(
@@ -1133,7 +1125,7 @@ class _Prepared:
         )
         if managed and run.found is not None:
             ready = await _admit_recovered_call(
-                run.ctx, run.run_id, run.found, outcome, run.lookups
+                run.found, outcome, run.lookups, _recovery_batch(run.ctx, run.run_id)
             )
         else:
             ready = list(outcome.pending_calls)
@@ -1162,6 +1154,7 @@ async def resolve(
         return cast("RunResult | None", managed)
     found = managed if isinstance(managed, _ManagedPending) else None
     state, descriptor = await _consume_recovery_submission(store, run_id, ctx, lookups)
+    found = _reclaim_managed._surviving_managed(found, state, run_id)
     pending = state.get("pending", [])
     rows = await _pending_rows(store, run_id, pause.iteration, pending)
     by_id = {row.tool_call_id: row for row in rows}

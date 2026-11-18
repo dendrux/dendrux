@@ -821,13 +821,14 @@ async def _reconnect_leaf(
             notifier=notifier,
             via_root=bool(node.agent_path),
         )
-    except RunAlreadyActiveError:
-        if not fanout_tree:
+    except (RunAlreadyActiveError, RunFencedError, RunNotReclaimableError) as exc:
+        if not fanout_tree or (
+            isinstance(exc, RunNotReclaimableError)
+            and exc.reason not in {"lease_fresh", "not_running"}
+        ):
             raise
-        return await _build_cached_result(store, node.run_id)
-    except RunNotReclaimableError as exc:
-        if not fanout_tree or exc.reason != "lease_fresh":
-            raise
+        if await scoped_run(store, node.run_id, tenant_id) is None:
+            raise RunNotFoundError(node.run_id) from None
         return await _build_cached_result(store, node.run_id)
     return await _managed.drive(result, notifier=notifier)
 
@@ -835,47 +836,69 @@ async def _reconnect_leaf(
 async def _reconnect_children(
     store: StateStore, node: WaitNode, *, fanout_tree: bool, notifier: LoopNotifier | None
 ) -> None:
-    tasks: list[asyncio.Task[RunResult]] = []
+    tasks: list[asyncio.Task[RunResult | Exception]] = []
     cancellation = None
     try:
         for child in node.children:
-            operation = drive_node(
-                store, child, tenant_id=node.tenant_id, fanout_tree=fanout_tree, notifier=notifier
-            )
+            operation = _reconnect_branch(store, child, node, fanout_tree, notifier)
             try:
                 task = asyncio.create_task(operation, context=owner_context())
             except BaseException:
                 operation.close()
                 raise
             tasks.append(task)
-        pending = set(tasks)
-        while pending:
-            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-            for task in done:
-                task.result()
+        if tasks:
+            await asyncio.wait(tasks)
     except asyncio.CancelledError as exc:
         cancellation = exc
     finally:
         _, cleanup_cancel = await _drain_cleanup(
-            _join_reconnect(tasks, node.run_id), run_id=node.run_id
+            _join_reconnect(tasks, cancel=cancellation is not None), run_id=node.run_id
         )
         if cancellation is not None:
             raise cancellation
         if cleanup_cancel is not None:
             raise cleanup_cancel
+    _raise_reconnect_error(tasks)
 
 
-async def _join_reconnect(tasks: list[asyncio.Task[RunResult]], run_id: str) -> None:
+def _raise_reconnect_error(tasks: Sequence[asyncio.Task[RunResult | Exception]]) -> None:
     for task in tasks:
-        if not task.done() and not task.cancelling():
-            task.cancel()
+        if task.cancelled():
+            task.result()
+    for task in tasks:
+        result = task.result()
+        if isinstance(result, Exception):
+            raise result
+
+
+async def _reconnect_branch(
+    store: StateStore,
+    child: WaitNode | LeafNode,
+    parent: WaitNode,
+    fanout_tree: bool,
+    notifier: LoopNotifier | None,
+) -> RunResult | Exception:
+    try:
+        return await drive_node(
+            store, child, tenant_id=parent.tenant_id, fanout_tree=fanout_tree, notifier=notifier
+        )
+    except Exception as error:  # noqa: BLE001, RUF100 - owner isolation retains failures until every sibling joins.
+        _codes.log_code(
+            logger,
+            _codes.MANAGED_FANOUT_BRANCH_ERROR,
+            run_id=child.run_id,
+            error_type=type(error).__name__,
+        )
+        return error
+
+
+async def _join_reconnect(
+    tasks: list[asyncio.Task[RunResult | Exception]], *, cancel: bool
+) -> None:
+    if cancel:
+        for task in tasks:
+            if not task.done() and not task.cancelling():
+                task.cancel()
     if tasks:
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for result in results:
-            if isinstance(result, Exception):
-                _codes.log_code(
-                    logger,
-                    _codes.MANAGED_FANOUT_BRANCH_ERROR,
-                    run_id=run_id,
-                    error_type=type(result).__name__,
-                )
+        await asyncio.gather(*tasks, return_exceptions=True)

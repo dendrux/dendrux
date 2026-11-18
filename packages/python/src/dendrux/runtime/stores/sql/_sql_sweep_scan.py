@@ -186,7 +186,10 @@ class _SweepScan:
             if self.waiting:
                 await self.collect_adoptable(row)
             return None
-        if self.waiting and self.abandoned_after is None:
+        if self.waiting and (
+            self.abandoned_after is None
+            or _to_aware_utc(row.sweep_age) >= self.now - self.abandoned_after
+        ):
             return None
         return await self.sweep_row(row)
 

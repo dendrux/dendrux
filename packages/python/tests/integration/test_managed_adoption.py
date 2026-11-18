@@ -1268,19 +1268,7 @@ async def test_r4a_recorded_approval_gate_is_not_bound_on_recovery(
 
 
 @pytest.mark.parametrize("refused_before_crash", [1, 2])
-@pytest.mark.parametrize(
-    "parallel_limit",
-    [
-        1,
-        pytest.param(
-            4,
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason="T5 must configure the batch recovery frame before classification",
-            ),
-        ),
-    ],
-)
+@pytest.mark.parametrize("parallel_limit", [1, 4])
 async def test_r4b_partial_batch_refusal_refuses_the_rest_on_recovery(
     store: Any, engine: Any, monkeypatch: Any, refused_before_crash: int, parallel_limit: int
 ) -> None:

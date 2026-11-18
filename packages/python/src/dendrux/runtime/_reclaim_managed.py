@@ -6,12 +6,14 @@ reclaim flow and its patch seams are unchanged.
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 from dendrux import _codes
 from dendrux.errors import ManagedStateError, RunNotFoundError, RunNotReclaimableError
+from dendrux.loops import _managed_batch
 from dendrux.runtime._fanout_adoption_state import (
     adoption_payload,
     fanout_adoption,
@@ -132,7 +134,7 @@ def _refuse_recovered_managed_results(
 
 @dataclass(frozen=True)
 class _ManagedPending:
-    """The one generated subagent call pending in a supported recovered batch (0.7)."""
+    """The ordered managed calls captured before recovery consumes a submission."""
 
     call: ToolCall
     admitted: bool
@@ -154,7 +156,8 @@ class _ManagedPending:
             raise ManagedStateError(reason="binding_conflict", run_id=run_id)
         return cls(
             calls[0],
-            admitted=admitted == calls[0].id or admitted == [call.id for call in calls],
+            admitted=admitted == [call.id for call in calls]
+            or (len(calls) == 1 and admitted == calls[0].id),
             calls=tuple(calls),
         )
 
@@ -202,8 +205,27 @@ def _managed_handoff(
 
 
 def _handed_off(found: _ManagedPending | None, held: list[ToolCall]) -> bool:
-    """Only the admitted managed call is left: it goes to the bind (0.7)."""
+    """Every surviving managed call is held and ready for the durable bind."""
     return found is not None and [tc.id for tc in held] == [tc.id for tc in found.ordered]
+
+
+def _surviving_managed(
+    found: _ManagedPending | None, state: dict[str, Any], run_id: str
+) -> _ManagedPending | None:
+    if found is None:
+        return None
+    pending = {
+        item["call_id"]
+        for item in state.get("pending", [])
+        if item.get("phase") not in {"rejected", "invalid"}
+    }
+    calls = [call for call in found.ordered if call.id in pending]
+    if not calls:
+        return None
+    admitted = state.get("managed_admitted")
+    if isinstance(admitted, list):
+        admitted = [call_id for call_id in admitted if call_id in pending]
+    return _ManagedPending.from_calls(calls, admitted=admitted, run_id=run_id)
 
 
 async def _check_wait_format(
@@ -278,3 +300,36 @@ def _refused_batch(
         ),
         pending,
     )
+
+
+def _saved_refusal(
+    history: list[Message],
+    refused: set[str],
+    decision: _managed_batch.BatchDecision,
+    limit: int,
+) -> tuple[_managed_batch.BatchDecision, int]:
+    for message in history:
+        if message.role.value != "tool" or message.call_id not in refused:
+            continue
+        try:
+            body = json.loads(message.content)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(body, dict) or "error" not in body:
+            continue
+        reason = body.get("reason")
+        if reason in (None, "client_call", "exclusive"):
+            return _managed_batch.BatchDecision("refuse", decision.count, reason), limit
+        saved_limit, count = body.get("limit"), body.get("requested")
+        if reason == "fanout_limit" and type(saved_limit) is int and type(count) is int:
+            return _managed_batch.BatchDecision("refuse", count, reason), saved_limit
+    return decision, limit
+
+
+async def _admit_recovered_call(
+    found: _ManagedPending, outcome: Any, lookups: Any, batch: Any
+) -> list[ToolCall]:
+    ready = [tc for tc in outcome.pending_calls if tc.id in found.call_ids]
+    if not ready or outcome.approval_gates:
+        return list(outcome.pending_calls)
+    return await _managed_batch._admit_managed_briefs(ready, lookups, batch)
