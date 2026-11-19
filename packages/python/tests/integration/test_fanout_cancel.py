@@ -9,18 +9,22 @@ from functools import wraps
 from typing import Any
 
 import pytest
-from sqlalchemy import select, update
+from sqlalchemy import event, select, update
 
 from dendrux import Agent, tool
 from dendrux.db.models import AgentRun
-from dendrux.errors import ManagedStateError, RunNotFoundError
+from dendrux.errors import ManagedStateError, RunAlreadyTerminalError, RunNotFoundError
 from dendrux.loops.single import SingleCall
+from dendrux.runtime import _managed_route
+from dendrux.runtime._managed_tree import LeafNode, WorkflowTree
+from dendrux.store import RunStore
 from dendrux.types import (
     Budget,
     Limits,
     LLMResponse,
     RunStatus,
     ToolCall,
+    ToolResult,
     ToolTarget,
     generate_ulid,
 )
@@ -29,11 +33,13 @@ from tests._helpers.gates import wait_for_gate
 from tests._helpers.scripted_provider import ScriptedLLM
 from tests.integration.test_fanout_adoption import Child, lead, parked
 from tests.integration.test_fanout_store_races import batch, fanout_parent, nest
+from tests.integration.test_managed_bind import bind_request, managed_parent
 from tests.integration.test_managed_cancel import parallel_stores
 from tests.integration.test_managed_cancel import paused_workflow as v3_workflow
 
 pytestmark = pytest.mark.parametrize("engine", ["sqlite_file", "postgres"], indirect=True)
 TENANT = "t1"
+HANG_TIMEOUT = 60
 
 
 def batch_response(*names: str) -> LLMResponse:
@@ -99,7 +105,25 @@ async def invoke(root: Agent, entry: str) -> Any:
     return stream.result
 
 
-@pytest.mark.parametrize("nested", ["flat", "fanout", "mixed"])
+def pause_children(nested: str, one: Agent, two: Agent, single: Agent) -> list[Agent]:
+    if nested == "flat":
+        return [one, two, single]
+    delegated = {"mixed": [one, two, single], "fanout": [one, two], "fanout_single": [one]}[nested]
+    middle = Agent(
+        name="middle",
+        description="Delegates",
+        prompt="Delegate",
+        subagents=delegated,
+        provider=ScriptedLLM(
+            [batch_response(*(child.name for child in delegated)), LLMResponse(text="done")]
+        ),
+    )
+    return {"mixed": [middle], "fanout": [middle, single], "fanout_single": [middle, two, single]}[
+        nested
+    ]
+
+
+@pytest.mark.parametrize("nested", ["flat", "fanout", "mixed", "fanout_single"])
 @pytest.mark.parametrize("cascade", [False, True])
 @pytest.mark.parametrize("entry", ["run", "stream"])
 async def test_a9_pause_reaches_every_react_leaf_without_revoking_claims(
@@ -113,28 +137,11 @@ async def test_a9_pause_reaches_every_react_leaf_without_revoking_claims(
     one, p1 = gated_child("one", effects)
     two, p2 = gated_child("two", effects)
     single, ps = gated_child("single", effects, single=True)
-    children = [one, two, single]
-    if nested != "flat":
-        middle = Agent(
-            name="middle",
-            description="Delegates",
-            prompt="Delegate",
-            subagents=[one, two, single] if nested == "mixed" else [one, two],
-            provider=ScriptedLLM(
-                [
-                    batch_response("one", "two", "single")
-                    if nested == "mixed"
-                    else batch_response("one", "two"),
-                    LLMResponse(text="done"),
-                ]
-            ),
-        )
-        children = [middle] if nested == "mixed" else [middle, single]
-    root = root_agent(store, children)
+    root = root_agent(store, pause_children(nested, one, two, single))
     run = asyncio.create_task(invoke(root, entry))
     try:
         for provider in (p1, p2, ps):
-            await wait_for_gate(provider.entered, task=run)
+            await wait_for_gate(provider.entered, task=run, timeout=HANG_TIMEOUT)
         root_id = await running_root_id(store)
         before = await store.get_subtree(root_id, tenant_id=TENANT)
         epochs = {n.run.id: n.run.claim_epoch for n in before.nodes}
@@ -154,7 +161,7 @@ async def test_a9_pause_reaches_every_react_leaf_without_revoking_claims(
             assert (await store.get_run(rid)).claim_epoch == epoch
         for provider in (p1, p2, ps):
             provider.gate.set()
-        result = await asyncio.wait_for(run, 15)
+        result = await asyncio.wait_for(run, HANG_TIMEOUT)
         assert result.status == RunStatus.PAUSED
         assert {p.agent_name for p in result.pendings} == {"one", "two"}
         assert all(p.reason == "requested" for p in result.pendings)
@@ -203,13 +210,13 @@ async def test_x2_remote_cancel_stops_checkpoint_and_preserves_committed_success
         owner_store.finalize_with_event = finalized
         run = asyncio.create_task(root.run("go", tenant_id=TENANT))
         try:
-            await wait_for_gate(provider.entered, task=run)
-            await wait_for_gate(committed, task=run)
+            await wait_for_gate(provider.entered, task=run, timeout=HANG_TIMEOUT)
+            await wait_for_gate(committed, task=run, timeout=HANG_TIMEOUT)
             rid = await running_root_id(remote_store)
             await remote.cancel_run(rid, tenant_id=TENANT)
             assert not provider.cancelled and not run.done()
             provider.gate.set()
-            result = await asyncio.wait_for(run, 15)
+            result = await asyncio.wait_for(run, HANG_TIMEOUT)
             assert result.status == RunStatus.CANCELLED
             subtree = await remote_store.get_subtree(rid, tenant_id=TENANT)
             assert {n.run.agent_name: n.run.status for n in subtree.nodes} == {
@@ -244,8 +251,32 @@ async def test_x3_cancel_one_paused_two_running_and_foreign_sibling(store: Any) 
     assert {r["run_id"] for r in result.meta["cascade"]} == {fanout.run_id, *fanout.child_ids}
 
 
+async def assert_cancelled_token_refused(root: Agent, engine: Any, rid: str, pending: Any) -> None:
+    assert pending is not None and pending.pause_id is not None
+    writes = []
+
+    def capture(conn: Any, cursor: Any, sql: str, params: Any, ctx: Any, many: Any) -> None:
+        kind = sql.split()[0].upper()
+        if kind in {"INSERT", "UPDATE", "DELETE"}:
+            writes.append(kind)
+
+    event.listen(engine.sync_engine, "before_cursor_execute", capture)
+    try:
+        with pytest.raises(RunAlreadyTerminalError) as raised:
+            await root.submit_tool_results(
+                rid,
+                [ToolResult(name="answer", call_id=pending.tool_calls[0].id, payload="ok")],
+                expected_pause_id=pending.pause_id,
+                tenant_id=TENANT,
+            )
+        assert raised.value.run_id == rid
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", capture)
+    assert writes == []
+
+
 async def test_x3_live_cancel_settles_paused_and_running_owners(
-    store: Any, monkeypatch: Any
+    store: Any, engine: Any, monkeypatch: Any
 ) -> None:
     effects = FanoutEffects()
 
@@ -280,14 +311,16 @@ async def test_x3_live_cancel_settles_paused_and_running_owners(
     run = asyncio.create_task(root.run("go", tenant_id=TENANT))
     try:
         for _, p in pairs:
-            await wait_for_gate(p.entered, task=run)
-        await wait_for_gate(paused, task=run)
+            await wait_for_gate(p.entered, task=run, timeout=HANG_TIMEOUT)
+        await wait_for_gate(paused, task=run, timeout=HANG_TIMEOUT)
         rid = await running_root_id(store)
+        pending = await RunStore(store).get_pending(rid, tenant_id=TENANT)
         result = await controller.cancel_run(rid, tenant_id=TENANT)
         assert result.status == RunStatus.CANCELLED
+        await assert_cancelled_token_refused(root, engine, rid, pending)
         for _, p in pairs:
             p.gate.set()
-        assert (await asyncio.wait_for(run, 15)).status == RunStatus.CANCELLED
+        assert (await asyncio.wait_for(run, HANG_TIMEOUT)).status == RunStatus.CANCELLED
         tree = await store.get_subtree(rid, tenant_id=TENANT)
         assert [n.run.status for n in tree.nodes] == ["cancelled"] * 4
         assert effects.counts().provider == {"paused": 1, "one": 1, "two": 1}
@@ -352,7 +385,7 @@ async def test_a9_single_child_keeps_v3_wait_bytes_and_leaf_first_order(store: A
     root = root_agent(store, [child])
     run = asyncio.create_task(root.run("go", tenant_id=TENANT))
     try:
-        await wait_for_gate(provider.entered, task=run)
+        await wait_for_gate(provider.entered, task=run, timeout=HANG_TIMEOUT)
         rid = await running_root_id(store)
         pause = await store.get_pause_state(rid)
         before = json.dumps(pause, sort_keys=True)
@@ -362,7 +395,7 @@ async def test_a9_single_child_keeps_v3_wait_bytes_and_leaf_first_order(store: A
         assert result.affected[-1][0] == rid and len(result.affected) == 2
         assert json.dumps(await store.get_pause_state(rid), sort_keys=True) == before
         provider.gate.set()
-        paused = await asyncio.wait_for(run, 15)
+        paused = await asyncio.wait_for(run, HANG_TIMEOUT)
         assert paused.status == RunStatus.PAUSED and len(paused.pendings) == 1
         assert effects.counts().provider_calls("one") == 1
     finally:
@@ -442,3 +475,68 @@ async def test_pause_honors_saved_run_cap_above_the_pending_reader_bound(store: 
         assert all(n.run.pause_requested for n in tree.nodes if n.depth == 2)
     finally:
         await root.close()
+
+
+async def test_pause_refuses_a_tree_that_omits_a_preflight_hop(
+    store: Any, monkeypatch: Any
+) -> None:
+    rid, call_id = await managed_parent(store)
+    bound = bind_request(rid, call_id)
+    await store.bind_managed_child(bound)
+    calls = await nest(store, bound.child_run_id, 2)
+    await store.bind_managed_children(
+        batch(bound.child_run_id, calls, root=rid, path=("reviewer",))
+    )
+    leaf = Agent(name="reviewer", description="Worker", prompt="Work", provider=ScriptedLLM([]))
+    middle = Agent(
+        name="reviewer",
+        description="Delegates",
+        prompt="Delegate",
+        provider=ScriptedLLM([]),
+        subagents=[leaf],
+    )
+    root = root_agent(store, [middle])
+
+    async def moved(*args: Any, **kwargs: Any) -> WorkflowTree:
+        return WorkflowTree(rid, TENANT, LeafNode(rid, root, (), "running"))
+
+    monkeypatch.setattr(_managed_route, "walk_tree", moved)
+    try:
+        with pytest.raises(ManagedStateError) as raised:
+            await root.request_pause(rid, tenant_id=TENANT)
+        assert raised.value.reason == "binding_conflict" and raised.value.run_id == rid
+        tree = await store.get_subtree(rid, tenant_id=TENANT)
+        assert not any(n.run.pause_requested for n in tree.nodes)
+    finally:
+        await root.close()
+
+
+async def test_pause_missing_definition_keeps_typed_error_under_strict_logging(
+    store: Any,
+    monkeypatch: Any,
+    caplog: Any,
+) -> None:
+    monkeypatch.setenv("DENDRUX_STRICT_LOG_FIELDS", "1")
+    original = lead(state_store=store)
+    fanout = await parked(store, original, [Child(status="running"), Child(status="running")])
+    different = Agent(
+        name="different", description="Worker", prompt="Work", provider=ScriptedLLM([])
+    )
+    controller = root_agent(store, [different])
+    try:
+        with pytest.raises(ManagedStateError) as raised:
+            await controller.request_pause(fanout.run_id, tenant_id=TENANT)
+        assert raised.value.reason == "path_missing" and raised.value.run_id == fanout.run_id
+        assert any(
+            getattr(r, "code", None) == "managed_state_invalid"
+            and r.run_id == fanout.run_id
+            and r.managed_reason == "path_missing"
+            for r in caplog.records
+        )
+        assert not any(
+            n.run.pause_requested
+            for n in (await store.get_subtree(fanout.run_id, tenant_id=TENANT)).nodes
+        )
+    finally:
+        await controller.close()
+        await original.close()

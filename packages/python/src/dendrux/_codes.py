@@ -170,6 +170,7 @@ _ENUMS = {
             "child_mismatch",
             "child_missing",
             "header_invalid",
+            "path_missing",
             "pending_missing",
             "storage_format",
             "wait_invalid",

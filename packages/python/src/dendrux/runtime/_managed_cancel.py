@@ -21,11 +21,10 @@ from dendrux.types import Budget, RunResult, RunStatus, ToolResult, _usage_from_
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
-    from types import ModuleType
 
     from dendrux.agent import Agent
     from dendrux.loops.base import LoopNotifier, LoopRecorder
-    from dendrux.runtime._managed_pending import ManagedHop, ReadHop
+    from dendrux.runtime._managed_pending import ManagedHop, ReadHop, Workflow
     from dendrux.runtime._managed_tree import WalkTree, WorkflowTree
     from dendrux.runtime.state import (
         BindManagedChildRequest,
@@ -38,6 +37,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 _CANCEL_OUTCOME_LIMIT = 999
+
+
+class PauseWorkflowReader(Protocol):
+    """Read the existing pending workflow through an injected, scoped hop reader."""
+
+    async def __call__(
+        self, state: StateStore, run_id: str, tenant_id: TenantScope, *, read_hop: ReadHop
+    ) -> Workflow | None: ...
 
 
 def _state() -> Any:
@@ -319,37 +326,45 @@ def pause_order(tree: WorkflowTree) -> list[str]:
 
 
 async def workflow_pause_order(
-    agent: Agent, store: StateStore, record: RunRecord, *, walk_tree: WalkTree
+    agent: Agent,
+    store: StateStore,
+    record: RunRecord,
+    *,
+    walk_tree: WalkTree,
+    read_hop: ReadHop,
+    read_workflow: PauseWorkflowReader,
 ) -> list[str]:
     """Keep v3 binding-only control; use the validated tree for workflows with fan-out."""
-    # Cycle: _pending -> state -> _managed_cancel -> _pending.
-    pending = importlib.import_module("._pending", __package__)
-    reader = pending._PendingReader(store)
     hops: list[ManagedHop] = []
 
-    async def read_hop(run_id: str, tenant_id: TenantScope) -> ManagedHop | None:
-        hop: ManagedHop | None = await reader._read_hop(run_id, tenant_id)
+    async def tracked_hop(run_id: str, tenant_id: TenantScope) -> ManagedHop | None:
+        hop = await read_hop(run_id, tenant_id)
         if hop is not None:
             hops.append(hop)
         return hop
 
-    if not await _needs_pause_tree(pending, store, record, read_hop, hops):
+    if not await _needs_pause_tree(read_workflow, store, record, tracked_hop, hops):
         return [hop.run_id for hop in reversed(hops)]
     tree = await walk_tree(agent, store, record.id, tenant_id=record.tenant_id)
-    return pause_order(tree)
+    return _checked_pause_order(tree, hops)
+
+
+def _checked_pause_order(tree: WorkflowTree, hops: Sequence[ManagedHop]) -> list[str]:
+    order = pause_order(tree)
+    if not {hop.run_id for hop in hops}.issubset(order):
+        raise ManagedStateError(reason="binding_conflict", run_id=tree.root_run_id)
+    return order
 
 
 async def _needs_pause_tree(
-    pending: ModuleType,
+    read_workflow: PauseWorkflowReader,
     store: StateStore,
     record: RunRecord,
     read_hop: ReadHop,
     hops: Sequence[ManagedHop],
 ) -> bool:
     try:
-        workflow = await pending.read_workflow(
-            store, record.id, record.tenant_id, read_hop=read_hop
-        )
+        workflow = await read_workflow(store, record.id, record.tenant_id, read_hop=read_hop)
     except ManagedStateError as error:
         if error.reason != "binding_conflict" or not any(hop.fanout for hop in hops):
             raise
