@@ -701,6 +701,52 @@ async def test_custom_sweep_refuses_adoption_listing_without_changing_legacy_cal
         await sweep(state_store=custom, on_stale="error", adoptable_after=timedelta(0))
 
 
+@pytest.mark.parametrize("policy", ["error", "reclaim"])
+@pytest.mark.parametrize("native_marker", [False, True])
+async def test_custom_sweep_refuses_adoption_before_any_store_call(
+    engine, caplog, policy, native_marker
+):
+    from types import SimpleNamespace
+
+    from dendrux import sweep
+    from dendrux.runtime.state import StoreCapabilities
+
+    calls = []
+
+    class Custom:
+        capabilities = StoreCapabilities(recovery=True, deployment="single_process")
+        _uses_waiting_sweep_cursor = native_marker
+        _scan_abandoned_runs = None
+
+        async def sweep_stale_runs(self, **kwargs):
+            calls.append("sweep_stale_runs")
+            return []
+
+        async def mark_lease_expired(self, *, finalise_unrecoverable, **kwargs):
+            calls.append("mark_lease_expired")
+            return SimpleNamespace(finalised=[], reclaimable=[], cursor=None)
+
+        get_lease_expired = sweep_stale_runs
+        reclaim_run = sweep_stale_runs
+        get_replayed_tool_calls = sweep_stale_runs
+        sweep_abandoned_runs = sweep_stale_runs
+
+    with pytest.raises(NotImplementedError) as error:
+        await sweep(
+            state_store=Custom(),
+            stale_running=timedelta(minutes=1),
+            adoptable_after=timedelta(0),
+            on_stale=policy,
+        )
+    assert str(error.value) == "adoptable_after requires the native SQL waiting scan"
+    assert [
+        (record.code, getattr(record, "run_id", None))
+        for record in caplog.records
+        if hasattr(record, "code")
+    ] == [("store_capability", None)]
+    assert calls == []
+
+
 async def test_public_sweep_does_not_restart_a_completed_waiting_category(store):
     from dendrux import sweep
 

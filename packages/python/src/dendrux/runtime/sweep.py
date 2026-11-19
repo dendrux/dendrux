@@ -47,6 +47,7 @@ from dendrux.runtime._bounds import (
     SWEEP_MAX_RUNS_DEFAULT,
     SWEEP_MAX_RUNS_MAX,
 )
+from dendrux.runtime._capabilities import capabilities, validate_capabilities
 from dendrux.runtime.durability import _live_updates_boundary
 from dendrux.runtime.state import SweepResult, _validate_sweep_age
 
@@ -105,6 +106,28 @@ def _waiting_position(value: Any) -> tuple[str, datetime, str] | None:
     return status, datetime.fromisoformat(age), run_id
 
 
+def _uses_native_waiting_scan(store: StateStore) -> bool:
+    return getattr(store, "_uses_waiting_sweep_cursor", False) is True and callable(
+        getattr(store, "_scan_abandoned_runs", None)
+    )
+
+
+def _validate_store_support(
+    store: StateStore, on_stale: Literal["error", "reclaim"], adoptable_after: timedelta | None
+) -> None:
+    if on_stale == "reclaim":
+        validate_capabilities(store)
+    if on_stale == "reclaim" and not capabilities(store).recovery:
+        _codes.log_code(logging.getLogger(__name__), _codes.STORE_CAPABILITY, run_id=None)
+        raise NotImplementedError(
+            f"StateStore {type(store).__name__} does not declare the 'recovery' "
+            'capability; pass on_stale="error" to finalise stale runs without it'
+        )
+    if adoptable_after is not None and not _uses_native_waiting_scan(store):
+        _codes.log_code(logging.getLogger(__name__), _codes.STORE_CAPABILITY, run_id=None)
+        raise NotImplementedError("adoptable_after requires the native SQL waiting scan")
+
+
 async def _sweep_waiting(
     store: StateStore,
     threshold: timedelta | None,
@@ -137,26 +160,22 @@ async def _waiting_page(
 ) -> tuple[list[SweptRun], tuple[str, datetime, str] | None]:
     if threshold is None and adoptable_after is None:
         return [], None
-    scan = getattr(store, "_scan_abandoned_runs", None)
-    if getattr(store, "_uses_waiting_sweep_cursor", False) is True and callable(scan):
+    if _uses_native_waiting_scan(store):
+        # The native marker guarantees the SQL scan's hosting interface.
+        scan = cast("_SqlSweep", store)._scan_abandoned_runs
         if progress.waiting_done:
             return [], None
         if adoptable_after is not None:
             return await _native_adoption_page(
                 store, threshold, limits, progress, adoptable_after, adoptable
             )
-        page = await scan(
-            threshold,
+        return await scan(
+            cast("timedelta", threshold),
             batch_size=limits.get("batch_size", SWEEP_BATCH_DEFAULT),
             max_runs=limits.get("max_runs", SWEEP_MAX_RUNS_DEFAULT),
             cursor=progress.waiting,
         )
-        # The native scan returns the same typed page as its SQL implementation.
-        return cast("tuple[list[SweptRun], tuple[str, datetime, str] | None]", page)
-    if adoptable_after is not None:
-        _codes.log_code(logging.getLogger(__name__), _codes.STORE_CAPABILITY, run_id=None)
-        raise NotImplementedError("adoptable_after requires the native SQL waiting scan")
-    # The no-age call returned above; adoption-only custom stores have just refused.
+    # Public validation has already refused adoption listing without a native scan.
     result = await store.sweep_abandoned_runs(older_than=cast("timedelta", threshold), **limits)
     return result, None
 
@@ -345,16 +364,7 @@ async def sweep(
                 limits["batch_size"] = batch_size
             if max_runs != SWEEP_MAX_RUNS_DEFAULT:
                 limits["max_runs"] = max_runs
-            from dendrux.runtime._capabilities import capabilities, validate_capabilities
-
-            if on_stale == "reclaim":
-                validate_capabilities(store)
-            if on_stale == "reclaim" and not capabilities(store).recovery:
-                _codes.log_code(logging.getLogger(__name__), _codes.STORE_CAPABILITY, run_id=None)
-                raise NotImplementedError(
-                    f"StateStore {type(store).__name__} does not declare the 'recovery' "
-                    'capability; pass on_stale="error" to finalise stale runs without it'
-                )
+            _validate_store_support(store, on_stale, adoptable_after)
             stale, reclaimable, next_cursor = await _sweep_running(
                 store,
                 stale_running,

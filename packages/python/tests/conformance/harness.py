@@ -199,8 +199,8 @@ ADDITIVE_060_RECORD_FIELDS = {
         "trace_link",
     },
 }
-# contracts §7 / §12.15: additive sweep result shape only (adoptable since 0.8).
-ADDITIVE_060_RESULT_FIELDS = {"SweepResult": {"reclaimable", "cursor", "adoptable"}}
+# contracts §7 / §12.15: additive sweep result shape only.
+ADDITIVE_060_RESULT_FIELDS = {"SweepResult": {"reclaimable", "cursor"}}
 # contracts §12.7 / §12.15: preserve every other base and its order.
 ADDITIVE_060_EXCEPTION_BASES = {"RunControlError"}
 
@@ -212,6 +212,13 @@ def _pending_excluded_fields(obj: Any) -> set[str]:
     ):
         return origin_fields
     return set()
+
+
+def _result_excluded_fields(obj: Any) -> set[str]:
+    excluded = ADDITIVE_060_RESULT_FIELDS.get(type(obj).__name__, set())
+    if type(obj).__name__ == "SweepResult" and obj.adoptable == []:
+        return excluded | {"adoptable"}
+    return excluded
 
 
 def raw(obj: Any) -> Any:
@@ -236,7 +243,7 @@ def raw(obj: Any) -> Any:
     if hasattr(obj, "__dataclass_fields__") and not isinstance(obj, type):
         excluded = (
             ADDITIVE_060_RECORD_FIELDS.get(type(obj).__name__, set())
-            | ADDITIVE_060_RESULT_FIELDS.get(type(obj).__name__, set())
+            | _result_excluded_fields(obj)
             | _pending_excluded_fields(obj)
         )
         return {
