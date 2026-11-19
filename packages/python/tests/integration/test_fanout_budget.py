@@ -20,7 +20,7 @@ from dendrux.types import Budget, Limits, LLMResponse, RunStatus, ToolCall, Usag
 from tests._helpers.fanout_effects import FanoutEffects
 from tests._helpers.gates import wait_for_gate
 from tests.integration.test_budget import _CostReportingLLM
-from tests.integration.test_fanout_cancel import TENANT, running_root_id
+from tests.integration.test_fanout_cancel import HANG_TIMEOUT, TENANT, running_root_id
 
 pytestmark = pytest.mark.parametrize("engine", ["sqlite_file", "postgres"], indirect=True)
 
@@ -132,18 +132,18 @@ async def test_g2_g3_one_unchecked_iteration_per_leaf_and_root_enforcement(
         path = recorder._loop_state.get("managed", {}).get("path", [])
         if path and path[-1].startswith("w") and recorder._run_id not in written:
             written.add(recorder._run_id)
-            await asyncio.wait_for(flushed.wait(), 10)
+            await asyncio.wait_for(flushed.wait(), HANG_TIMEOUT)
 
     monkeypatch.setattr(_managed_budget, "record_interaction", flush)
     run = asyncio.create_task(root.run("go", tenant_id=TENANT))
     try:
         for _, p in pairs:
-            await wait_for_gate(p.entered, task=run)
+            await wait_for_gate(p.entered, task=run, timeout=HANG_TIMEOUT)
         rid = await running_root_id(store)
         assert (await store.subtree_usage(rid)).known_cost_usd == 1
         for _, p in pairs:
             p.gate.set()
-        result = await asyncio.wait_for(run, 60)
+        result = await asyncio.wait_for(run, HANG_TIMEOUT)
         assert (
             result.status.value
             == {"pause": "paused", "cancel": "cancelled", "warn": "success"}[action]
@@ -234,13 +234,13 @@ async def test_g5_fault_in_one_branch_fails_closed_after_adoption(
     run = asyncio.create_task(root.run("go", tenant_id=TENANT))
     try:
         for _, p in pairs:
-            await wait_for_gate(p.entered, task=run)
+            await wait_for_gate(p.entered, task=run, timeout=HANG_TIMEOUT)
         rid = await running_root_id(store)
         subtree = await store.get_subtree(rid, tenant_id=TENANT)
         origin[0] = next(n.run.id for n in subtree.nodes if n.run.agent_name == "w0")
         for _, p in pairs:
             p.gate.set()
-        result = await asyncio.wait_for(run, 20)
+        result = await asyncio.wait_for(run, HANG_TIMEOUT)
         assert result.status == RunStatus.PAUSED and provider.calls == 1
         state = await store.get_loop_state(rid)
         assert state[_managed_budget.UNKNOWN] == {
@@ -340,6 +340,12 @@ async def test_g7_eight_leaf_measurements_have_bounded_query_cost(
         event.remove(engine.sync_engine, "before_cursor_execute", capture)
     assert result.status == RunStatus.SUCCESS
     assert effects.counts().provider == {f"w{i}": 2 for i in range(8)}
-    assert measurements and max(m["SELECT"] for m in measurements) <= 4  # D=1, D+3
+    assert_measurement_queries(measurements)
     record_property("measurement_count", len(measurements))
     record_property("measurement_selects", sum(m["SELECT"] for m in measurements))
+
+
+def assert_measurement_queries(measurements: list[Counter[str]]) -> None:
+    assert len(measurements) >= 8
+    assert all(m["SELECT"] >= 1 for m in measurements)
+    assert max(m["SELECT"] for m in measurements) <= 4  # D=1, D+3
