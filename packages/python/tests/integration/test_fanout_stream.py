@@ -33,7 +33,6 @@ from tests.integration.test_fanout_driver import (  # noqa: F401 - fixtures used
     assert_parent_turn,
     live_adoption,
     round2_children,
-    v4_continuation,
 )
 
 pytestmark = pytest.mark.parametrize("engine", ["sqlite_file", "postgres"], indirect=True)
