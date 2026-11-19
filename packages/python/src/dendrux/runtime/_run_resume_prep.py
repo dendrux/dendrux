@@ -27,6 +27,7 @@ from dendrux.runtime import (
     _run_contracts,
     _run_entry,
     _run_events,
+    _run_execute,
     _run_images,
     _run_pending,
     _run_tools,
@@ -270,11 +271,13 @@ async def _prepare_resume(
     history_records: Any = None,
     pause_data: dict[str, Any] | None = None,
     submission_projection: _SubmissionProjection | None = None,
-    recovering: bool | None = None,
+    recovering: bool,
 ) -> _run_contracts._ResumeContext:
     """Prepare a claimed continuation's history, recorder and frame capability.
 
-    The caller owns loading and claiming, injected-history replay and lifecycle
+    ``recovering``: the continuation resolves an interrupted step instead of applying a
+    new payload. Every frame, batch or stream, gets its fan-out capability here, from its
+    store. The caller owns loading and claiming, injected-history replay and lifecycle
     notifications, including their failure cleanup.
     """
     from dendrux.runtime.persistence import PersistenceRecorder
@@ -346,7 +349,7 @@ async def _prepare_resume(
         **_run_images._recorder_image_kwargs(tenant_id, provider),
     )
 
-    await _managed_budget.restore_recorder(recorder, agent, history_records, bool(recovering))
+    await _managed_budget.restore_recorder(recorder, agent, history_records, recovering)
     recorder._resume_pause_data = pause_data
 
     # NOTE: lifecycle hooks (record_run_started/notify_run_started) and
@@ -363,9 +366,7 @@ async def _prepare_resume(
         resolved_loop=resolved_loop,
         resolved_strategy=resolved_strategy,
     )
-    # Batch callers explicitly pass the recovery flag; stream preparation omits
-    # it and keeps the frame capability disabled.
-    _reclaim.configure_recovery_frame(ctx, state_store, streaming=recovering is None)
+    _run_execute._configure_fanout(ctx.recorder, state_store)
     return ctx
 
 

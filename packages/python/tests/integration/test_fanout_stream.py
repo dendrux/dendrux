@@ -1194,3 +1194,57 @@ async def test_a_cancel_while_the_root_is_being_cancelled_still_finishes_it(
             provider.gate.set()
         await asyncio.gather(caller, return_exceptions=True)
         await close_all(root, *children)
+
+
+# ---------------------------------------------------------------------------
+# Every frame, batch or stream, new or continued, gets its capability the same way
+# ---------------------------------------------------------------------------
+
+
+def frame_flags(monkeypatch: Any) -> list[Any]:
+    """The fan-out flag each ReAct frame reads when it builds its batch policy."""
+    from dendrux.loops import _managed_batch
+
+    seen: list[Any] = []
+    original = _managed_batch.loop_fanout_capable
+
+    def capable(recorder: object) -> bool:
+        seen.append(getattr(recorder, "_managed_fanout_capable", "unset"))
+        return original(recorder)
+
+    monkeypatch.setattr(_managed_batch, "loop_fanout_capable", capable)
+    return seen
+
+
+@pytest.mark.parametrize("entry", ["batch", "stream"])
+@pytest.mark.parametrize("capable", [True, False])
+async def test_new_and_continued_frames_fan_out_exactly_when_the_store_can(
+    store, monkeypatch, entry, capable
+):
+    from tests.integration.test_fanout_old_store import OldStore
+
+    flags = frame_flags(monkeypatch)
+    child = worker("alpha", ScriptedLLM([LLMResponse(text="alpha")]), loop=SingleCall())
+    root = lead(
+        store if capable else OldStore(store),
+        ScriptedLLM([LLMResponse(tool_calls=[ToolCall("read", {})]), LLMResponse(text="done")]),
+        [child],
+        tools=[read],
+    )
+    try:
+        if entry == "batch":
+            paused = await root.run("go", tenant_id=TENANT)
+        else:
+            paused = (await collect(root.stream("go", tenant_id=TENANT)))[-1].run_result
+        reply = [ToolResult("read", paused.pending.tool_calls[0].id, '"answer"')]
+        kwargs = {"tenant_id": TENANT, "expected_pause_id": paused.pause_id}
+        if entry == "batch":
+            final = await root.resume(paused.run_id, tool_results=reply, **kwargs)
+        else:
+            stream = root.resume_stream(paused.run_id, tool_results=reply, **kwargs)
+            final = (await collect(stream))[-1].run_result
+        assert final.status == RunStatus.SUCCESS
+        assert len(flags) == 2  # the new run's frame, then its continuation's
+        assert flags == [capable, capable]
+    finally:
+        await close_all(root, child)

@@ -119,9 +119,14 @@ async def _crash_phase(mode: str, cut: str) -> None:
             async for event in stream:
                 kind = getattr(event.type, "value", event.type)
                 seen["first"] = seen["first"] or kind
-                seen["terminal"] = seen["terminal"] or kind.startswith("run_") and kind not in (
-                    "run_started",
-                    "run_resumed",
+                seen["terminal"] = (
+                    seen["terminal"]
+                    or kind.startswith("run_")
+                    and kind
+                    not in (
+                        "run_started",
+                        "run_resumed",
+                    )
                 )
                 if event.run_id not in (None, stream.run_id) and kind.startswith("tool_"):
                     seen["child_events"] += 1

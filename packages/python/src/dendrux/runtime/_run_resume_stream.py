@@ -31,7 +31,6 @@ from dendrux.runtime import (
     _run_contracts,
     _run_errors,
     _run_events,
-    _run_execute,
     _run_images,
     _run_observers,
     _run_outcome,
@@ -130,15 +129,6 @@ async def _stream_resume_images(
         loop_method="run_stream",
     )
     return store, stream_results, user_parts, results_prepared
-
-
-def _fanout_frame(
-    ctx: _run_contracts._ResumeContext, store: StateStore
-) -> _run_contracts._ResumeContext:
-    """Set the streamed frame's fan-out flag explicitly: approval dispatch, recovery and
-    the loop fan out exactly when resume() would."""
-    _run_execute._configure_fanout(ctx.recorder, store)
-    return ctx
 
 
 async def _stream_resume_state(
@@ -589,10 +579,8 @@ def resume_stream(
             _shared["expected_status"] = expected
             progress = _shared["progress"] = _run_contracts._ResumeProgress()
 
-            # 5. Prepare (shared helper — history, notifier).
-            #    Does NOT fire any lifecycle hooks; that's done below inside
-            #    the same try block so failure or released-finish hooks pair
-            #    with on_run_started.
+            # 5. Prepare (shared helper: history, notifier, frame capability). Lifecycle
+            #    hooks fire below, in this try block, so failure hooks pair with them.
             run_tenant = run_record.tenant_id if run_record else None
             ctx = await _run_resume_prep._prepare_resume(
                 run_id,
@@ -608,9 +596,10 @@ def resume_stream(
                 tenant_id=run_tenant,
                 history_records=reads.history_records,
                 pause_data=raw_pause,
+                recovering=recovering,
             )
             image_runtime = _run_images._image_runtime(agent, store, run_tenant, run_id)
-            _shared["ctx"] = _fanout_frame(ctx, store)
+            _shared["ctx"] = ctx
             progress.submission = getattr(ctx.recorder, "_loop_state", {}).get("submission")
 
             # 5a. Fire run-level lifecycle hooks. The exception handler closes
