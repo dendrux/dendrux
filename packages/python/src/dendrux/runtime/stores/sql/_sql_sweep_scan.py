@@ -226,7 +226,7 @@ class _SweepScan:
         bindings = wait.managed_fanout.bindings if wait.managed_fanout else (wait.managed_wait,)
         ids = [binding.child_run_id for binding in bindings if binding is not None]
         # The native SQL scan is hosted by a store implementing the fan-out read protocol.
-        store = cast("ManagedFanoutStore", self.store)
+        store: ManagedFanoutStore = cast("Any", self.store)
         children = await store.get_managed_children(row.id, ids, tenant_id=row.tenant_id)
         if (
             _adoptable_children(children, bindings, row, header)
