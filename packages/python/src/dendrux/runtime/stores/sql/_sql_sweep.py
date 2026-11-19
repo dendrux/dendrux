@@ -138,17 +138,13 @@ async def _collect_runs(
     )
 
 
-async def _scan_runs_core(
-    store: _SqlSweep,
-    older_than: timedelta | None,
-    *,
-    waiting: bool,
+def _scan_window(
     batch_size: int,
     max_runs: int,
-    cursor: tuple[str, datetime, str] | None = None,
-    adoptable_after: timedelta | None = None,
-    adoptable: list[str] | None = None,
-) -> tuple[list[SweptRun], tuple[str, datetime, str] | None]:
+    older_than: timedelta | None,
+    adoptable_after: timedelta | None,
+) -> timedelta:
+    """Validate the scan bounds and ages; return the youngest age the scan must read."""
     for name, value, ceiling in (
         ("batch_size", batch_size, SWEEP_BATCH_MAX),
         ("max_runs", max_runs, SWEEP_MAX_RUNS_MAX),
@@ -160,7 +156,22 @@ async def _scan_runs_core(
         _validate_sweep_age(age)
     if not ages:
         raise ValueError("sweep age must be a non-negative timedelta")
-    scan = _sql_sweep_scan._SweepScan(store, waiting=waiting, older_than=min(ages))
+    return min(ages)
+
+
+async def _scan_runs_core(
+    store: _SqlSweep,
+    older_than: timedelta | None,
+    *,
+    waiting: bool,
+    batch_size: int,
+    max_runs: int,
+    cursor: tuple[str, datetime, str] | None = None,
+    adoptable_after: timedelta | None = None,
+    adoptable: list[str] | None = None,
+) -> tuple[list[SweptRun], tuple[str, datetime, str] | None]:
+    window = _scan_window(batch_size, max_runs, older_than, adoptable_after)
+    scan = _sql_sweep_scan._SweepScan(store, waiting=waiting, older_than=window)
     if adoptable_after is not None:
         scan.configure_adoption(
             abandoned_after=older_than, adoptable_after=adoptable_after, adoptable=adoptable
