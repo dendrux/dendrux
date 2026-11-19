@@ -153,12 +153,6 @@ def _prepare_stream_result(
     _run_observers._attach_mcp_meta(result, mcp_meta)
 
 
-def _disable_stream_fanout(recorder: LoopRecorder | None) -> None:
-    """Mark a streamed loop's recorder as not fan-out capable (no-op without a recorder)."""
-    if recorder is not None:
-        recorder._managed_fanout_capable = False  # type: ignore[attr-defined]  # Frame flag.
-
-
 async def _stream_loop_events(
     loop_stream: AsyncGenerator[RunEvent, None],
     *,
@@ -172,7 +166,6 @@ async def _stream_loop_events(
     replay_plan: ReplayPlan | None = None,
     new_run: bool = False,
 ) -> AsyncGenerator[RunEvent, None]:
-    _disable_stream_fanout(recorder)
     async with _closing_loop_stream(loop_stream, run_id):
         async for event in loop_stream:
             result = _terminal_stream_result(event)

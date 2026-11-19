@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import aclosing
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
@@ -16,6 +17,7 @@ from dendrux.runtime import (
     _managed_route,
     _managed_stream,
 )
+from dendrux.runtime._entry_checks import entry_checks
 from dendrux.runtime._managed_adoption import _FAILURE_CODES as _FAILURE_CODES
 from dendrux.runtime._managed_adoption import _FAILURE_TEXT as _FAILURE_TEXT
 from dendrux.runtime._managed_adoption import CHILD_CANCELLED as CHILD_CANCELLED
@@ -52,17 +54,24 @@ from dendrux.runtime._managed_route import _registered as _registered
 from dendrux.runtime._managed_route import _root_result as _root_result
 from dendrux.runtime._managed_route import root_view as root_view
 from dendrux.runtime._managed_route import walk as walk
+from dendrux.runtime._managed_stream import _TERMINAL_EVENTS, _Leg, _Single, _StreamState, _Terminal
 from dendrux.runtime._managed_stream import _cancel_unstarted as _cancel_unstarted
 from dendrux.runtime._managed_stream import _close_workflow as _close_workflow
 from dendrux.runtime._managed_stream import _continuation_stream as _continuation_stream
 from dendrux.runtime._managed_stream import _event as _event
 from dendrux.runtime._managed_stream import _event_with_error as _event_with_error
 from dendrux.runtime._managed_stream import _paused_or_failed as _paused_or_failed
-from dendrux.runtime._managed_stream import _Single, _Started, _StreamState, _Terminal
+from dendrux.runtime._managed_stream import _Started as _Started
 from dendrux.runtime._managed_stream import _stream_failure as _stream_failure
 from dendrux.runtime._managed_stream import _structural as _structural
 from dendrux.runtime._managed_tree import FanoutInvocation
-from dendrux.runtime.state import MANAGED_HEADER_KEY, EventWrite, ManagedHeader, unclaimed_store
+from dendrux.runtime.state import (
+    MANAGED_HEADER_KEY,
+    UNSCOPED,
+    EventWrite,
+    ManagedHeader,
+    unclaimed_store,
+)
 from dendrux.types import (
     Limits,
     PauseState,
@@ -697,7 +706,6 @@ async def adopt_terminal_leaf(found: Route, store: Any, *, notifier: Any) -> Run
 # ---------------------------------------------------------------------------
 
 _LIFECYCLE_STARTS = frozenset({"run_started", "run_resumed"})
-_TERMINAL_EVENTS = frozenset({"run_completed", "run_paused", "run_error", "run_cancelled"})
 
 
 _TOOL_EVENTS = frozenset({"tool_use_start", "tool_use_end", "tool_result"})
@@ -730,24 +738,6 @@ def _forwarded(
     return _managed_stream._structural(event, run_id)
 
 
-def _child_stream(invocation: ManagedInvocation, notifier: Any) -> Any:
-    """The bound child's own stream (created by the atomic bind on first step)."""
-    from dendrux.runtime._subagents import _tighten
-    from dendrux.runtime.runner import run_stream
-
-    child = invocation.child
-    return run_stream(
-        child,
-        provider=child._require_provider(),
-        user_input=_task(invocation),
-        state_store=invocation.store,
-        tenant_id=invocation.tenant_id,
-        extra_notifier=notifier,
-        max_delegation_depth=_tighten(invocation.max_depth, child.max_delegation_depth),
-        _managed_invocation=invocation,
-    )
-
-
 async def _drain(
     stream: Any, *, root_level: bool, first: bool, managed_names: frozenset[str] = frozenset()
 ) -> Any:
@@ -755,8 +745,6 @@ async def _drain(
 
     The run's own stream is closed here, in this task, however iteration ends.
     """
-    from contextlib import aclosing
-
     terminal = None
     async with aclosing(stream.__aiter__()) as events:
         async for event in events:
@@ -775,15 +763,11 @@ async def _drain(
     yield _Terminal(terminal)
 
 
-@dataclass
-class _Leg:
-    """One run's stream inside the workflow: its outcome once drained."""
-
-    stream: Any
-    invocation: ManagedInvocation | None = None
-    terminal: Any = None
-    result: Any = None
-    bound: bool = False
+def _leg_events(leg: _Leg, state: _StreamState, *, first: bool) -> Any:
+    """One leg's events: a run's own stream, or a fan-out's owner progress."""
+    if isinstance(leg.stream, _managed_stream.FanoutStream):
+        return leg.stream.leg_events(state, leg)
+    return _run_leg(leg, state, first=first)
 
 
 async def _run_leg(leg: _Leg, state: _StreamState, *, first: bool) -> Any:
@@ -793,8 +777,6 @@ async def _run_leg(leg: _Leg, state: _StreamState, *, first: bool) -> Any:
     binding. Before its bind a child is not a run: its failure decides for its
     parent, exactly as for ``run()``.
     """
-    from contextlib import aclosing
-
     root_level = not state.waiting and leg.invocation is None
     state.current, state.root_active = leg.stream, root_level
     try:
@@ -829,8 +811,9 @@ async def _drive_stream(first: Any, state: _StreamState, *, notifier: Any) -> An
     state.waiting = state.waiting if state.waiting is not None else []
     leg = _Leg(first)
     for step in range(_MAX_STEPS):
-        async for item in _run_leg(leg, state, first=step == 0):
-            yield item
+        async with aclosing(_leg_events(leg, state, first=step == 0)) as items:
+            async for item in items:
+                yield item
         if state.root_run_id is None:
             state.root_run_id = leg.stream.run_id
         if leg.invocation is not None and leg.bound:
@@ -851,23 +834,29 @@ async def _next_leg(leg: _Leg, state: _StreamState, notifier: Any) -> Any:
             await _managed_route.root_view(state.store, str(state.root_run_id))
         )
     if is_descend(result):
-        invocation = result.meta[DESCEND_KEY]
-        state.tenant_id = invocation.tenant_id
-        return _Leg(_child_stream(invocation, notifier), invocation)
+        return _managed_stream._descend_leg(result.meta[DESCEND_KEY], state, notifier)
     if not waiting:
         return leg.terminal if leg.terminal is not None else _managed_stream._event(result)
+    if not isinstance(parent := waiting[-1], _Waiting):
+        return await _managed_stream.settle_wait(state, leg, parent, notifier)
     if result.status not in TERMINAL_STATUSES:
         return _managed_stream._event(
-            await _managed_stream._paused_or_failed(state, waiting, result, leg.terminal)
+            await _managed_stream._paused_view(state, waiting, result, leg.terminal)
         )
-    claim = await claim_adoption(waiting[-1], state.store)
+    return await _adopt_next(waiting, parent, state, notifier)
+
+
+async def _adopt_next(
+    waiting: list[Any], parent: _Waiting, state: _StreamState, notifier: Any
+) -> Any:
+    """Adopt a finished child into ``waiting[-1]``: its continuation leg, or the root view."""
+    claim = await claim_adoption(parent, state.store)
     if claim is None:
-        return _managed_stream._event(
-            await _managed_route.root_view(state.store, str(state.root_run_id))
-        )
-    parent = waiting.pop()
+        view = await _managed_route.root_view(state.store, str(state.root_run_id))
+        return _managed_stream._event(view)
+    waiting.pop()
     state.unstarted = (parent.parent_run_id, claim)
-    return _Leg(_managed_stream._continuation_stream(parent, state.store, claim, notifier))
+    return _Leg(_managed_stream._waiting_continuation(parent, state.store, claim, notifier))
 
 
 def workflow_stream(
@@ -886,8 +875,6 @@ def workflow_stream(
     early cancels the active run through its own stream and, while the root
     waits on a subagent, cancels the root with its descendants.
     """
-    from contextlib import aclosing
-
     from dendrux.types import RunStream as _RunStream
 
     state = _StreamState(root_agent)
@@ -942,33 +929,27 @@ def routed_stream(
     from dendrux.runtime.runner import resume_stream
     from dendrux.types import RunEvent, RunEventType
 
+    leaf_kwargs = {
+        "tool_results": tool_results,
+        "user_input": user_input,
+        "expected_pause_id": expected_pause_id,
+        "notifier": notifier,
+        "tenant_explicit": tenant_explicit,
+    }
+
     async def open_first(state: _StreamState) -> Any:
         state.store = store = await root_agent._resolve_state_store()
         found = await route(root_agent, store, run_id, tenant_id=tenant_id)
         state.root_run_id, state.tenant_id = run_id, found.tenant_id
+        if await _managed_route.reaches_fanout(store, found):  # a fan-out below (0.8)
+            return await _managed_stream.open_fanout_leaf(state, root_agent, found, **leaf_kwargs)
         resumed = RunEvent(type=RunEventType.RUN_RESUMED, run_id=run_id)
         no_payload = tool_results is None and user_input is None
         if no_payload and found.routed and found.leaf.status in _TERMINAL_VALUES:
-            waiting = list(found.waiting)
-            claim = await claim_adoption(waiting[-1], store)
-            if claim is None:
-                state.waiting = []
-                return _Single(
-                    _managed_stream._event(await _managed_route.root_view(store, run_id))
-                ), None
-            parent = waiting.pop()
-            first = _managed_stream._continuation_stream(parent, store, claim, notifier)
-            # Cleanup ownership is in place before any event or the claim escapes.
-            state.waiting, state.unstarted = waiting, (parent.parent_run_id, claim)
-            state.current, state.root_active = first, not waiting
-            # The root's own continuation opens with its RUN_RESUMED.
-            return first, (resumed if waiting else None)
+            return await _adopt_finished(state, found, resumed, notifier)
         require_leaf_pause(found, expected_pause_id)
         leaf = found.leaf_agent
         if found.routed:
-            from dendrux.runtime._entry_checks import entry_checks
-            from dendrux.runtime.state import UNSCOPED
-
             entry_checks(
                 leaf,
                 "resume_stream",
@@ -993,32 +974,29 @@ def routed_stream(
             state.waiting = []
             state.current, state.root_active = first, True
             return first, None
-        return await _owned_leaf_stream(state, found, first, resumed)
+        return await _managed_stream._owned_leaf_stream(
+            state, found.root_run_id, list(found.waiting), first, resumed
+        )
 
     return workflow_stream(root_agent, open_first, run_id=run_id, notifier=notifier)
 
 
-async def _owned_leaf_stream(state: _StreamState, found: Route, first: Any, resumed: Any) -> Any:
-    """Validate and claim the leaf in this task before the workflow exposes anything.
-
-    The leaf stream's first step runs its generation check and claim. Only a
-    stream that now owns the leaf arms workflow cancellation and opens with the
-    root's RUN_RESUMED; a refused or lost claim ends with a root-facing
-    RUN_ERROR and changes nothing.
-    """
-    events = first.__aiter__()
-    head = await anext(events, None)
-    if head is None or getattr(head.type, "value", head.type) in _TERMINAL_EVENTS:
-        await events.aclose()
+async def _adopt_finished(state: _StreamState, found: Route, resumed: Any, notifier: Any) -> Any:
+    """A payload-free resume adopts a finished subagent without a token: its parent's
+    continuation opens the stream, or the root view when another caller adopts."""
+    waiting = list(found.waiting)
+    claim = await claim_adoption(waiting[-1], state.store)
+    if claim is None:
         state.waiting = []
         view = await _managed_route.root_view(state.store, found.root_run_id)
-        error = getattr(head, "error", None) if head is not None else None
-        view.error = error
-        return _Single(_managed_stream._event_with_error(view, error)), None
-    started = _Started(first, events, head)
-    state.waiting = list(found.waiting)
-    state.current, state.root_active = started, False
-    return started, resumed
+        return _Single(_managed_stream._event(view)), None
+    parent = waiting.pop()
+    first = _managed_stream._waiting_continuation(parent, state.store, claim, notifier)
+    # Cleanup ownership is in place before any event or the claim escapes.
+    state.waiting, state.unstarted = [*waiting], (parent.parent_run_id, claim)
+    state.current, state.root_active = first, not waiting
+    # The root's own continuation opens with its RUN_RESUMED.
+    return first, (resumed if waiting else None)
 
 
 _TERMINAL_VALUES = frozenset(s.value for s in TERMINAL_STATUSES)

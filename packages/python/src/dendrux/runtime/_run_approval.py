@@ -664,16 +664,10 @@ async def _resume_approval_batch(
     streaming: bool = False,
 ) -> tuple[_run_contracts._ApprovalResume | None, bool]:
     pause = ctx.pause_state
-    if streaming and ctx.recorder is not None:
-        _run_execute._configure_fanout(ctx.recorder, None)
     approving = _is_approval_resume(expected, results, user_input)
     paused_batch = expected == RunStatus.PAUSED.value and bool(pause.pending_tool_calls)
     if not (approving or paused_batch):
         return None, approving
-    if streaming:
-        refused = await _refuse_stream_approval(agent, ctx, run_id)
-        if refused is not None:
-            return refused, approving
     decision_map = await _batch_decision_map(
         agent, ctx, run_id, decisions, approving=approving, streaming=streaming
     )
@@ -693,27 +687,6 @@ async def _resume_approval_batch(
         on_work=on_work,
     )
     return await _hand_off_approved_subagent(agent, ctx, run_id, approval), approving
-
-
-async def _refuse_stream_approval(
-    agent: Agent, ctx: _run_contracts._ResumeContext, run_id: str
-) -> _run_contracts._ApprovalResume | None:
-    """Refuse a held unsupported batch before approval dispatch creates any effect."""
-    # cycle: _reclaim imports _run_approval via runner; removed when T6 extracts recovery dispatch.
-    from dendrux.runtime._reclaim import _refuse_recovered_batch
-
-    calls = ctx.pause_state.pending_tool_calls
-    if len(calls) < 2:
-        return None
-    lookups = await agent.get_tool_lookups(loop=ctx.resolved_loop)
-    policy = _managed_batch.batch_policy(agent, fanout_capable=False)
-    if _managed_batch.classify_batch(calls, lookups, policy).action != "refuse":
-        return None
-    await _refuse_recovered_batch(ctx, run_id, calls)
-    decided = _decided_payload(
-        run_id, [(tc, "denied", _managed_batch.MANAGED_BATCH_UNSUPPORTED) for tc in calls]
-    )
-    return _run_contracts._ApprovalResume([], [], decided, None)
 
 
 async def _hand_off_approved_subagent(
