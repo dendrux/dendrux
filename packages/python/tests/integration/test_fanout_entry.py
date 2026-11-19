@@ -28,6 +28,8 @@ from dendrux.types import LLMResponse, ToolCall, UsageStats, generate_ulid
 from tests._helpers.gates import wait_for_gate
 from tests.integration.test_fanout_store_races import batch, fanout_parent
 
+PROGRESS_S = 60  # green-path waits wait for progress; generous for loaded runners
+
 SECRET = "AKIAIOSFODNN7EXAMPLE"
 
 
@@ -202,7 +204,7 @@ async def test_x10_cancel_during_bind_retains_every_claim(store, monkeypatch, lo
         caller.cancel("first")
         release.set()
         with pytest.raises(asyncio.CancelledError) as cancelled:
-            await asyncio.wait_for(caller, 10)
+            await asyncio.wait_for(caller, PROGRESS_S)
         assert cancelled.value.args == ("first",)
         for child in request.children:
             assert (await store.get_run(child.child_run_id)).status == "cancelled"
@@ -416,7 +418,7 @@ async def test_handoff_repeated_cancel_cannot_skip_finalization(store, monkeypat
             await asyncio.sleep(0)
         finish.set()
         with pytest.raises(asyncio.CancelledError) as error:
-            await asyncio.wait_for(caller, 10)
+            await asyncio.wait_for(caller, PROGRESS_S)
         assert error.value.args == ("first",)
         assert writes == [(c.child_run_id, 0) for c in request.children]
         for spec in request.children:
@@ -613,7 +615,7 @@ async def test_precommit_bind_cancel_has_no_children(store, monkeypatch):
     await wait_for_gate(entered, task=caller)
     caller.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(caller, 10)
+        await asyncio.wait_for(caller, PROGRESS_S)
     assert (await store.get_run(root)).status == "running"
     for child in request.children:
         assert await store.get_run(child.child_run_id) is None
@@ -993,7 +995,7 @@ async def test_fix1_cancel_before_bind_task_first_step(store, monkeypatch):
     monkeypatch.setattr(asyncio, "create_task", cut_before_first_step)
     caller = real_create(handoff()(store, operation, run_id=root))
     with pytest.raises(asyncio.CancelledError) as error:
-        await asyncio.wait_for(caller, 5)
+        await asyncio.wait_for(caller, PROGRESS_S)
     assert error.value.args == ("first",)
     assert touched == []
 
@@ -1018,7 +1020,7 @@ async def test_fix1_cancel_during_success_flush_finalizes_claims(store, monkeypa
     await wait_for_gate(entered, task=caller)
     caller.cancel("first")
     with pytest.raises(asyncio.CancelledError) as error:
-        await asyncio.wait_for(caller, 5)
+        await asyncio.wait_for(caller, PROGRESS_S)
     assert error.value.args == ("first",)
     for child in request.children:
         assert (await store.get_run(child.child_run_id)).status == "cancelled"

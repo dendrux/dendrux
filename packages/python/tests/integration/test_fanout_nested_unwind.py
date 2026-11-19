@@ -32,6 +32,8 @@ from tests.integration.test_fanout_adoption import (
     parked,
 )
 
+PROGRESS_S = 60  # green-path waits wait for progress; generous for loaded runners
+
 TENANT = "nested-recovery"
 pytestmark = pytest.mark.parametrize("engine", ["sqlite_file", "postgres"], indirect=True)
 
@@ -139,7 +141,7 @@ async def test_nested_concurrent_submits_adopt_each_wait_once(store, engine, mon
             arrivals += 1
             if arrivals == 2:
                 ready.set()
-            await asyncio.wait_for(ready.wait(), 10)
+            await asyncio.wait_for(ready.wait(), PROGRESS_S)
         return await original(store, node, **kwargs)
 
     monkeypatch.setattr(_managed_fanout, "settle_parent", settle)
@@ -193,7 +195,7 @@ async def test_public_restart_skips_terminal_children_and_fences_retired_writers
         env=env,
         capture_output=True,
         text=True,
-        timeout=45,
+        timeout=PROGRESS_S,
     )
     assert crashed.returncode == 17, crashed.stderr[-3000:]
     runs = await records(engine)
@@ -209,7 +211,7 @@ async def test_public_restart_skips_terminal_children_and_fences_retired_writers
         env=env,
         capture_output=True,
         text=True,
-        timeout=45,
+        timeout=PROGRESS_S,
     )
     assert recovered.returncode == 0, recovered.stderr[-3000:]
     assert (await store.get_run(root.id)).status == "success"
@@ -628,7 +630,7 @@ async def test_tokenless_resume_race_adopts_once(store, engine, monkeypatch):
         arrivals += 1
         if arrivals == 2:
             ready.set()
-        await asyncio.wait_for(ready.wait(), 10)
+        await asyncio.wait_for(ready.wait(), PROGRESS_S)
         return await original(*args, **kwargs)
 
     monkeypatch.setattr(_managed_fanout, "settle_parent", settle)

@@ -54,6 +54,8 @@ from dendrux.types import (
 )
 from tests._helpers.scripted_provider import ScriptedLLM
 
+PROGRESS_S = 60  # green-path waits wait for progress; generous for loaded runners
+
 if TYPE_CHECKING:
     from dendrux.runtime._managed_tree import SettleParent, WaitNode
     from dendrux.runtime.state import StateStore
@@ -1515,9 +1517,10 @@ async def test_cancelling_the_root_interrupts_a_routed_leaf(store: Any, shape: s
     submit = asyncio.create_task(
         root.submit_approval(root_id, approved=True, tenant_id=TENANT, expected_pause_id=token)
     )
-    await asyncio.wait_for(llm.entered.wait(), 5)
+    await asyncio.wait_for(llm.entered.wait(), PROGRESS_S)
     await root.cancel_run(root_id, tenant_id=TENANT)
     try:
+        # hang proof: a cancelled root must stop the routed leaf promptly
         await asyncio.wait_for(asyncio.shield(submit), 5)
     except TimeoutError:
         llm.gate.set()
