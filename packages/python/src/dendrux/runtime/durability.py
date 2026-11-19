@@ -83,6 +83,7 @@ _SWEEP_BOUNDARIES = frozenset(
     {
         "_scan_expired_runs",
         "_sweep_runs",
+        "_collect_runs",
         "mark_lease_expired",
         "sweep_stale_runs",
         "sweep_abandoned_runs",

@@ -19,8 +19,8 @@ if TYPE_CHECKING:
 
 pytest_plugins = ["pytester"]
 
-# Slices select one contract module by name, so a new managed module (for example the 0.8
-# fan-out contracts in ``test_managed_fanout.py``) never changes another slice's counts.
+# Slices select contract families by module or test name; shared sweep coverage
+# includes the one-child cases in the managed-subagent slice too.
 MANAGED_SLICE = "test_managed_subagents"
 FANOUT_SLICE = "test_managed_fanout"
 
@@ -145,7 +145,7 @@ def test_managed_contract_rejects_broken_store(pytester: Pytester, name: str) ->
 
 def test_managed_contract_slice_passes_on_intact_store(pytester: Pytester) -> None:
     intact = run_slice(pytester, NONE, MANAGED_SLICE)
-    intact.assert_outcomes(passed=22)
+    intact.assert_outcomes(passed=24)
     assert "managed_subagents" in intact.stdout.str()
 
 
@@ -179,7 +179,7 @@ def mutate(store):
     return store
 """.replace("PREREQUISITE", repr(prerequisite))
     result = run_slice(pytester, mutation, MANAGED_SLICE)
-    result.assert_outcomes(passed=1, skipped=21)
+    result.assert_outcomes(passed=1, skipped=23)
     assert "managed_subagents" not in result.stdout.str().split("capabilities=")[1].split(")")[0]
 
 
@@ -200,19 +200,19 @@ def mutate(store):
     return store
 """
     result = run_slice(pytester, mutation, MANAGED_SLICE)
-    result.assert_outcomes(passed=1, skipped=21)
+    result.assert_outcomes(passed=1, skipped=23)
     assert "managed_subagents" not in result.stdout.str().split("capabilities=")[1].split(")")[0]
 
 
 def test_managed_fault_cuts_are_reported_uncertified_without_injector(pytester: Pytester) -> None:
     result = run_kit(pytester, injector=None, k=MANAGED_SLICE)
-    result.assert_outcomes(passed=17, skipped=5)
+    result.assert_outcomes(passed=19, skipped=5)
     assert "crash recovery: not certified" in result.stdout.str()
 
 
 def test_fanout_contract_slice_passes_on_intact_store(pytester: Pytester) -> None:
     intact = run_slice(pytester, NONE, FANOUT_SLICE)
-    intact.assert_outcomes(passed=43)
+    intact.assert_outcomes(passed=47)
     assert "managed_subagents" in intact.stdout.str()
 
 
@@ -225,14 +225,14 @@ def mutate(store):
     return store
 """
     fanout = run_slice(pytester, mutation, FANOUT_SLICE)
-    fanout.assert_outcomes(passed=1, skipped=42)
+    fanout.assert_outcomes(passed=3, skipped=44)
     managed = run_slice(pytester, mutation, MANAGED_SLICE)
-    managed.assert_outcomes(passed=22)
+    managed.assert_outcomes(passed=24)
 
 
 def test_fanout_fault_cuts_are_reported_uncertified_without_injector(pytester: Pytester) -> None:
     result = run_kit(pytester, injector=None, k=FANOUT_SLICE)
-    result.assert_outcomes(passed=37, skipped=6)
+    result.assert_outcomes(passed=41, skipped=6)
     assert "crash recovery: not certified" in result.stdout.str()
 
 
@@ -273,3 +273,8 @@ def test_fanout_appears_in_the_report_label_only_when_capable(pytester: Pytester
     intact = run_slice(pytester, NONE, "test_fanout_support_reads_the_declaration")
     label = intact.stdout.str().split("capabilities=")[1].split(")")[0]
     assert label.endswith("managed_subagents,managed_fanout")
+
+
+def test_managed_sweep_contract_passes_on_intact_store(pytester: Pytester) -> None:
+    result = run_slice(pytester, NONE, "test_managed_fanout_sweep")
+    result.assert_outcomes(passed=4)

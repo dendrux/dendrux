@@ -42,7 +42,6 @@ from tests.integration.test_fanout_adoption import (
     parent_row,
     parked,
     transform_counts,
-    v4_continuation,  # noqa: F401 - autouse fixture (contract gap G2)
 )
 
 

@@ -649,9 +649,7 @@ class NoteRecord:
     delivered_iteration: int | None = None
 
 
-# ---------------------------------------------------------------------------
 # Delegation read models
-# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -880,6 +878,7 @@ class SweepResult:
     abandoned_waiting: list[SweptRun] = field(default_factory=list)
     reclaimable: list[ReclaimableRun] = field(default_factory=list)
     cursor: str | None = None
+    adoptable: list[str] = field(default_factory=list)
 
 
 @dataclass

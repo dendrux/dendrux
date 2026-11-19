@@ -16,7 +16,13 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 from dendrux import _codes
 from dendrux._lifecycle import STORAGE_FORMAT_CHECKPOINTED, TERMINAL_STATUSES
 from dendrux._managed_wait import MANAGED_FANOUT_SCHEMA_VERSION, MANAGED_WAIT_REASON
-from dendrux.errors import ManagedStateError, RunCancelledError, RunFencedError
+from dendrux.errors import (
+    ManagedStateError,
+    RunCancelledError,
+    RunFencedError,
+    RunNotFoundError,
+    RunNotReclaimableError,
+)
 from dendrux.loops import _helpers as _hooks
 from dendrux.loops._managed_batch import MANAGED_HANDOFF_KEY, ManagedHandoff
 from dendrux.loops.base import BaseNotifier, LoopNotifier
@@ -26,6 +32,7 @@ from dendrux.runtime import (
     _managed_budget,
     _managed_cancel,
     _managed_fanout_store,
+    _managed_route,
     _reclaim,
     _run_events,
     _run_execute,
@@ -34,9 +41,12 @@ from dendrux.runtime import context as _context
 from dendrux.runtime._capabilities import capabilities, fanout_support
 from dendrux.runtime._fanout_ledger import FanoutLedger
 from dendrux.runtime._managed import ManagedInvocation
-from dendrux.runtime._managed_definitions import require_bindable
+from dendrux.runtime._managed_claim import scoped_run
+from dendrux.runtime._managed_definitions import require_bindable, require_claimable
+from dendrux.runtime._managed_route import _Waiting
 from dendrux.runtime._managed_tree import BranchSpec, FanoutInvocation, LeafNode, WaitNode
 from dendrux.runtime._run_entry import PreparedChild, prepare_child_creation
+from dendrux.runtime._run_pending import _build_cached_result, _PendingReader, attach_facing
 from dendrux.runtime.durability import _fanout_ownership_handoff
 from dendrux.runtime.state import (
     ClaimResult,
@@ -64,7 +74,7 @@ if TYPE_CHECKING:
     from dendrux.agent import Agent
     from dendrux.loops.base import LoopRecorder
     from dendrux.runtime._managed_fanout_store import BindManagedChildrenResult
-    from dendrux.runtime.state import StateStore
+    from dendrux.runtime.state import StateStore, TenantScope
     from dendrux.types import ToolCall, ToolResult
 
     EventSink = Callable[[RunEvent], Awaitable[None]]
@@ -744,3 +754,199 @@ def _fanout_wait(
         image_view_ref=state.get("image_view_ref"),
         provider_kwargs=dict(provider_kwargs or pause.provider_kwargs or {}),
     )
+
+
+async def reconnect_tree(
+    root_agent: Agent,
+    store: StateStore,
+    root_run_id: str,
+    *,
+    tenant_id: TenantScope,
+    notifier: LoopNotifier | None,
+) -> RunResult:
+    """Validate and reconnect a fan-out workflow, then read its root-facing pending view."""
+    tree = await _managed_route.route_tree(root_agent, store, root_run_id, tenant_id=tenant_id)
+    result = await drive_node(
+        store, tree.root, tenant_id=tree.tenant_id, fanout_tree=True, notifier=notifier
+    )
+    await attach_facing(result, _PendingReader(store), root_run_id, tree.tenant_id)
+    return result
+
+
+async def drive_node(
+    store: StateStore,
+    node: WaitNode | LeafNode,
+    *,
+    tenant_id: TenantScope,
+    fanout_tree: bool,
+    notifier: LoopNotifier | None = None,
+) -> RunResult:
+    """Reconnect a validated tree, joining branch owners before fresh fan-in.
+
+    ``fanout_tree`` is true for every node beneath a workflow containing a v4
+    wait. Only there may a live lease or a running SingleCall be left to its
+    owner or developer-called sweep. Legacy trees keep their recovery errors.
+    The caller owns and joins every task created here, including on cancellation.
+    """
+    record = await scoped_run(store, node.run_id, tenant_id)
+    if record is None:
+        raise RunNotFoundError(node.run_id)
+    if record.status in _TERMINAL:
+        return await _build_cached_result(store, node.run_id)
+    if isinstance(node, LeafNode) or record.status != RunStatus.PAUSED.value:
+        return await _reconnect_leaf(store, node, record.status, tenant_id, fanout_tree, notifier)
+    return await _reconnect_wait(store, node, fanout_tree=fanout_tree, notifier=notifier)
+
+
+async def _reconnect_wait(
+    store: StateStore, node: WaitNode, *, fanout_tree: bool, notifier: LoopNotifier | None
+) -> RunResult:
+    joined_terminal = await _reconnect_children(
+        store, node, fanout_tree=fanout_tree, notifier=notifier
+    )
+    if node.version == 4:
+        if not joined_terminal and not await _reconnect_terminal_children(store, node):
+            return await _build_cached_result(store, node.run_id)
+        claim = await settle_parent(store, node)
+        if claim is None:
+            return await _build_cached_result(store, node.run_id)
+        result = await continue_parent(node.agent, store, node.run_id, claim, notifier=notifier)
+    else:
+        child = node.children[0]
+        if child.call is None:
+            raise ManagedStateError(reason="binding_missing", run_id=node.run_id)
+        waiting = _Waiting(
+            node.agent, node.run_id, child.agent, child.agent_path, child.call, child.run_id
+        )
+        result = await _managed.adopt(waiting, store=store, notifier=notifier)
+    return await _managed.drive(result, notifier=notifier)
+
+
+async def _reconnect_terminal_children(store: StateStore, node: WaitNode) -> bool:
+    # A validated v4 wait supplies this optional reader; re-read after joining owners.
+    ids = [binding.child_run_id for binding in node.bindings]
+    rows = await cast("_managed_fanout_store.ManagedFanoutStore", store).get_managed_children(
+        node.run_id, ids, tenant_id=node.tenant_id
+    )
+    if len(rows) != len(ids) or {row.run_id for row in rows} != set(ids):
+        raise ManagedStateError(reason="child_missing", run_id=node.run_id)
+    return all(row.status in _TERMINAL for row in rows)
+
+
+async def _reconnect_leaf(
+    store: StateStore,
+    node: WaitNode | LeafNode,
+    status: str,
+    tenant_id: TenantScope,
+    fanout_tree: bool,
+    notifier: LoopNotifier | None,
+) -> RunResult:
+    if status != RunStatus.RUNNING.value:
+        return await _build_cached_result(store, node.run_id)
+    state = await store.get_loop_state(node.run_id)
+    if state is None:
+        raise RunNotReclaimableError(node.run_id, "recovery_state_missing")
+    loop = state.get("loop")
+    if fanout_tree and loop == "single_call":
+        return await _build_cached_result(store, node.run_id)
+    require_claimable(node.run_id, loop)
+    try:
+        result = await _reclaim.reclaim(
+            node.agent,
+            store,
+            node.run_id,
+            tenant_id=tenant_id,
+            item=None,
+            notifier=notifier,
+            via_root=bool(node.agent_path),
+        )
+    except (RunAlreadyActiveError, RunFencedError, RunNotReclaimableError) as exc:
+        if not fanout_tree or (
+            isinstance(exc, RunNotReclaimableError)
+            and exc.reason not in {"lease_fresh", "not_running", "already_reclaimed"}
+        ):
+            raise
+        if await scoped_run(store, node.run_id, tenant_id) is None:
+            raise RunNotFoundError(node.run_id) from None
+        return await _build_cached_result(store, node.run_id)
+    return await _managed.drive(result, notifier=notifier)
+
+
+async def _reconnect_children(
+    store: StateStore, node: WaitNode, *, fanout_tree: bool, notifier: LoopNotifier | None
+) -> bool:
+    tasks: list[asyncio.Task[RunResult | Exception]] = []
+    cancellation = None
+    try:
+        for child in node.children:
+            operation = _reconnect_branch(store, child, node, fanout_tree, notifier)
+            try:
+                task = asyncio.create_task(operation, context=owner_context())
+            except BaseException:
+                operation.close()
+                raise
+            tasks.append(task)
+        if tasks:
+            await asyncio.wait(tasks)
+    except asyncio.CancelledError as exc:
+        cancellation = exc
+    finally:
+        _, cleanup_cancel = await _drain_cleanup(
+            _join_reconnect(tasks, cancel=cancellation is not None), run_id=node.run_id
+        )
+        if cancellation is not None:
+            raise cancellation
+        if cleanup_cancel is not None:
+            raise cleanup_cancel
+    _raise_reconnect_error(tasks)
+    return _reconnected_terminal(tasks)
+
+
+def _reconnected_terminal(tasks: Sequence[asyncio.Task[RunResult | Exception]]) -> bool:
+    results = [task.result() for task in tasks]
+    return all(
+        isinstance(result, RunResult) and result.status.value in _TERMINAL for result in results
+    )
+
+
+def _raise_reconnect_error(tasks: Sequence[asyncio.Task[RunResult | Exception]]) -> None:
+    # A child's own cancellation propagates after the join, even in an uncancelled caller.
+    for task in tasks:
+        if task.cancelled():
+            task.result()
+    for task in tasks:
+        result = task.result()
+        if isinstance(result, Exception):
+            raise result
+
+
+async def _reconnect_branch(
+    store: StateStore,
+    child: WaitNode | LeafNode,
+    parent: WaitNode,
+    fanout_tree: bool,
+    notifier: LoopNotifier | None,
+) -> RunResult | Exception:
+    try:
+        return await drive_node(
+            store, child, tenant_id=parent.tenant_id, fanout_tree=fanout_tree, notifier=notifier
+        )
+    except Exception as error:  # noqa: BLE001, RUF100 - owner isolation retains failures until every sibling joins.
+        _codes.log_code(
+            logger,
+            _codes.MANAGED_FANOUT_BRANCH_ERROR,
+            run_id=child.run_id,
+            error_type=type(error).__name__,
+        )
+        return error
+
+
+async def _join_reconnect(
+    tasks: list[asyncio.Task[RunResult | Exception]], *, cancel: bool
+) -> None:
+    if cancel:
+        for task in tasks:
+            if not task.done() and not task.cancelling():
+                task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)

@@ -327,33 +327,6 @@ async def recover(
     return await finish_fanout_adoption(agent, owned, run_id, claim, tenant_id=tenant_id)
 
 
-@pytest.fixture(autouse=True)
-def v4_continuation(monkeypatch: Any) -> None:
-    """Contract gap G2 (T6 owns ``_reclaim.py``): continue from a stale v4 wait as from v3.
-
-    After adoption the parent's raw pause still holds the v4 wait; the 0.7
-    ``_continuation_base`` reads only a v3 one strictly and refuses v4 as
-    ``pause_format_unsupported``. This stand-in is the same rule for v4: decode
-    strictly, keep only the continuation fields. Remove it when T6 lands the fix.
-    """
-    original = _reclaim._continuation_base
-
-    def base(raw: dict[str, Any], run_id: str) -> PauseState:
-        if raw.get("schema_version") != 4:
-            return original(raw, run_id)
-        wait = PauseState.from_managed_dict(raw, run_id=run_id)
-        return replace(
-            wait,
-            managed_fanout=None,
-            schema_version=2,
-            pause_reason=None,
-            pending_tool_calls=[],
-            pending_targets={},
-        )
-
-    monkeypatch.setattr(_reclaim, "_continuation_base", base)
-
-
 # ---------------------------------------------------------------------------
 # Reading durable effects
 # ---------------------------------------------------------------------------

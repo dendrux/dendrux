@@ -571,7 +571,7 @@ async def submit_routed(
     notifier: Any,
     **fields: Any,
 ) -> RunResult:
-    """Continue the leaf a fan-out workflow's token names, then unwind leaf-first.
+    """Reconnect a root without external pauses, or continue its token-selected leaf.
 
     ``found`` is the 0.7 route that stopped at the fan-out (its root already in scope).
     The whole tree is walked from the root again (entry rules first); the leaf is
@@ -579,6 +579,31 @@ async def submit_routed(
     checked against its own entry rules, claimed and run in the caller's task.
     """
     tree = await route_tree(root_agent, store, found.root_run_id, tenant_id=found.tenant_id)
+    return await _submit_or_reconnect(
+        root_agent, store, tree, operation, expected_pause_id, submit, notifier, fields
+    )
+
+
+async def _submit_or_reconnect(
+    root_agent: Agent,
+    store: Any,
+    tree: WorkflowTree,
+    operation: EntryPoint,
+    expected_pause_id: str | None,
+    submit: Callable[[Agent, str, Any], Awaitable[RunResult]],
+    notifier: Any,
+    fields: dict[str, Any],
+) -> RunResult:
+    # Legacy external pauses still block reconnect when their generation is missing.
+    if (
+        operation == "resume"
+        and expected_pause_id is None
+        and all(value is None for value in fields.values())
+        and not any(leaf.status in PAUSE_STATUSES for leaf in tree.leaves())
+    ):
+        return await root_agent.reclaim(
+            tree.root_run_id, tenant_id=tree.tenant_id, notifier=notifier
+        )
     leaf = _required_leaf(tree, expected_pause_id)
     parent = tree.ancestors(leaf.run_id)[0]
     _managed_definitions._require_supported_loop(parent.agent, leaf.agent, paused=True)

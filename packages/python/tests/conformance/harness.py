@@ -216,6 +216,13 @@ def _pending_excluded_fields(obj: Any) -> set[str]:
     return set()
 
 
+def _result_excluded_fields(obj: Any) -> set[str]:
+    excluded = ADDITIVE_060_RESULT_FIELDS.get(type(obj).__name__, set())
+    if type(obj).__name__ == "SweepResult" and obj.adoptable == []:
+        return excluded | {"adoptable"}
+    return excluded
+
+
 def raw(obj: Any) -> Any:
     """Plain-JSON snapshot keeping real values (ids, ISO timestamps); bytes as base64."""
     if obj is None or isinstance(obj, bool | int | str):
@@ -238,7 +245,7 @@ def raw(obj: Any) -> Any:
     if hasattr(obj, "__dataclass_fields__") and not isinstance(obj, type):
         excluded = (
             ADDITIVE_060_RECORD_FIELDS.get(type(obj).__name__, set())
-            | ADDITIVE_060_RESULT_FIELDS.get(type(obj).__name__, set())
+            | _result_excluded_fields(obj)
             | _pending_excluded_fields(obj)
         )
         return {

@@ -1110,31 +1110,7 @@ async def test_round2_preclaimed_owners_enter_the_canonical_runner(store, monkey
 
 
 @pytest.fixture
-def v4_continuation(monkeypatch):
-    """Read stale v4 waits as continuation state until recovery supports that format."""
-    from dendrux.runtime import _reclaim
-    from dendrux.types import PauseState
-
-    original = _reclaim._continuation_base
-
-    def base(raw, run_id):
-        if raw.get("schema_version") != 4:
-            return original(raw, run_id)
-        wait = PauseState.from_managed_dict(raw, run_id=run_id)
-        return replace(
-            wait,
-            managed_fanout=None,
-            schema_version=2,
-            pause_reason=None,
-            pending_tool_calls=[],
-            pending_targets={},
-        )
-
-    monkeypatch.setattr(_reclaim, "_continuation_base", base)
-
-
-@pytest.fixture
-def live_adoption(monkeypatch, v4_continuation):
+def live_adoption(monkeypatch):
     """Observe successful real adoptions without changing their claim or completions."""
     from dendrux.runtime import _managed_adoption
 
@@ -1844,9 +1820,7 @@ async def test_close_transfers_custody_before_cancel_or_cleanup(store, monkeypat
 
 
 @pytest.mark.parametrize("width", [1, 2])
-async def test_child_failure_uses_the_same_durable_error_at_each_width(
-    store, v4_continuation, width
-):
+async def test_child_failure_uses_the_same_durable_error_at_each_width(store, width):
     providers = [GatedStreamLLM(first="unused", second="") for _ in range(width)]
     for provider in providers:
         provider.complete_error = ValueError("child execution failed")
