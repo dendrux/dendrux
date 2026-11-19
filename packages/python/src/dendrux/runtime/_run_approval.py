@@ -42,7 +42,6 @@ from dendrux.loops._policy_context import (
 from dendrux.runtime import (
     _run_contracts,
     _run_entry,
-    _run_execute,
     _run_images,
     _run_resume_replay,
 )
@@ -764,7 +763,6 @@ async def _resume_approval_work(
 ) -> RunResult | None:
     from dendrux.loops._helpers import _BlockedObservationError
 
-    _run_execute._configure_fanout(ctx.recorder, store)
     try:
         approval, approving = await _resume_approval_batch(
             agent,

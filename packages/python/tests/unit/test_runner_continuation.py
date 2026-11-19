@@ -171,6 +171,7 @@ async def test_prepare_input_image_count(store, parts_present):
         expected_status="waiting_human_input",
         user_input="answer",
         user_parts=parts,
+        recovering=False,
     )
     events = await store.get_run_events(run_id)
     data = next(e.data for e in events if e.event_type == "run.resumed")
@@ -182,6 +183,44 @@ async def test_prepare_input_image_count(store, parts_present):
     assert ctx.history[-1] == (
         Message.with_parts(Role.USER, parts) if parts else Message(Role.USER, "answer")
     )
+
+
+async def _prepared(store, *, recovering, capable=True, **omit):
+    """A minimal paused run prepared for continuation; ``omit`` drops ``recovering``."""
+    provider = MockLLM([])
+    agent = Agent(name="frame", prompt="p", provider=provider, strict_tenancy=False)
+    run_id = "01J00000000000000000000001"
+    await store.create_run(run_id, agent_name=agent.name, input_data={})
+    store.capabilities = replace(store.capabilities, managed_fanout=capable)
+    kwargs = {} if omit.get("omit_recovering") else {"recovering": recovering}
+    ctx = await runner._prepare_resume(
+        run_id,
+        PauseState(agent.name, [], [], [], 0, 0, UsageStats()),
+        state_store=store,
+        agent=agent,
+        provider=provider,
+        expected_status="waiting_human_input",
+        user_input="answer",
+        **kwargs,
+    )
+    await agent.close()
+    return ctx
+
+
+async def test_prepare_resume_needs_an_explicit_recovering_flag(store):
+    """No hidden frame mode: every caller says whether it is recovering."""
+    with pytest.raises(TypeError):
+        await _prepared(store, recovering=None, omit_recovering=True)
+
+
+@pytest.mark.parametrize("recovering", [False, True])
+@pytest.mark.parametrize("capable", [False, True])
+async def test_prepare_resume_sets_every_frame_capability_from_its_store(
+    store, recovering, capable
+):
+    """Batch and stream continuations, recovering or not, fan out when the store can."""
+    ctx = await _prepared(store, recovering=recovering, capable=capable)
+    assert ctx.recorder._managed_fanout_capable is capable
 
 
 async def test_resume_loop_kwargs_match_stream(store, monkeypatch):
