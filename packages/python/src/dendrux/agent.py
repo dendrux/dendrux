@@ -2853,11 +2853,9 @@ class Agent:
     ) -> list[str]:
         """Runs a pause request flags, deepest first and ``record`` last."""
         if self._subagents:
-            # A managed root's request reaches its active branch, leaf first (0.7).
-            from dendrux.runtime._pending import managed_branch
-
-            hops, _, _ = await managed_branch(store, record.id, record.tenant_id)
-            return [hop.run_id for hop in reversed(hops)]
+            return await _managed_cancel.workflow_pause_order(
+                self, store, record, walk_tree=_managed_route.walk_tree
+            )
         if not cascade:
             return [record.id]
         subtree = await require_store_method(store, "get_subtree")(record.id, tenant_id=tenant_id)
