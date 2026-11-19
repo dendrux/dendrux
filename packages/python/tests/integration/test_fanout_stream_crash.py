@@ -58,7 +58,7 @@ def _phase(env, mode, cut):
         env=env,
         capture_output=True,
         text=True,
-        timeout=60,
+        timeout=180,
     )
 
 

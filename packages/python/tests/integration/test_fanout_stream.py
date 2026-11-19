@@ -13,6 +13,7 @@ Runs on SQLite and Postgres (``DENDRUX_TEST_PG_URL``, a private ``*_test`` datab
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from contextvars import ContextVar
 from typing import Any
 
@@ -39,6 +40,12 @@ pytestmark = pytest.mark.parametrize("engine", ["sqlite_file", "postgres"], indi
 
 TENANT = "t1"
 DEADLOCK_S = 5
+"""Only for proofs that a schedule deadlocks: those tests assert this bound expires."""
+PROGRESS_S = 120
+"""Green-path bound. It only stops a stuck test; nothing asserts on wall-clock speed
+(a loaded CI runner writes a few hundred tool rows far slower than a laptop)."""
+STALL_S = 20
+"""A queue that gains no event for this long while being filled is stuck, not slow."""
 CHILD_EVENTS = frozenset({"tool_use_start", "tool_use_end", "tool_result"})
 
 
@@ -91,7 +98,7 @@ def batch(children: list[Agent]) -> LLMResponse:
     return LLMResponse(tool_calls=[ToolCall(c.name, {"task": "go"}) for c in children])
 
 
-async def collect(stream: Any, *, timeout: float = DEADLOCK_S) -> list[Any]:
+async def collect(stream: Any, *, timeout: float = PROGRESS_S) -> list[Any]:
     """Iterate in this task (``wait_for`` runs its coroutine in another task on 3.11)."""
     async with asyncio.timeout(timeout), stream:
         return [event async for event in stream]
@@ -302,8 +309,8 @@ async def test_q1_zero_event_children_end_the_loop_and_fan_in(
     )
     try:
         if schedule == "revision2":
-            with pytest.raises(TimeoutError):
-                await collect(root.stream("go", tenant_id=TENANT))
+            with pytest.raises(TimeoutError):  # the revision-2 schedule never finishes
+                await collect(root.stream("go", tenant_id=TENANT), timeout=DEADLOCK_S)
             assert not owner_tasks_left()
             return
         events = await collect(root.stream("go", tenant_id=TENANT))
@@ -322,18 +329,32 @@ class _FullGate(asyncio.Event):
     """Set once a producer finds the stream queue full; ``blocked`` names its run."""
 
     blocked: set[str | None]
+    puts: int
+
+    async def filled(self) -> None:
+        """Wait until the queue is full, failing only when puts stop arriving."""
+        seen, quiet = -1, 0.0
+        while not self.is_set():
+            seen, quiet = self.puts, (0.0 if self.puts != seen else quiet + 0.5)
+            if quiet >= STALL_S:
+                raise AssertionError(f"the queue stopped filling at {self.puts} puts")
+            with contextlib.suppress(TimeoutError):
+                async with asyncio.timeout(0.5):
+                    await self.wait()
 
 
 def _full_gate(monkeypatch: Any) -> _FullGate:
     """Set once a producer finds the stream queue full (it is about to block)."""
     full = _FullGate()
-    full.blocked = set()
+    full.blocked, full.puts = set(), 0
     original = asyncio.Queue.put
 
     async def put(queue: Any, event: Any) -> None:
-        if queue.maxsize == _managed_stream.QUEUE_EVENTS and queue.full():
-            full.blocked.add(event.run_id)
-            full.set()
+        if queue.maxsize == _managed_stream.QUEUE_EVENTS:
+            full.puts += 1
+            if queue.full():
+                full.blocked.add(event.run_id)
+                full.set()
         await original(queue, event)
 
     monkeypatch.setattr(asyncio.Queue, "put", put)
@@ -371,18 +392,17 @@ async def test_q2_more_than_the_queue_bound_before_the_next_step(
                 events.append(event)
                 if len(child_events(events, events[0].run_id)) == 1:
                     # Hold the consumer until producers block on the bound.
-                    async with asyncio.timeout(DEADLOCK_S):
-                        await full.wait()
+                    await full.filled()
         return events
 
     try:
         if schedule == "join_first":
-            with pytest.raises(TimeoutError):
+            with pytest.raises(TimeoutError):  # join-first never finishes
                 async with asyncio.timeout(DEADLOCK_S):
                     await consume()
             assert not owner_tasks_left()
             return
-        async with asyncio.timeout(4 * DEADLOCK_S):
+        async with asyncio.timeout(PROGRESS_S):
             events = await consume()
         assert full.is_set()
         final = events[-1].run_result
@@ -482,7 +502,7 @@ async def test_q5_slow_consumer_receives_every_event(store, live_adoption):
                     events.append(event)
                     await asyncio.sleep(0.005)
 
-        async with asyncio.timeout(4 * DEADLOCK_S):
+        async with asyncio.timeout(PROGRESS_S):
             await consume()
         final = events[-1].run_result
         assert final.status == RunStatus.SUCCESS
@@ -539,14 +559,14 @@ async def test_q5_q6_close_runs_the_exit_path_without_awaiting_the_queue(
                 events.append(event)
                 if child_events(events, events[0].run_id):
                     break  # stop advancing once a child's progress arrived
-            async with asyncio.timeout(DEADLOCK_S):
+            async with asyncio.timeout(PROGRESS_S):
                 if how == "queue_full":
-                    await full.wait()
+                    await full.filled()
                 else:
                     for provider in providers:
                         await provider.first_sent.wait()
             assert not runs[0].owners_done()
-            async with asyncio.timeout(DEADLOCK_S):
+            async with asyncio.timeout(PROGRESS_S):
                 await stream.aclose()
         root_id = events[0].run_id
         assert stream.result is not None and stream.result.status == RunStatus.CANCELLED
@@ -673,7 +693,7 @@ async def test_a6_early_close_matches_the_single_child_outcome(store, live_adopt
             # Owner tasks keep running while the consumer holds; a single child streams
             # only when the consumer advances, as in 0.7.
             for provider in providers if n > 1 else ():
-                await wait_for_gate(provider.first_sent, timeout=DEADLOCK_S)
+                await wait_for_gate(provider.first_sent, timeout=PROGRESS_S)
         root_id = events[0].run_id
         assert stream.result.status == RunStatus.CANCELLED
         statuses = await _rows(store, root_id)
@@ -707,7 +727,7 @@ async def test_caller_cancel_propagates_and_matches_the_single_child_outcome(
     caller = asyncio.create_task(consume())
     try:
         for provider in providers:
-            await wait_for_gate(provider.first_sent, task=caller, timeout=DEADLOCK_S)
+            await wait_for_gate(provider.first_sent, task=caller, timeout=PROGRESS_S)
         caller.cancel("first")
         with pytest.raises(asyncio.CancelledError) as caught:
             await caller
@@ -889,7 +909,7 @@ async def test_a_cancel_during_the_close_cleanup_still_cancels_the_workflow(
 
     caller = asyncio.create_task(consume())
     try:
-        async with asyncio.timeout(DEADLOCK_S):
+        async with asyncio.timeout(PROGRESS_S):
             while not gates:
                 await asyncio.sleep(0)
             entered, release = gates[0]
@@ -898,7 +918,7 @@ async def test_a_cancel_during_the_close_cleanup_still_cancels_the_workflow(
         await asyncio.sleep(0)
         release.set()
         with pytest.raises(asyncio.CancelledError) as caught:
-            async with asyncio.timeout(DEADLOCK_S):
+            async with asyncio.timeout(PROGRESS_S):
                 await caller
         assert caught.value.args == ("first",)
         statuses = await _rows(store, seen[0].run_id)
@@ -928,20 +948,20 @@ async def test_a_second_cancellation_in_the_cleanup_keeps_the_first(
 
     caller = asyncio.create_task(consume())
     try:
-        async with asyncio.timeout(DEADLOCK_S):
+        async with asyncio.timeout(PROGRESS_S):
             for provider in providers:
                 await provider.first_sent.wait()
             while not runs:
                 await asyncio.sleep(0)
         entered, release = gated_finalize(runs[0], monkeypatch)
         caller.cancel("first")  # the consumer waits on wake
-        async with asyncio.timeout(DEADLOCK_S):
+        async with asyncio.timeout(PROGRESS_S):
             await entered.wait()
         caller.cancel("second")  # lands in the retained cleanup
         await asyncio.sleep(0)
         release.set()
         with pytest.raises(asyncio.CancelledError) as caught:
-            async with asyncio.timeout(DEADLOCK_S):
+            async with asyncio.timeout(PROGRESS_S):
                 await caller
         assert caught.value.args == ("first",)
         assert not owner_tasks_left()
@@ -987,10 +1007,10 @@ async def test_closing_a_full_queue_leaves_the_queue_alone(store, live_adoption,
             async for _ in iterator:
                 if any(op == "get" for op, _ in calls):
                     break
-            async with asyncio.timeout(DEADLOCK_S):
-                await full.wait()
+            async with asyncio.timeout(PROGRESS_S):
+                await full.filled()
             before = len(calls)
-            async with asyncio.timeout(DEADLOCK_S):
+            async with asyncio.timeout(PROGRESS_S):
                 await stream.aclose()
         # The exit path neither drains nor fills the queue; owners were cancelled.
         assert [op for op, _ in calls[before:]] == []
@@ -1054,12 +1074,12 @@ async def test_parallel_tools_put_from_the_owner_subtree_with_backpressure(
     caller = asyncio.current_task()
     try:
         events: list[Any] = []
-        async with asyncio.timeout(6 * DEADLOCK_S):
+        async with asyncio.timeout(PROGRESS_S):
             async with root.stream("go", tenant_id=TENANT, notifier=observer) as stream:
                 async for event in stream:
                     events.append(event)
                     if len(child_events(events, events[0].run_id)) == 1:
-                        await full.wait()  # producers hit the bound before the next step
+                        await full.filled()  # producers hit the bound before the next step
                     await asyncio.sleep(0.001)  # a slow consumer
         final = events[-1].run_result
         assert (final.status, final.answer) == (RunStatus.SUCCESS, "done")
@@ -1101,7 +1121,7 @@ async def test_a_fast_parallel_result_arrives_while_its_sibling_is_blocked(store
     root = lead(store, ScriptedLLM([batch(children), LLMResponse(text="done")]), children)
     try:
         events: list[Any] = []
-        async with asyncio.timeout(DEADLOCK_S):
+        async with asyncio.timeout(PROGRESS_S):
             async with root.stream("go", tenant_id=TENANT) as stream:
                 async for event in stream:
                     events.append(event)
@@ -1130,11 +1150,11 @@ async def test_close_with_parallel_tools_blocked_on_the_full_queue(
             async for event in iterator:
                 if child_events([event], ""):
                     break
-            async with asyncio.timeout(DEADLOCK_S):
-                await full.wait()
+            async with asyncio.timeout(PROGRESS_S):
+                await full.filled()
             blocked_helpers = [task for tag, task in puts if task is not tag and not task.done()]
             assert blocked_helpers  # parallel-tool tasks are waiting in put
-            async with asyncio.timeout(DEADLOCK_S):
+            async with asyncio.timeout(PROGRESS_S):
                 await stream.aclose()
         assert all(task.done() for task in blocked_helpers)
         assert set(asyncio.all_tasks()) - before - {asyncio.current_task()} == set()
@@ -1177,13 +1197,13 @@ async def test_a_cancel_while_the_root_is_being_cancelled_still_finishes_it(
 
     caller = asyncio.create_task(consume())
     try:
-        async with asyncio.timeout(DEADLOCK_S):
+        async with asyncio.timeout(PROGRESS_S):
             await entered.wait()
         caller.cancel("first")
         await asyncio.sleep(0)
         release.set()
         with pytest.raises(asyncio.CancelledError) as caught:
-            async with asyncio.timeout(DEADLOCK_S):
+            async with asyncio.timeout(PROGRESS_S):
                 await caller
         assert caught.value.args == ("first",)
         statuses = await _rows(store, seen[0].run_id)
