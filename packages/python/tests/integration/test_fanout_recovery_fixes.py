@@ -602,7 +602,9 @@ async def test_public_continuation_frame_is_configured_before_preparation_return
         else:
             result = await root.resume(paused.run_id, **kwargs)
         assert result.status == RunStatus.SUCCESS
-        assert observed == [not streaming]
+        # Batch and stream frames alike are configured from the store before preparation
+        # returns (no hidden stream mode that leaves fan-out off).
+        assert observed == [True]
     finally:
         await root.close()
 
