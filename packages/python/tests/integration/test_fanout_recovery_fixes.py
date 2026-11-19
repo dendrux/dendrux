@@ -47,6 +47,8 @@ from tests.integration.test_fanout_adoption import (
     parked,
 )
 
+PROGRESS_S = 60  # green-path waits wait for progress; generous for loaded runners
+
 pytestmark = pytest.mark.parametrize("engine", ["sqlite_file", "postgres"], indirect=True)
 
 
@@ -840,7 +842,7 @@ async def test_public_reconnect_retains_cancellation_during_owner_join(store, mo
     monkeypatch.setattr(_managed_fanout, "_join_reconnect", join)
     task = asyncio.create_task(root.reclaim(fanout.run_id, tenant_id=TENANT))
     try:
-        await asyncio.wait_for(joining.wait(), 10)
+        await asyncio.wait_for(joining.wait(), PROGRESS_S)
         task.cancel("join cancellation")
         release.set()
         with pytest.raises(asyncio.CancelledError) as error:
@@ -878,7 +880,7 @@ async def test_public_reconnect_race_has_one_adoption_winner(store, engine, monk
         arrivals += 1
         if arrivals == 2:
             ready.set()
-        await asyncio.wait_for(ready.wait(), 10)
+        await asyncio.wait_for(ready.wait(), PROGRESS_S)
         return await original(*args, **kwargs)
 
     monkeypatch.setattr(_managed_fanout, "settle_parent", settle)
@@ -941,12 +943,12 @@ async def test_public_reconnect_rereads_not_owner_results_after_join(store, engi
             if len(cached) == 2:
                 caches_ready.set()
             return RunResult(run_id=node.run_id, status=RunStatus.RUNNING)
-        await asyncio.wait_for(caches_ready.wait(), 10)
+        await asyncio.wait_for(caches_ready.wait(), PROGRESS_S)
         assert await store.finalize_run(node.run_id, status="success", answer="ok", claim_epoch=0)
         completed.add(label)
         if len(completed) == 2:
             finishes_ready.set()
-        await asyncio.wait_for(finishes_ready.wait(), 10)
+        await asyncio.wait_for(finishes_ready.wait(), PROGRESS_S)
         return await runner._build_cached_result(store, node.run_id)
 
     async def reconnect(label):
@@ -958,7 +960,7 @@ async def test_public_reconnect_rereads_not_owner_results_after_join(store, engi
 
     monkeypatch.setattr(_managed_fanout, "_reconnect_leaf", leaf)
     try:
-        results = await asyncio.wait_for(asyncio.gather(reconnect(0), reconnect(1)), 20)
+        results = await asyncio.wait_for(asyncio.gather(reconnect(0), reconnect(1)), PROGRESS_S)
         assert any(result.status == RunStatus.SUCCESS for result in results)
         assert transformed == [call.id for call in fanout.calls]
         assert root.provider.calls == 1

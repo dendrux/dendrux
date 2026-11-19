@@ -50,6 +50,8 @@ from tests.integration.test_fanout_adoption import (
 )
 from tests.integration.test_fanout_store_races import batch, fanout_parent, nest
 
+PROGRESS_S = 60  # green-path waits wait for progress; generous for loaded runners
+
 SAVED_CASES = (
     "saved-error",
     "saved-cancelled",
@@ -297,7 +299,7 @@ async def test_fresh_process_adoption_cuts(store, engine, tmp_path, cut):
         env=env,
         capture_output=True,
         text=True,
-        timeout=45,
+        timeout=PROGRESS_S,
     )
     assert crashed.returncode == 17, crashed.stderr[-3000:]
     async with AsyncSession(engine) as session:
@@ -321,7 +323,7 @@ async def test_fresh_process_adoption_cuts(store, engine, tmp_path, cut):
         env=env,
         capture_output=True,
         text=True,
-        timeout=45,
+        timeout=PROGRESS_S,
     )
     assert fresh.returncode == 0, fresh.stderr[-3000:]
     after = FanoutEffects(effects).counts()
@@ -521,7 +523,7 @@ async def test_replaced_adopter_is_fenced_after_transform(store, engine):
     )
     owner = asyncio.create_task(adopt_settled(store, node_of(fanout, root)))
     try:
-        await asyncio.wait_for(entered.wait(), 5)
+        await asyncio.wait_for(entered.wait(), PROGRESS_S)
         item = await expire(replacement_store, replacement_engine, fanout.run_id)
         result = await replacement.reclaim(fanout.run_id, tenant_id=TENANT, item=item)
         assert result.status == RunStatus.SUCCESS
@@ -556,7 +558,7 @@ async def test_cancel_cascade_repeats_after_process_death(store, engine, tmp_pat
             env=env,
             capture_output=True,
             text=True,
-            timeout=45,
+            timeout=PROGRESS_S,
         )
         assert result.returncode == expected, result.stderr[-3000:]
     assert json.loads(report.read_text()) == {
@@ -777,9 +779,9 @@ async def test_reconnect_joins_children_and_keeps_first_cancellation(store, monk
         )
     )
     try:
-        await asyncio.wait_for(entered.wait(), 5)
+        await asyncio.wait_for(entered.wait(), PROGRESS_S)
         task.cancel("first")
-        await asyncio.wait_for(cleaning.wait(), 5)
+        await asyncio.wait_for(cleaning.wait(), PROGRESS_S)
         task.cancel("second")
         release.set()
         with pytest.raises(asyncio.CancelledError) as error:

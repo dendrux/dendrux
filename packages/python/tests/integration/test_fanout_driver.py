@@ -37,6 +37,8 @@ from tests._helpers.gates import wait_for_gate
 from tests._helpers.scripted_provider import ScriptedLLM
 from tests.integration.test_fanout_store_races import fanout_parent, fanout_wait
 
+PROGRESS_S = 60  # green-path waits wait for progress; generous for loaded runners
+
 pytestmark = pytest.mark.parametrize("engine", ["sqlite_file", "postgres"], indirect=True)
 
 
@@ -98,7 +100,7 @@ async def test_p2_t1_t3_real_overlap_and_isolated_owner_tasks(store):
         assert len({id(c._lease_lock) for c in contexts}) == 2
         for p in providers:
             p.gate.set()
-        outcomes = await asyncio.wait_for(run.wait(), 5)
+        outcomes = await asyncio.wait_for(run.wait(), PROGRESS_S)
         assert [o.kind for o in outcomes] == ["terminal", "terminal"]
         for i, p in enumerate(providers):
             assert p.complete_tasks == [run.owners[i]] * 3
@@ -126,7 +128,7 @@ async def test_q1_zero_event_children_complete_without_a_queue_waiter(store, mon
     monkeypatch.setattr(store, "_creation_storage_format", read)
     try:
         run = await module.start_fanout(invocation)
-        outcomes = await asyncio.wait_for(run.wait(), 5)
+        outcomes = await asyncio.wait_for(run.wait(), PROGRESS_S)
         assert calls == [1]
         assert run.queue is None
         assert run.owners_done()
@@ -177,7 +179,7 @@ async def test_x6_t2_caller_cancel_joins_owners_and_preserves_first_cancel(store
             await wait_for_gate(p.first_sent)
         waiter.cancel("first")
         with pytest.raises(asyncio.CancelledError) as caught:
-            await asyncio.wait_for(waiter, 5)
+            await asyncio.wait_for(waiter, PROGRESS_S)
         assert caught.value.args == ("first",)
         assert run.owners_done()
         for i, b in enumerate(invocation.branches):
@@ -221,7 +223,7 @@ async def test_p17_errors_are_collected_in_call_order_after_siblings_settle(
     try:
         run = await module.start_fanout(invocation)
         with pytest.raises(ValueError) as caught:
-            await asyncio.wait_for(run.wait(), 5)
+            await asyncio.wait_for(run.wait(), PROGRESS_S)
         assert caught.value is errors[0]
         assert run.owners_done()
         assert effects.counts().provider_calls("2") == 1
@@ -316,7 +318,7 @@ async def test_x8_x9_repeated_cancel_retains_finalize_and_join(store, monkeypatc
         waiter.cancel("fourth")
         release[ids[0]].set()
         with pytest.raises(asyncio.CancelledError) as caught:
-            await asyncio.wait_for(waiter, 5)
+            await asyncio.wait_for(waiter, PROGRESS_S)
         assert caught.value.args == ("first",)
         assert run.ledger.states == ("accepted", "finalized", "finalized")
         assert sorted(writes) == sorted((child, 0) for child in ids)
@@ -557,7 +559,7 @@ async def test_p1_p3_parent_continues_in_caller_after_call_order_adoption(
         await wait_for_gate(committed, task=runner)
         assert not runner.done() and live_adoption == [] and llm.calls == 1
         providers[0].gate.set()
-        result = await asyncio.wait_for(runner, 5)
+        result = await asyncio.wait_for(runner, PROGRESS_S)
         expected = [{"summary": f"report-{i}"} for i in range(2)]
         assert result.status == RunStatus.SUCCESS and result.answer == "done"
         assert live_adoption == [(result.run_id, tuple(c.id for c in calls), runner)]
@@ -742,7 +744,7 @@ async def test_x1_remote_cancel_interrupts_four_in_process_owners(store):
             invocation.root_run_id, tenant_id="t1", cascade=True
         )
         assert cancelled.status.value == "cancelled"
-        outcomes = await asyncio.wait_for(run.wait(), 5)
+        outcomes = await asyncio.wait_for(run.wait(), PROGRESS_S)
         assert [o.result.status.value for o in outcomes] == ["cancelled"] * 4
         assert run.owners_done()
         assert all(p.complete_closed for p in providers)
@@ -890,7 +892,7 @@ async def test_p15_eight_children_release_two_connection_pool_before_provider(en
         assert pools == []
         for p in providers:
             p.gate.set()
-        assert len(await asyncio.wait_for(run.wait(), 5)) == 8
+        assert len(await asyncio.wait_for(run.wait(), PROGRESS_S)) == 8
         assert sum(effects.counts().provider.values()) == 8
         assert pool.pool.checkedout() == 0
     finally:

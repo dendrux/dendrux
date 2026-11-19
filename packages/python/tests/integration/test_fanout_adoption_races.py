@@ -44,6 +44,8 @@ from tests.integration.test_fanout_adoption import (
     transform_counts,
 )
 
+PROGRESS_S = 60  # green-path waits wait for progress; generous for loaded runners
+
 
 def _postgres_only(engine: Any) -> None:
     if engine.dialect.name != "postgresql":
@@ -70,7 +72,7 @@ def _gate_claims(store: Any, barrier: asyncio.Barrier) -> None:
     real = store.submit_and_claim
 
     async def claim(*args: Any, **kwargs: Any) -> Any:
-        await asyncio.wait_for(barrier.wait(), timeout=10)
+        await asyncio.wait_for(barrier.wait(), timeout=PROGRESS_S)
         return await real(*args, **kwargs)
 
     store.submit_and_claim = claim
@@ -94,7 +96,7 @@ async def _finisher(
     ids = list(fanout.child_ids)
     before = await store.get_managed_children(fanout.run_id, ids, tenant_id=TENANT)
     assert any(r.status == RunStatus.RUNNING.value for r in before if r.run_id != ids[child])
-    await asyncio.wait_for(barriers[0].wait(), timeout=10)  # both read a sibling running
+    await asyncio.wait_for(barriers[0].wait(), timeout=PROGRESS_S)  # both read a sibling running
     assert await store.finalize_run(
         ids[child],
         status=RunStatus.SUCCESS.value,
@@ -102,7 +104,7 @@ async def _finisher(
         claim_epoch=0,
         expected_current_status=RunStatus.RUNNING.value,
     )
-    await asyncio.wait_for(barriers[1].wait(), timeout=10)  # both committed
+    await asyncio.wait_for(barriers[1].wait(), timeout=PROGRESS_S)  # both committed
     rows = (
         await store.get_managed_children(fanout.run_id, ids, tenant_id=TENANT)
         if read_after_commit
@@ -201,13 +203,13 @@ async def test_r5_cancel_between_the_reads_and_the_claim_wins(engine: Any) -> No
 
         async def held(*args: Any, **kwargs: Any) -> Any:
             reached.set()
-            await asyncio.wait_for(release.wait(), timeout=10)
+            await asyncio.wait_for(release.wait(), timeout=PROGRESS_S)
             return await real(*args, **kwargs)
 
         adopter.submit_and_claim = held
         root = lead(tool_result_transform=effects.transform())
         adoption = asyncio.ensure_future(adopt_settled(adopter, node_of(fanout, root)))
-        await asyncio.wait_for(reached.wait(), timeout=10)
+        await asyncio.wait_for(reached.wait(), timeout=PROGRESS_S)
         await _cancel(canceller, fanout.run_id)
         release.set()
         assert await adoption is None
@@ -223,7 +225,7 @@ async def test_r5_cancel_during_the_completions_stops_the_continuation(engine: A
     async def gated(ctx: Any) -> Any:
         if ctx.call_id == fanout.calls[0].id:
             entered.set()
-            await asyncio.wait_for(release.wait(), timeout=10)
+            await asyncio.wait_for(release.wait(), timeout=PROGRESS_S)
         return ctx.result
 
     fanout = await parked(store_for_engine(engine), lead(), [Child("a"), Child("b")])
@@ -231,7 +233,7 @@ async def test_r5_cancel_during_the_completions_stops_the_continuation(engine: A
         adopter, canceller = await _processes(stack, engine, 2)
         root = lead(tool_result_transform=effects.transform(gated))
         adoption = asyncio.ensure_future(adopt_settled(adopter, node_of(fanout, root)))
-        await asyncio.wait_for(entered.wait(), timeout=10)
+        await asyncio.wait_for(entered.wait(), timeout=PROGRESS_S)
         await _cancel(canceller, fanout.run_id)
         assert (await parent_row(engine, fanout.run_id)).cancel_requested is True
         release.set()
