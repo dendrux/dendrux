@@ -76,6 +76,9 @@ async def test_unscoped_is_refused_with_a_logged_code(caplog: Any) -> None:
     with pytest.raises(TenantScopeRequiredError) as info:
         await cancel_run(run_id, tenant_id=UNSCOPED, state_store=NoIO())  # type: ignore[arg-type]
     assert info.value.operation == "cancel_run"
+    assert str(info.value) == (
+        "cancel_run() requires tenant_id=<str or None>; UNSCOPED is not accepted."
+    )
     record = next(r for r in caplog.records if getattr(r, "code", None) == "tenant_scope_required")
     assert (record.run_id, record.entry) == (run_id, "cancel_run")
 
@@ -252,3 +255,20 @@ async def test_database_url_store_is_created_and_disposed(
         assert result.status == RunStatus.CANCELLED
     assert len(created) == 1
     assert disposed == created
+
+
+async def test_same_bound_retry_does_not_continue(store: Any) -> None:
+    """There is no cursor: only a larger ``max_nodes`` reaches the rest of the tree."""
+    root, kids = await seed(store, children=3)
+    first = await cancel_run(root, tenant_id=TENANT, state_store=store, max_nodes=2)
+    second = await cancel_run(root, tenant_id=TENANT, state_store=store, max_nodes=2)
+    assert first.meta["cascade_truncated"] and second.meta["cascade_truncated"]
+    visited = [[item["run_id"] for item in r.meta["cascade"]] for r in (first, second)]
+    assert visited[0] == visited[1] == [kids[0], root]
+    for kid in kids[1:]:
+        row = await store.get_run(kid)
+        assert (row.status, row.cancel_requested) == ("paused", False)
+    wider = await cancel_run(root, tenant_id=TENANT, state_store=store, max_nodes=4)
+    assert wider.meta["cascade_truncated"] is False
+    for kid in kids:
+        assert (await store.get_run(kid)).status == "cancelled"

@@ -244,6 +244,27 @@ class TestNewNonProviderErrors:
         assert clone.operation == "submit_input"  # type: ignore[attr-defined]
         assert str(clone) == str(exc)
 
+    def test_tenant_scope_required_default_message_is_unchanged(self) -> None:
+        assert str(TenantScopeRequiredError("run")) == (
+            "run() requires an explicit tenant_id= because the agent has strict_tenancy=True. "
+            "For delegated runs, pass tenant_id on the outer run."
+        )
+        assert TenantScopeRequiredError("run").message is None  # type: ignore[attr-defined]
+
+    def test_tenant_scope_required_custom_message_round_trips(self) -> None:
+        exc = TenantScopeRequiredError("cancel_run", message="custom text")  # type: ignore[call-arg]
+        assert (exc.operation, str(exc), isinstance(exc, ValueError)) == (
+            "cancel_run",
+            "custom text",
+            True,
+        )
+        clone = _roundtrip(exc)
+        assert (clone.operation, clone.message, str(clone)) == (  # type: ignore[attr-defined]
+            "cancel_run",
+            "custom text",
+            "custom text",
+        )
+
     def test_governance_mismatch_error(self) -> None:
         exc = GovernanceMismatchError(
             "r1", expected_digest="aa", actual_digest="bb", changed=["guardrails", "deny"]

@@ -9,6 +9,7 @@ from dendrux import _codes
 from dendrux.errors import TenantScopeRequiredError
 from dendrux.runtime import _cancel, sweep
 from dendrux.runtime._entry_checks import require_boolean
+from dendrux.runtime._run_events import _shielded_cleanup
 from dendrux.runtime._tenant_checks import _check_tenant_value
 from dendrux.runtime.state import _Unscoped, unclaimed_store
 from dendrux.types import ULID_CHARS, Budget, _validate_identifier
@@ -18,6 +19,7 @@ if TYPE_CHECKING:
     from dendrux.types import RunResult
 
 logger = logging.getLogger(__name__)
+_UNSCOPED_REFUSED = "cancel_run() requires tenant_id=<str or None>; UNSCOPED is not accepted."
 
 
 async def cancel_run(
@@ -48,7 +50,8 @@ async def cancel_run(
             always included.
         max_nodes: Root-inclusive traversal bound. Default
             ``Budget.max_subtree_nodes`` (10,000). Reaching it sets
-            ``meta["cascade_truncated"]``; call again to continue.
+            ``meta["cascade_truncated"]``. There is no cursor: a repeat call with the
+            same bound visits the same runs, so raise ``max_nodes`` to cover the rest.
 
     Returns:
         The same :class:`RunResult` shape as ``Agent.cancel_run``.
@@ -78,7 +81,8 @@ async def cancel_run(
             store, run_id, tenant_id=tenant_id, cascade=cascade, max_nodes=bound
         )
     finally:
-        await engine.dispose()
+        # Finish disposal even if the caller cancels meanwhile, then re-raise that cancel.
+        await _shielded_cleanup(engine.dispose)
 
 
 def _resolve_bound(max_nodes: object) -> int:
@@ -93,5 +97,5 @@ def _require_tenant(run_id: str, tenant_id: object) -> None:
     """Refuse the administrative ``UNSCOPED`` scope, then validate the tenant value."""
     if isinstance(tenant_id, _Unscoped):
         _codes.log_code(logger, _codes.TENANT_SCOPE_REQUIRED, run_id=run_id, entry="cancel_run")
-        raise TenantScopeRequiredError("cancel_run")
+        raise TenantScopeRequiredError("cancel_run", message=_UNSCOPED_REFUSED)
     _check_tenant_value("cancel_run", tenant_id, new_run=True)
