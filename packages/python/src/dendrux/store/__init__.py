@@ -427,17 +427,11 @@ class _InitOnFirstUse:
     """
 
     def __init__(self, inner: Any, init: Any, dispose: Any) -> None:
-        self._inner = inner
+        self._capability_store = inner
         self._init = init
         self._dispose = dispose
         self._done = False
         self.closed = False
-
-    @property
-    def capabilities(self) -> StoreCapabilities:
-        from dendrux.runtime._capabilities import capabilities
-
-        return capabilities(self._inner)
 
     async def _ensure(self) -> None:
         from sqlalchemy.exc import InvalidRequestError
@@ -453,7 +447,7 @@ class _InitOnFirstUse:
         self._done = True
 
     def __getattr__(self, name: str) -> Any:
-        attr = getattr(self._inner, name)
+        attr = getattr(self._capability_store, name)
         if not inspect.iscoroutinefunction(attr):
             return attr
 
