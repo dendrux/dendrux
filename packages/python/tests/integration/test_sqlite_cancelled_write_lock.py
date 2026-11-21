@@ -208,10 +208,6 @@ async def test_busy_worker_does_not_extend_double_cancelled_store_write(
             gc.collect()
 
 
-@pytest.mark.skipif(
-    not hasattr(aiosqlite.Connection, "stop"),
-    reason="before aiosqlite 0.22.1 SQLAlchemy drops a collected connection without closing it",
-)
 @pytest.mark.parametrize("engine", ["sqlite_file"], indirect=True)
 async def test_garbage_collected_connection_finalizes_a_retained_cursor(engine, store) -> None:
     await store.create_run("parent", "agent")

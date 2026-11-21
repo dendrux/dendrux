@@ -158,18 +158,9 @@ class _SQLiteStatements:
     def enqueue(self) -> None:
         """Queue :meth:`finalize` ahead of the close; never waits for the worker."""
         driver = self.driver()
-        if driver is None:
-            return
-        future = None
-        if not callable(getattr(driver, "stop", None)):
-            # Before aiosqlite 0.22.1 every queue item needs a Future on a running loop.
-            try:
-                future = asyncio.get_running_loop().create_future()
-            except RuntimeError:
-                logger.debug("sqlite_finalize_skipped_no_loop")
-                return
-            future.add_done_callback(_retrieve)
-        driver._tx.put_nowait((future, self.finalize))
+        if driver is not None:
+            # aiosqlite's worker runs an item without a Future and reports nothing back.
+            driver._tx.put_nowait((None, self.finalize))
 
 
 def _track_sqlite_statements(dbapi_connection: Any, *_args: object) -> None:
