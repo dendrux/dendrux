@@ -86,8 +86,15 @@ _CACHE: dict[int, tuple[weakref.ReferenceType[Any], StoreCapabilities]] = {}
 logger = logging.getLogger(__name__)
 
 
+def _capability_target(store: Any) -> Any:
+    # RunStore's init wrapper exposes its store for inspection only. Calls must
+    # still go through the wrapper so initialization and closed checks run.
+    return inspect.getattr_static(store, "_capability_store", store)
+
+
 def validate_capabilities(store: Any) -> StoreCapabilities:
     """Validate each declared capability once per live store object."""
+    store = _capability_target(store)
     key = id(store)
     cached = _CACHE.get(key)
     if cached is not None and cached[0]() is store:
@@ -191,6 +198,7 @@ def _refuse(store: Any, capability: str, method: str, missing: tuple[str, ...]) 
 
 def capabilities(store: Any) -> StoreCapabilities:
     """Read a declaration; absent means legacy regardless of method signatures."""
+    store = _capability_target(store)
     declared = inspect.getattr_static(store, "capabilities", None)
     if isinstance(declared, property):
         declared = declared.__get__(store, type(store))
