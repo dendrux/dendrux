@@ -360,6 +360,7 @@ class SQLStateStore(
         recovery=True,
         managed_subagents=True,
         managed_fanout=True,
+        waiting_filter=True,
     )
 
     def _insert(self, table: Any) -> Any:

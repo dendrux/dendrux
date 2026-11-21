@@ -71,6 +71,7 @@ from dendrux.runtime._bounds import (
     MAX_PAGE,
     SUBTREE_MAX_NODES_DEFAULT,
 )
+from dendrux.runtime._capabilities import waiting_filter_options
 from dendrux.runtime._pending import _KIND_BY_STATUS as _KIND_BY_STATUS
 from dendrux.runtime._pending import PendingKind as PendingKind
 from dendrux.runtime._pending import PendingPause as PendingPause
@@ -187,11 +188,9 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True, slots=True)
 class RunSummary:
-    """A run row suitable for list views.
+    """A list row; ``waiting_for`` labels a managed subagent pause.
 
-    ``replay`` is set on runs created with ``agent.run(runs=...)``: which
-    earlier runs were replayed (``runs_full`` + ``runs_text``, in order),
-    and what reasoning was kept or dropped.
+    ``replay`` lists replayed ``runs_full`` + ``runs_text`` and reasoning kept or dropped.
     """
 
     run_id: str
@@ -211,6 +210,7 @@ class RunSummary:
     total_reasoning_tokens: int = 0
     replay: ReplaySummary | None = None
     tenant_id: str | None = None
+    waiting_for: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -264,10 +264,7 @@ class RunSubtree:
 
 @dataclass(frozen=True, slots=True)
 class RunDetail:
-    """A single run's full detail — summary fields plus answer and error.
-
-    ``error_info`` is set when a provider failure ended the run.
-    """
+    """Full run detail, with provider ``error_info`` and a ``waiting_for`` label."""
 
     run_id: str
     agent_name: str
@@ -294,6 +291,7 @@ class RunDetail:
     pause_requested: bool = False
     tenant_id: str | None = None
     error_info: ErrorInfo | None = None
+    waiting_for: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -847,23 +845,20 @@ class RunStore:
         started_after: datetime | None = None,
         started_before: datetime | None = None,
         metadata_filter: dict[str, Any] | None = None,
+        include_waiting: bool = True,
         limit: int = DEFAULT_LIST_LIMIT,
         offset: int = 0,
     ) -> list[RunSummary]:
-        """List runs with SQL-side filtering and pagination, newest first.
+        """List filtered runs newest first; limit 1..1000, offset at most 10,000.
 
-        ``tenant_id``: omit (``UNSCOPED``) for every tenant, a string for that
-        tenant, ``None`` for untenanted runs only (changed in 0.5.0). ``limit``
-        is clamped to 1..1000 and ``offset`` may be at most 10,000.
-        ``started_after`` / ``started_before`` must be timezone-aware; they are
-        compared in UTC.
-
-        ``metadata_filter`` matches runs where every given key/value pair
-        is present at the top level of the run's ``metadata`` (the dev
-        passes this to ``agent.run(..., metadata=...)``). The canonical
-        chatbot pattern is ``metadata_filter={"thread_id": "..."}``;
-        keys are restricted to ``[A-Za-z0-9_-]+``, nested paths are not
-        supported, and values must be scalars (str, int, float, bool or None).
+        Omit ``tenant_id`` (``UNSCOPED``) for all tenants, pass a string for one
+        tenant, or ``None`` for untenanted runs only (changed in 0.5.0).
+        ``started_after`` / ``started_before`` must be aware; comparisons use UTC.
+        ``metadata_filter`` matches every top-level key/value in run metadata,
+        e.g. ``{"thread_id": "..."}``. Keys match ``[A-Za-z0-9_-]+``; values are
+        scalar str, int, float, bool or None. Nested paths are unsupported.
+        ``include_waiting=False`` requires store support and excludes subagent waits.
+        It reads pause data for every candidate row; very large tables can be slower.
         """
         _check_list_filters(
             tenant_id,
@@ -887,6 +882,7 @@ class RunStore:
             started_after=_utc(started_after),
             started_before=_utc(started_before),
             metadata_filter=metadata_filter,
+            **waiting_filter_options(self._state, include_waiting=include_waiting),
         )
         return [_run_to_summary(r) for r in records]
 
@@ -900,8 +896,9 @@ class RunStore:
         started_after: datetime | None = None,
         started_before: datetime | None = None,
         metadata_filter: dict[str, Any] | None = None,
+        include_waiting: bool = True,
     ) -> int:
-        """Count runs matching the same filters as ``list_runs``."""
+        """Count with the same filters and waiting-filter cost as ``list_runs``."""
         _check_list_filters(
             tenant_id,
             status,
@@ -919,6 +916,7 @@ class RunStore:
             started_after=_utc(started_after),
             started_before=_utc(started_before),
             metadata_filter=metadata_filter,
+            **waiting_filter_options(self._state, include_waiting=include_waiting),
         )
 
     async def get_run(self, run_id: str, *, tenant_id: TenantScope = UNSCOPED) -> RunDetail | None:
@@ -1578,6 +1576,7 @@ def _run_to_summary(record: Any) -> RunSummary:
         run_id=record.id,
         agent_name=record.agent_name,
         status=record.status,
+        waiting_for=getattr(record, "waiting_for", None),
         created_at=record.created_at,
         updated_at=record.updated_at,
         iteration_count=record.iteration_count,
@@ -1649,6 +1648,7 @@ def _run_to_detail(record: Any) -> RunDetail:
         run_id=record.id,
         agent_name=record.agent_name,
         status=record.status,
+        waiting_for=getattr(record, "waiting_for", None),
         created_at=record.created_at,
         updated_at=record.updated_at,
         iteration_count=record.iteration_count,
