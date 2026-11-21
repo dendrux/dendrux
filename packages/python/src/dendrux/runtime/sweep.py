@@ -399,7 +399,7 @@ async def sweep(
             )
         finally:
             if engine is not None:
-                await engine.dispose()
+                await _shielded_cleanup(engine.dispose)
 
 
 def _validate_scan_limits(
