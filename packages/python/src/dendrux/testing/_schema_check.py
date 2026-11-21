@@ -3,13 +3,15 @@
 Prefer ``FakeModel.provider(name, output_type=Model)``, which validates with the real
 Pydantic model. This checker works from an allowlist. It checks ``type``, ``properties``,
 ``required``, ``additionalProperties``, ``items`` (one schema), ``enum``, ``const``,
-``anyOf``, ``allOf``, ``oneOf`` (exactly one), a local ``$ref`` (beside annotations only),
-the numeric bounds, ``minLength``/``maxLength``, ``minItems``/``maxItems`` and the boolean
-schemas ``true`` and ``false``. It ignores annotations such as ``title`` and ``default``.
-Any other keyword or form (``format``, ``pattern``, an unknown keyword, an external or
-missing ``$ref`` and so on) is refused with :class:`SchemaUnsupportedError`; it is never
-passed silently. Reasons name the path and the kind of mismatch, never a value; a key
-that comes from the script and not from the schema shows as ``<key>``.
+``anyOf``, ``allOf``, ``oneOf`` (exactly one), the numeric bounds,
+``minLength``/``maxLength``, ``minItems``/``maxItems``, the boolean schemas ``true`` and
+``false``, and a ``$ref`` that names a root ``$defs`` or ``definitions`` entry (with only
+annotations beside it). It ignores annotations such as ``title`` and ``default``.
+``const`` and ``enum`` compare as JSON values, so ``true`` is not ``1``. Any other keyword
+or form (``format``, ``pattern``, an unknown keyword, any other or a missing ``$ref`` and
+so on) is refused with :class:`SchemaUnsupportedError`; it is never passed silently.
+Reasons name the path and the kind of mismatch, never a value; a key that comes from the
+script and not from the schema shows as ``<key>``.
 """
 
 from __future__ import annotations
@@ -72,6 +74,14 @@ def _is_schema_map(value: object) -> bool:
     return isinstance(value, dict) and all(_is_schema(v) for v in value.values())
 
 
+def _def_name(ref: str) -> tuple[str, str] | None:
+    """``("$defs", name)`` for ``#/$defs/<name>`` (or ``definitions``), else None."""
+    parts = ref.split("/")
+    if len(parts) != 3 or parts[0] != "#" or parts[1] not in _CONTAINERS or not parts[2]:
+        return None
+    return parts[1], parts[2].replace("~1", "/").replace("~0", "~")
+
+
 def _is_schema_list(value: object) -> bool:
     return isinstance(value, list) and bool(value) and all(_is_schema(v) for v in value)
 
@@ -89,7 +99,7 @@ _FORMS: dict[str, Callable[[object], bool]] = {
     "anyOf": _is_schema_list,
     "allOf": _is_schema_list,
     "oneOf": _is_schema_list,
-    "$ref": lambda v: isinstance(v, str) and (v == "#" or v.startswith("#/")),
+    "$ref": lambda v: isinstance(v, str) and _def_name(v) is not None,
     "minimum": _is_number,
     "maximum": _is_number,
     "exclusiveMinimum": _is_number,
@@ -151,13 +161,24 @@ def _refuse_unsupported(node: Schema, root: Schema) -> None:
 
 
 def _lookup(ref: str, root: Schema) -> Schema:
-    node: Any = root
-    for part in ref[2:].split("/") if ref != "#" else ():
-        key = part.replace("~1", "/").replace("~0", "~")
-        node = node.get(key) if isinstance(node, dict) else None
+    """The root ``$defs``/``definitions`` entry ``ref`` names; preflight already checked it."""
+    found = _def_name(ref)
+    container = root.get(found[0]) if found and isinstance(root, dict) else None
+    node = container.get(found[1]) if isinstance(container, dict) and found else None
     if isinstance(node, (dict, bool)):
         return node
     raise SchemaUnsupportedError("$ref")
+
+
+def _same(left: object, right: object) -> bool:
+    """JSON equality: ``1 == 1.0``, but a boolean never equals a number, at any depth."""
+    if isinstance(left, dict) and isinstance(right, dict):
+        return left.keys() == right.keys() and all(_same(left[k], right[k]) for k in left)
+    if isinstance(left, list) and isinstance(right, list):
+        return len(left) == len(right) and all(map(_same, left, right))
+    if isinstance(left, bool) or isinstance(right, bool):
+        return type(left) is type(right) and left == right
+    return left == right
 
 
 def _type_ok(value: object, name: str) -> bool:
@@ -190,9 +211,9 @@ def _check_choice(value: object, schema: dict[str, Any], root: Schema, path: str
     found = _check_combinators(value, schema, root, path)
     if found:
         return found
-    if "const" in schema and value != schema["const"]:
+    if "const" in schema and not _same(value, schema["const"]):
         return f"{path}: not the allowed constant"
-    if "enum" in schema and value not in schema["enum"]:
+    if "enum" in schema and not any(_same(value, option) for option in schema["enum"]):
         return f"{path}: not one of the allowed values"
     return None
 
