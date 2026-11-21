@@ -2508,7 +2508,7 @@ class Agent:
         """One result read; ``moved`` when the pending read saw another public status."""
         from dendrux.errors import RunNotFoundError
         from dendrux.guardrails._engine import deanonymize_text
-        from dendrux.runtime._run_pending import _PendingReader, attach_facing
+        from dendrux.runtime._run_pending import attach_facing
         from dendrux.runtime.runner import _cached_output, _public_meta, _recovery_info
 
         facade = _PendingReader(store)

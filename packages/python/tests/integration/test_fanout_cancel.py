@@ -15,8 +15,10 @@ from dendrux import Agent, tool
 from dendrux.db.models import AgentRun
 from dendrux.errors import ManagedStateError, RunAlreadyTerminalError, RunNotFoundError
 from dendrux.loops.single import SingleCall
-from dendrux.runtime import _managed_route
-from dendrux.runtime._managed_tree import LeafNode, WorkflowTree
+from dendrux.runtime import _managed_cancel, _managed_route
+from dendrux.runtime._managed_pending import ManagedHop
+from dendrux.runtime._managed_tree import LeafNode, WaitNode, WorkflowTree
+from dendrux.runtime.state import MANAGED_HEADER_KEY, ManagedHeader
 from dendrux.store import RunStore
 from dendrux.types import (
     Budget,
@@ -477,9 +479,7 @@ async def test_pause_honors_saved_run_cap_above_the_pending_reader_bound(store: 
         await root.close()
 
 
-async def test_pause_refuses_a_tree_that_omits_a_preflight_hop(
-    store: Any, monkeypatch: Any
-) -> None:
+async def pause_preflight(store: Any) -> tuple[Agent, str, Agent]:
     rid, call_id = await managed_parent(store)
     bound = bind_request(rid, call_id)
     await store.bind_managed_child(bound)
@@ -495,18 +495,66 @@ async def test_pause_refuses_a_tree_that_omits_a_preflight_hop(
         provider=ScriptedLLM([]),
         subagents=[leaf],
     )
-    root = root_agent(store, [middle])
+    return root_agent(store, [middle]), rid, middle
 
-    async def moved(*args: Any, **kwargs: Any) -> WorkflowTree:
-        return WorkflowTree(rid, TENANT, LeafNode(rid, root, (), "running"))
 
-    monkeypatch.setattr(_managed_route, "walk_tree", moved)
+async def test_pause_refuses_a_still_waiting_node_that_changes_child(
+    store: Any, monkeypatch: Any
+) -> None:
+    root, rid, middle = await pause_preflight(store)
+    replacement, call_id = generate_ulid(), generate_ulid()
+    await store.create_run(replacement, "reviewer", tenant_id=TENANT, parent_run_id=rid)
+    await store.checkpoint_step(
+        replacement,
+        claim_epoch=0,
+        loop_state={MANAGED_HEADER_KEY: ManagedHeader(rid, ("reviewer",), rid, call_id).to_dict()},
+        pii_mapping=None,
+        trace=None,
+    )
+
+    async def diverged(*args: Any, **kwargs: Any) -> WorkflowTree:
+        child = LeafNode(
+            replacement, middle, ("reviewer",), "running", call=ToolCall("reviewer", {}, id=call_id)
+        )
+        wait = WaitNode(rid, rid, TENANT, root, (), generate_ulid(), 3, 1, (child,))
+        return WorkflowTree(rid, TENANT, wait)
+
+    monkeypatch.setattr(_managed_route, "walk_tree", diverged)
     try:
         with pytest.raises(ManagedStateError) as raised:
             await root.request_pause(rid, tenant_id=TENANT)
         assert raised.value.reason == "binding_conflict" and raised.value.run_id == rid
         tree = await store.get_subtree(rid, tenant_id=TENANT)
         assert not any(n.run.pause_requested for n in tree.nodes)
+    finally:
+        await root.close()
+
+
+async def test_pause_accepts_a_root_that_resumed_between_reads(
+    store: Any, monkeypatch: Any, caplog: Any
+) -> None:
+    root, rid, _ = await pause_preflight(store)
+    before = await store.get_subtree(rid, tenant_id=TENANT)
+    epochs = {n.run.id: n.run.claim_epoch for n in before.nodes}
+
+    async def moved(*args: Any, **kwargs: Any) -> WorkflowTree:
+        async with store._session_factory() as session:
+            await session.execute(
+                update(AgentRun)
+                .where(AgentRun.id == rid, AgentRun.tenant_id == TENANT)
+                .values(status="running", pause_data=None)
+            )
+            await session.commit()
+        return WorkflowTree(rid, TENANT, LeafNode(rid, root, (), "running"))
+
+    monkeypatch.setattr(_managed_route, "walk_tree", moved)
+    try:
+        outcome = await root.request_pause(rid, tenant_id=TENANT)
+        assert outcome.affected == [(rid, "requested")]
+        after = await store.get_subtree(rid, tenant_id=TENANT)
+        assert {n.run.id for n in after.nodes if n.run.pause_requested} == {rid}
+        assert {n.run.id: n.run.claim_epoch for n in after.nodes} == epochs
+        assert not any(getattr(r, "code", None) == "managed_state_invalid" for r in caplog.records)
     finally:
         await root.close()
 
@@ -540,3 +588,32 @@ async def test_pause_missing_definition_keeps_typed_error_under_strict_logging(
     finally:
         await controller.close()
         await original.close()
+
+
+@pytest.mark.parametrize("waiting", [False, True])
+async def test_pause_only_checks_an_incomplete_binding_while_the_node_still_waits(
+    waiting: bool,
+    engine: Any,
+) -> None:
+    reviewer = Agent(name="reviewer", description="Worker", prompt="Work", provider=ScriptedLLM([]))
+    root = root_agent(None, [reviewer])
+    rid, child_id, call_id = generate_ulid(), generate_ulid(), generate_ulid()
+    child = LeafNode(
+        child_id, reviewer, ("reviewer",), "running", call=ToolCall("reviewer", {}, id=call_id)
+    )
+    node = (
+        WaitNode(rid, rid, TENANT, root, (), generate_ulid(), 3, 1, (child,))
+        if waiting
+        else LeafNode(rid, root, (), "running")
+    )
+    hop = ManagedHop(rid, "paused", TENANT, None, "lead", ManagedHeader(rid, ()).to_dict(), {})
+    tree = WorkflowTree(rid, TENANT, node)
+    try:
+        if waiting:
+            with pytest.raises(ManagedStateError) as raised:
+                _managed_cancel._checked_pause_order(tree, [hop])
+            assert raised.value.reason == "binding_conflict" and raised.value.run_id == rid
+        else:
+            assert _managed_cancel._checked_pause_order(tree, [hop]) == [rid]
+    finally:
+        await root.close()

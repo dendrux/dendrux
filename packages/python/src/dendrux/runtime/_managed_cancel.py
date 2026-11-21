@@ -16,7 +16,7 @@ from dendrux.errors import (
     RunFencedError,
 )
 from dendrux.runtime._bounds import MAX_SMALL_PAGE
-from dendrux.runtime._managed_tree import _descend
+from dendrux.runtime._managed_tree import WaitNode, _descend
 from dendrux.types import Budget, RunResult, RunStatus, ToolResult, _usage_from_dict
 
 if TYPE_CHECKING:
@@ -350,10 +350,22 @@ async def workflow_pause_order(
 
 
 def _checked_pause_order(tree: WorkflowTree, hops: Sequence[ManagedHop]) -> list[str]:
-    order = pause_order(tree)
-    if not {hop.run_id for hop in hops}.issubset(order):
+    if _v3_pause_binding_changed(tree, hops):
         raise ManagedStateError(reason="binding_conflict", run_id=tree.root_run_id)
-    return order
+    return pause_order(tree)
+
+
+def _v3_pause_binding_changed(tree: WorkflowTree, hops: Sequence[ManagedHop]) -> bool:
+    bindings = {
+        hop.run_id: hop.binding.get("child_run_id")
+        for hop in hops
+        if hop.waiting and not hop.fanout
+    }
+    return any(
+        node.children[0].run_id != bindings[node.run_id]
+        for node, _ in _descend(tree.root)
+        if isinstance(node, WaitNode) and node.version == 3 and node.run_id in bindings
+    )
 
 
 async def _needs_pause_tree(
