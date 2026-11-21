@@ -218,7 +218,7 @@ async def test_adoption_collector_enters_one_sweep_boundary(store, monkeypatch):
 
 
 @pytest.mark.parametrize("reason", ["exclusive", "fanout_limit"])
-async def test_partial_refusal_keeps_durable_reason(store, engine, monkeypatch, reason):
+async def test_partial_refusal_keeps_durable_reason(store, engine, monkeypatch, caplog, reason):
     from dendrux.loops import react
     from tests.integration.test_managed_adoption import ProcessDeathError
 
@@ -250,6 +250,7 @@ async def test_partial_refusal_keeps_durable_reason(store, engine, monkeypatch, 
             ).one()
         before = await refusal_rows(engine, run_id)
         assert len(before) == 1 and before[0].meta["reason"] == reason
+        caplog.clear()
         result = await root.reclaim(
             run_id, tenant_id=TENANT, item=await expire(store, engine, run_id)
         )
@@ -262,6 +263,17 @@ async def test_partial_refusal_keeps_durable_reason(store, engine, monkeypatch, 
             for row in rows
         )
         assert all(row.error_message == before[0].error_message for row in rows)
+        logs = [
+            r
+            for r in caplog.records
+            if getattr(r, "code", None) in ("managed_fanout_limit", "managed_batch_unsupported")
+        ]
+        assert len(logs) == 1
+        if reason == "exclusive":
+            assert logs[0].code == "managed_batch_unsupported" and logs[0].count == 2
+        else:
+            assert logs[0].code == "managed_fanout_limit"
+            assert (getattr(logs[0], "requested", None), getattr(logs[0], "limit", None)) == (3, 2)
         assert child._require_provider().calls == 0
     finally:
         await root.close()

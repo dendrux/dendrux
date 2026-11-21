@@ -394,6 +394,8 @@ class _AgentBlobs:
 class Agent:
     """Dendrux agent — definition and runtime facade.
 
+    Holds identity, capabilities, limits and runtime config; run() and resume() use the runner.
+
     Attributes:
         name: Agent identifier. Auto-derived from class name if subclassed.
         description: Agent purpose; required for subagents so the parent's model can choose them.

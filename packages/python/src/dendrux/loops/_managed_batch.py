@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, TypedDict, cast
 
 from dendrux import _codes
 from dendrux.loops import _pause_shared
@@ -37,7 +37,7 @@ _MANAGED_BATCH_MESSAGE = (
 
 _FANOUT_LIMIT_MESSAGE = (
     "Refused: {requested} subagent calls in one response; the limit is {limit}. "
-    "Call at most {limit} subagents at once."
+    "Call at most {limit} {subagents} at once."
 )
 
 _EXCLUSIVE_MESSAGE = (
@@ -194,7 +194,11 @@ def _refusal_message(decision: BatchDecision, limit: int) -> str:
     if decision.reason == "exclusive":
         return _EXCLUSIVE_MESSAGE
     if decision.reason == "fanout_limit":
-        return _FANOUT_LIMIT_MESSAGE.format(requested=decision.count, limit=limit)
+        return _FANOUT_LIMIT_MESSAGE.format(
+            requested=decision.count,
+            limit=limit,
+            subagents="subagent" if limit == 1 else "subagents",
+        )
     return _MANAGED_BATCH_MESSAGE
 
 
@@ -203,6 +207,31 @@ def refusal_code(decision: BatchDecision | None) -> _codes.Code:
     if decision is not None and decision.reason == "fanout_limit":
         return _codes.MANAGED_FANOUT_LIMIT
     return _codes.MANAGED_BATCH_UNSUPPORTED
+
+
+class _RefusalLogFields(TypedDict, total=False):
+    count: int
+    requested: int
+    limit: int
+    store_capability: bool
+
+
+def log_refusal(
+    logger: logging.Logger,
+    run_id: str,
+    decision: BatchDecision | None,
+    *,
+    count: int,
+    limit: int,
+    store_capability: bool | None = None,
+) -> None:
+    """Log original fan-out counts, or the refused batch size for other reasons."""
+    fields: _RefusalLogFields = {"count": count}
+    if decision is not None and decision.reason == "fanout_limit":
+        fields = {"requested": decision.count, "limit": limit}
+        if store_capability is not None:
+            fields["store_capability"] = store_capability
+    _codes.log_code(logger, refusal_code(decision), run_id=run_id, **fields)
 
 
 def _managed_batch_result(
@@ -231,11 +260,11 @@ async def refuse_managed_batch(
 ) -> None:
     """Answer every call of a refused batch before any hook, approval or effect."""
     if decision.reason == "fanout_limit":
-        _codes.log_code(
+        log_refusal(
             logger,
-            refusal_code(decision),
-            run_id=batch.run_id,
-            requested=decision.count,
+            batch.run_id,
+            decision,
+            count=len(calls),
             limit=policy.limit,
             store_capability=policy.fanout_capable,
         )

@@ -241,7 +241,7 @@ async def test_two_managed_calls_are_refused_with_fanout_limit_and_counts(caplog
         assert (body["limit"], body["requested"]) == (1, 2)
         assert body["error"] == (
             "Refused: 2 subagent calls in one response; the limit is 1. "
-            "Call at most 1 subagents at once."
+            "Call at most 1 subagent at once."
         )
     assert "managed_batch_unsupported" not in caplog.text
     assert "managed_fanout_limit" in caplog.text
@@ -340,9 +340,10 @@ def test_fanout_refusal_text_states_requested_count_and_limit(limit):
         BatchDecision("refuse", limit + 1, "fanout_limit"),
         limit=limit,
     )
+    subagents = "subagent" if limit == 1 else "subagents"
     expected = (
         f"Refused: {limit + 1} subagent calls in one response; the limit is {limit}. "
-        f"Call at most {limit} subagents at once."
+        f"Call at most {limit} {subagents} at once."
     )
     assert result.error == json.loads(result.payload)["error"] == expected
     assert BRIEF not in result.payload

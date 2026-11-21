@@ -215,6 +215,11 @@ async def test_recovered_over_limit_batch(store, engine, monkeypatch, caplog, co
         )
         assert result.status == RunStatus.SUCCESS and result.answer == "done"
         await assert_refusal(store, engine, result, llm, calls, limit, caplog, [])
+        logs = [r for r in caplog.records if getattr(r, "code", None) == "managed_fanout_limit"]
+        assert [(getattr(r, "requested", None), getattr(r, "limit", None)) for r in logs] == [
+            (len(calls), limit)
+        ]
+        assert all(not hasattr(r, "count") for r in logs)
         assert child_llm.calls == 0
     finally:
         await root.close()
