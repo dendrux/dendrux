@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import copy
 import dataclasses
+import hashlib
 import json
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -21,8 +23,13 @@ class FakeModelScriptError(LookupError):
     """The script has no usable answer for a call.
 
     The message names the agent, the turn, counts and known agent names only:
-    never message text, tool arguments or payloads.
+    never message text, tool arguments or payloads. ``code`` is a stable reason:
+    ``exhausted``, ``no_when_match``, ``invalid_json`` or ``schema_mismatch``.
     """
+
+    def __init__(self, message: str, *, code: str = "script") -> None:
+        super().__init__(message)
+        self.code = code
 
 
 @dataclass(frozen=True)
@@ -72,8 +79,16 @@ def calls(*steps: _Step) -> _Step:
 
 
 def structured(value: BaseModel | Mapping[str, Any]) -> _Step:
-    """JSON text for an agent with ``output_type``; checked against its schema when used."""
-    data = value.model_dump(mode="json") if isinstance(value, BaseModel) else dict(value)
+    """JSON text for an agent with ``output_type``; checked against its schema when used.
+
+    A model is dumped with its field aliases, the keys its output schema expects.
+    A model whose validation and serialization aliases differ should be passed as a dict.
+    """
+    data = (
+        value.model_dump(mode="json", by_alias=True)
+        if isinstance(value, BaseModel)
+        else dict(value)
+    )
     return _Step(text=json.dumps(data, sort_keys=True), structured=True)
 
 
@@ -115,6 +130,23 @@ def _usage(messages: Sequence[Message], text: str | None) -> UsageStats:
     )
 
 
+def _step_key(entry: Any) -> Any:
+    """A comparable form of an entry; ids and object identity are left out."""
+    if isinstance(entry, _Step):
+        return ("step", entry.text, entry.structured, json.dumps(entry.calls, default=repr))
+    if isinstance(entry, _When):
+        predicate = entry.predicate
+        name = (getattr(predicate, "__module__", ""), getattr(predicate, "__qualname__", ""))
+        return ("when", name, _step_key(entry.response))
+    calls_key = [(c.name, c.params) for c in entry.tool_calls or []]
+    return ("raw", entry.text, json.dumps(calls_key, default=repr), repr(entry.usage))
+
+
+def _fingerprint(slots: Mapping[str, tuple[tuple[Entry, ...], ...]]) -> str:
+    keyed = {n: [[_step_key(e) for e in slot] for slot in s] for n, s in slots.items()}
+    return hashlib.sha256(json.dumps(keyed, sort_keys=True, default=repr).encode()).hexdigest()
+
+
 class FakeModel:
     """A script of model answers, one list per agent name, with no memory.
 
@@ -122,40 +154,82 @@ class FakeModel:
     :meth:`provider` and the turn (the number of assistant messages in that
     call's history). A new ``FakeModel`` built from the same script, in
     another process or after a resume, answers the same way.
+
+    The script is deep-copied when the model is built, and every response and
+    call record hands out its own copies, so changing a returned value never
+    changes the script. Predicates given to ``when`` stay caller-owned and must
+    be pure. A scripted raw ``LLMResponse`` must be deep-copyable.
     """
 
     def __init__(self, script: Mapping[str, Sequence[Entry]], *, model: str = "fake") -> None:
-        self._slots = {name: _slots(entries) for name, entries in script.items()}
+        self._slots = {
+            name: _slots([copy.deepcopy(entry) for entry in entries])
+            for name, entries in script.items()
+        }
+        self._fingerprint = _fingerprint(self._slots)
         self._model = model
         self._calls: dict[str, list[FakeCall]] = {name: [] for name in self._slots}
         self._used: dict[str, set[int]] = {name: set() for name in self._slots}
+        self._failures: list[tuple[str, int, str]] = []
 
     def provider(self, name: str) -> FakeProvider:
         """The provider for agent ``name``; an unknown name raises at bind time."""
         if name not in self._slots:
             raise FakeModelScriptError(
-                f"FakeModel has no script for agent {name!r}; known agents: {sorted(self._slots)}"
+                f"FakeModel has no script for agent {name!r}; known agents: {sorted(self._slots)}",
+                code="unknown_agent",
             )
         return FakeProvider(self, name)
 
     def calls(self, name: str) -> list[FakeCall]:
-        """The calls agent ``name`` made through this instance, oldest first."""
+        """The calls agent ``name`` received through this instance, oldest first.
+
+        Failed attempts are included. The records are copies.
+        """
         return list(self._calls[name])
 
+    def script_errors(self) -> list[tuple[str, int, str]]:
+        """Every failed script attempt as ``(agent, turn, code)``, oldest first."""
+        return list(self._failures)
+
+    def assert_no_script_errors(self, *others: FakeModel) -> None:
+        """Fail if any call, here or in ``others``, could not be answered.
+
+        A fan-out child whose script fails is isolated by the runtime and the
+        parent can still succeed, so assert this at the end of the test.
+        """
+        failures = list(self._failures)
+        for other in others:
+            self._require_same_script(other)
+            failures += other._failures
+        if failures:
+            shown = [f"{agent}@{turn} ({code})" for agent, turn, code in failures]
+            raise AssertionError(f"FakeModel script errors: {shown}")
+
     def assert_all_used(self, *others: FakeModel) -> None:
-        """Fail if a script entry was never used, here or in ``others``.
+        """Fail on a script error or on a turn slot that never answered.
 
         After a simulated second process, pass the first instance as ``others``:
-        each instance only sees the calls made through it.
+        each instance only sees the calls made through it. Every instance must be
+        built from the same script, otherwise the check is refused. A slot counts
+        as used when one of its alternatives answered.
         """
+        self.assert_no_script_errors(*others)
         unused = []
         for name, slots in self._slots.items():
             used = set(self._used[name])
             for other in others:
-                used |= other._used.get(name, set())
+                used |= other._used[name]
             unused += [f"{name}@{turn}" for turn in range(len(slots)) if turn not in used]
         if unused:
             raise AssertionError(f"FakeModel entries never used: {unused}")
+
+    def _require_same_script(self, other: FakeModel) -> None:
+        if other._fingerprint != self._fingerprint:
+            raise AssertionError(
+                "FakeModel instances were built from different scripts; "
+                "pass only instances built from the same script"
+            )
 
     def _answer(
         self,
@@ -167,23 +241,46 @@ class FakeModel:
         model: str,
     ) -> LLMResponse:
         turn = sum(1 for m in messages if m.role == Role.ASSISTANT)
+        self._calls[name].append(
+            FakeCall(
+                turn,
+                tuple(copy.deepcopy(messages)),
+                tuple(copy.deepcopy(tools)) if tools else None,
+                copy.deepcopy(output_schema),
+                run_id,
+                model,
+            )
+        )
+        try:
+            response = self._respond(name, turn, messages, output_schema, model)
+        except FakeModelScriptError as exc:
+            self._failures.append((name, turn, exc.code))
+            raise
+        self._used[name].add(turn)
+        return response
+
+    def _respond(
+        self,
+        name: str,
+        turn: int,
+        messages: list[Message],
+        output_schema: dict[str, Any] | None,
+        model: str,
+    ) -> LLMResponse:
         slots = self._slots[name]
         if turn >= len(slots):
             raise FakeModelScriptError(
                 f"FakeModel script for agent {name!r} has no entry for turn {turn} "
-                f"({len(slots)} entries)"
+                f"({len(slots)} entries)",
+                code="exhausted",
             )
         entry = self._pick(name, turn, slots[turn], messages)
-        self._calls[name].append(
-            FakeCall(
-                turn, tuple(messages), tuple(tools) if tools else None, output_schema, run_id, model
-            )
-        )
-        self._used[name].add(turn)
         return self._build(name, turn, entry, messages, output_schema, model)
 
     @staticmethod
-    def _pick(name: str, turn: int, slot: tuple[Entry, ...], messages: list[Message]) -> Any:
+    def _pick(
+        name: str, turn: int, slot: tuple[Entry, ...], messages: list[Message]
+    ) -> _Step | LLMResponse:
         for entry in slot:
             if not isinstance(entry, _When):
                 return entry
@@ -191,7 +288,8 @@ class FakeModel:
                 return entry.response
         raise FakeModelScriptError(
             f"FakeModel script for agent {name!r} at turn {turn}: no when() entry matched "
-            f"({len(slot)} entries)"
+            f"({len(slot)} entries)",
+            code="no_when_match",
         )
 
     @staticmethod
@@ -204,13 +302,13 @@ class FakeModel:
         model: str,
     ) -> LLMResponse:
         if isinstance(entry, LLMResponse):
-            return dataclasses.replace(entry, model=model)
+            return dataclasses.replace(copy.deepcopy(entry), model=model)
         if entry.structured and output_schema is not None:
             _check_structured(name, turn, entry.text, output_schema)
         tool_calls = [
             ToolCall(
                 name=tool,
-                params=dict(args),
+                params=copy.deepcopy(args),
                 id=f"fake-{name}-{turn}-{i}",
                 provider_tool_call_id=f"fake-{name}-{turn}-{i}",
             )
@@ -229,11 +327,13 @@ def _check_structured(name: str, turn: int, text: str | None, schema: dict[str, 
     head = f"FakeModel scripted structured response for agent {name!r} at turn {turn}"
     try:
         value = json.loads(text or "")
-    except ValueError as exc:
-        raise FakeModelScriptError(f"{head} is not valid JSON") from exc
+    except ValueError:
+        raise FakeModelScriptError(f"{head} is not valid JSON", code="invalid_json") from None
     problem = first_mismatch(value, schema)
     if problem:
-        raise FakeModelScriptError(f"{head} does not match the output schema: {problem}")
+        raise FakeModelScriptError(
+            f"{head} does not match the output schema: {problem}", code="schema_mismatch"
+        )
 
 
 class FakeProvider(LLMProvider):
