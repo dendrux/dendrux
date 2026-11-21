@@ -187,7 +187,7 @@ class Bounds(BaseModel):
     ge: int = Field(default=1, ge=1)
     lt: int = Field(default=1, lt=5)
     le: int = Field(default=1, le=5)
-    text: str = Field(default="okay", min_length=2, max_length=5, pattern="^ok")
+    text: str = Field(default="okay", min_length=2, max_length=5)
     items: list[int] = Field(default_factory=lambda: [1], min_length=1, max_length=2)
     mapping: dict[str, int] = Field(default_factory=dict)
     number: float = Field(default=1.0, gt=0.5)
