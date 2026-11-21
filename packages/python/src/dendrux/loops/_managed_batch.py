@@ -36,8 +36,8 @@ _MANAGED_BATCH_MESSAGE = (
 )
 
 _FANOUT_LIMIT_MESSAGE = (
-    "Too many subagent calls in one turn (at most {limit}). "
-    "No tool in this batch ran; call fewer subagents per turn."
+    "Refused: {requested} subagent calls in one response; the limit is {limit}. "
+    "Call at most {limit} subagents at once."
 )
 
 _EXCLUSIVE_MESSAGE = (
@@ -193,9 +193,16 @@ def _managed_batch_unsupported(calls: Sequence[ToolCall], lookups: ToolLookups) 
 def _refusal_message(decision: BatchDecision, limit: int) -> str:
     if decision.reason == "exclusive":
         return _EXCLUSIVE_MESSAGE
-    if decision.reason == "fanout_limit" and limit > 1:
-        return _FANOUT_LIMIT_MESSAGE.format(limit=limit)
+    if decision.reason == "fanout_limit":
+        return _FANOUT_LIMIT_MESSAGE.format(requested=decision.count, limit=limit)
     return _MANAGED_BATCH_MESSAGE
+
+
+def refusal_code(decision: BatchDecision | None) -> _codes.Code:
+    """The stable diagnostic for a refusal, shared by results and both log paths."""
+    if decision is not None and decision.reason == "fanout_limit":
+        return _codes.MANAGED_FANOUT_LIMIT
+    return _codes.MANAGED_BATCH_UNSUPPORTED
 
 
 def _managed_batch_result(
@@ -208,7 +215,7 @@ def _managed_batch_result(
         body["reason"] = decision.reason
         if decision.reason == "fanout_limit":
             body["limit"], body["requested"] = limit, decision.count
-    meta = {"code": MANAGED_BATCH_UNSUPPORTED, **{k: v for k, v in body.items() if k != "error"}}
+    meta = {"code": refusal_code(decision).name, **{k: v for k, v in body.items() if k != "error"}}
     return ToolResult(
         name=tc.name,
         call_id=tc.id,
@@ -223,23 +230,24 @@ async def refuse_managed_batch(
     calls: Sequence[ToolCall], batch: _ToolBatch, decision: BatchDecision, policy: BatchPolicy
 ) -> None:
     """Answer every call of a refused batch before any hook, approval or effect."""
-    _codes.log_code(
-        logger,
-        _codes.MANAGED_BATCH_UNSUPPORTED,
-        run_id=batch.run_id,
-        count=len(calls),
-        reason=decision.reason,
-        limit=policy.limit,
-        requested=decision.count,
-    )
     if decision.reason == "fanout_limit":
         _codes.log_code(
             logger,
-            _codes.MANAGED_FANOUT_LIMIT,
+            refusal_code(decision),
             run_id=batch.run_id,
             requested=decision.count,
             limit=policy.limit,
             store_capability=policy.fanout_capable,
+        )
+    else:
+        _codes.log_code(
+            logger,
+            refusal_code(decision),
+            run_id=batch.run_id,
+            count=len(calls),
+            reason=decision.reason,
+            limit=policy.limit,
+            requested=decision.count,
         )
     mark = getattr(batch.recorder, "mark_managed_refusal", None)
     if mark is not None:

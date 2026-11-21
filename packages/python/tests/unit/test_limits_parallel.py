@@ -61,6 +61,7 @@ def test_fanout_state_reasons_are_preserved_and_logged(reason, caplog):
     "name,fields",
     [
         ("managed_fanout_limit", {"requested": 33, "limit": 32, "store_capability": True}),
+        ("managed_fanout_limit", {"count": 2}),
         ("managed_fanout_branch_error", {"error_type": "RuntimeError"}),
     ],
 )

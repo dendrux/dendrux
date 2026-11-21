@@ -915,7 +915,7 @@ MANAGED_FANOUT_LIMIT = Code(
     "managed_fanout_limit",
     logging.WARNING,
     "subagent",
-    _BASE_FIELDS | frozenset({"requested", "limit", "store_capability"}),
+    _BASE_FIELDS | frozenset({"requested", "limit", "store_capability", "count"}),
     "A subagent batch exceeds the turn limit or store capability.",
     "Reduce the batch or use a store that supports managed fan-out.",
 )

@@ -1036,7 +1036,7 @@ async def _refuse_recovered_batch(
 
     recorder = cast("PersistenceRecorder", ctx.recorder)
     iteration = ctx.pause_state.iteration
-    _codes.log_code(logger, _codes.MANAGED_BATCH_UNSUPPORTED, run_id=run_id, count=len(calls))
+    _codes.log_code(logger, _managed_batch.refusal_code(decision), run_id=run_id, count=len(calls))
     if not set(recorder._loop_state.get("managed_refused") or ()) >= {tc.id for tc in calls}:
         await recorder.mark_managed_refusal([tc.id for tc in calls])
     for tc in calls:

@@ -847,7 +847,9 @@ async def test_recovered_unsupported_batch_is_refused_with_zero_effects(
     tool_rows = await rows(engine, ToolCallRecord, ToolCallRecord.agent_run_id == root_id)
     if parallel_limit == 4:
         assert all(r.meta.get("reason") == "exclusive" for r in tool_rows)
-    assert {r.meta.get("code") for r in tool_rows} == {"managed_batch_unsupported"}
+    assert {r.meta.get("code") for r in tool_rows} == {
+        "managed_fanout_limit" if parallel_limit == 1 else "managed_batch_unsupported"
+    }
 
 
 async def test_recovered_pre_bind_handoff_binds_once_not_a_client_pause(
@@ -1316,7 +1318,9 @@ async def test_r4b_partial_batch_refusal_refuses_the_rest_on_recovery(
     assert len(tool_rows) == 3
     if parallel_limit == 4:
         assert all(r.meta.get("reason") == "exclusive" for r in tool_rows)
-    assert {r.meta.get("code") for r in tool_rows} == {"managed_batch_unsupported"}
+    assert {r.meta.get("code") for r in tool_rows} == {
+        "managed_fanout_limit" if parallel_limit == 1 else "managed_batch_unsupported"
+    }
     assert not await rows(engine, AgentRun, AgentRun.parent_run_id == root_id)
 
 

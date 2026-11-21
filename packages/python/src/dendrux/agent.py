@@ -394,17 +394,17 @@ class _AgentBlobs:
 class Agent:
     """Dendrux agent — definition and runtime facade.
 
-    Holds the agent's identity, capabilities, limits, and runtime config
-    (provider, persistence, guardrails). Provides run() and resume() as
-    instance methods that delegate to the runner.
-
     Attributes:
         name: Agent identifier. Auto-derived from class name if subclassed.
-        description: What the agent does. Required when it is used as a
-            subagent: the parent's model reads it to decide when to call it.
+        description: Agent purpose; required for subagents so the parent's model can choose them.
         prompt: System prompt for the agent.
         tools: List of @tool-decorated functions this agent can use.
         max_iterations: Maximum ReAct loop iterations before stopping.
+        subagents: Direct child agents exposed as managed tools; defaults to none.
+        exclusive_subagents: Names whose calls must be the only subagent call; defaults to none.
+        limits: Size and count caps; defaults to Limits(), including 4 parallel subagents.
+        budget: Optional token/cost policy; managed trees require a root-only, inclusive budget.
+        lease_interval: In-flight persisted claim renewal interval; default 30s, minimum 5s.
     """
 
     name: str = ""
