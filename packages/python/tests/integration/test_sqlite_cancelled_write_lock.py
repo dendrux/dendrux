@@ -28,16 +28,24 @@ async def test_cancelled_store_write_releases_lock_with_retained_traceback(
 
 
 @pytest.mark.parametrize(
-    "query",
+    "database",
     [
-        "mode=memory",  # no uri=true: SQLAlchemy opens the plain path and drops the query
-        "mode=memory&uri=false",
+        "{disk}?mode=memory",  # no uri=true: SQLAlchemy opens the plain path and drops the query
+        "{disk}?mode=memory&uri=false",
+        # SQLAlchemy decodes %25 once; SQLite cuts the option name at the NUL and applies
+        # mode=rwc after mode=memory, so it opens the disk file.
+        "file:{disk}?mode=memory&mode%2500x=rwc&uri=true",
     ],
 )
-async def test_disk_url_that_mentions_memory_keeps_the_guard(tmp_path, monkeypatch, query) -> None:
-    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'on-disk.db'}?{query}")
+async def test_disk_url_that_mentions_memory_keeps_the_guard(
+    tmp_path, monkeypatch, database
+) -> None:
+    disk = tmp_path / "on-disk.db"
+    engine = create_async_engine("sqlite+aiosqlite:///" + database.format(disk=disk))
     try:
         async with engine.begin() as connection:
+            main = (await connection.exec_driver_sql("PRAGMA database_list")).one()
+            assert Path(main[2]).resolve() == disk.resolve(), "the case must open the disk file"
             await connection.run_sync(Base.metadata.create_all)
         await _cancel_a_write_then_write_elsewhere(engine, store_for_engine(engine), monkeypatch)
     finally:
@@ -70,7 +78,8 @@ async def _cancel_a_write_then_write_elsewhere(engine, store, monkeypatch) -> No
     )
     retained = None
     probe = create_async_engine(engine.url, poolclass=NullPool, connect_args={"timeout": 0.05})
-    journal = Path(str(engine.url.database) + "-journal")
+    # A URI database names its disk file after the file: scheme.
+    journal = Path(str(engine.url.database).removeprefix("file:") + "-journal")
     try:
         await asyncio.wait_for(stepped.wait(), timeout=2)
         assert journal.exists(), "the cancelled operation must already hold a write transaction"

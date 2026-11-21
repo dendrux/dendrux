@@ -65,6 +65,9 @@ async def test_file_sqlite_is_still_guarded(tmp_path) -> None:
 URL_KINDS = [
     ("sqlite+aiosqlite://", True),
     ("sqlite+aiosqlite:///:memory:", True),
+    ("sqlite+aiosqlite:///:memory:?uri=true", True),  # the exact name is memory whatever uri says
+    ("sqlite+aiosqlite:///:memory:?uri=1", True),
+    ("sqlite+aiosqlite:///:memory:?uri=yes", True),
     ("sqlite+aiosqlite:///file::memory:?cache=shared&uri=true", True),
     ("sqlite+aiosqlite:///file:named?mode=memory&cache=shared&uri=true", True),
     ("sqlite+aiosqlite:///file:%3Amemory%3A?uri=true", True),  # percent-encoded name
@@ -75,6 +78,8 @@ URL_KINDS = [
     ("sqlite+aiosqlite:///file::memory:", False),  # URI off: a file with that literal name
     ("sqlite+aiosqlite:///file::memory:?uri=false", False),
     ("sqlite+aiosqlite:///file:other.db?mode=MEMORY&uri=true", False),  # unclear: stay guarded
+    # SQLite reads mode%00x=rwc as a second mode option and opens the disk file.
+    ("sqlite+aiosqlite:///file:encoded.db?mode=memory&mode%2500x=rwc&uri=true", False),
     ("sqlite+aiosqlite:///normal.db", False),
 ]
 

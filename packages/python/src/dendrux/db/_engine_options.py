@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar
-from urllib.parse import parse_qs, unquote
+from urllib.parse import unquote
 
 from sqlalchemy.engine import URL, make_url
 
@@ -19,6 +20,8 @@ if TYPE_CHECKING:
 _MYSQL_DRIVER = "mysql+asyncmy"
 _MYSQL_UTC_INIT = "SET time_zone='+00:00'"
 _SQLITE_MEMORY = ":memory:"
+# Plain name=value URI options only; anything else (such as %00) is unclear.
+_PLAIN_URI_QUERY = re.compile(r"\w+=\w+(?:&\w+=\w+)*", re.ASCII)
 _T = TypeVar("_T")
 
 
@@ -77,23 +80,29 @@ def mysql_engine_options(supplied: dict[str, Any]) -> dict[str, Any]:
 def is_memory_sqlite(engine: AsyncEngine) -> bool:
     """True only when ``engine`` clearly opens an in-memory SQLite database.
 
-    Reads the filename and ``uri`` flag the dialect passes to ``sqlite3`` for the
-    engine URL, then applies SQLite's rules. Without ``uri`` only ``:memory:`` is
-    in-memory (SQLAlchemy turns every other name into an absolute path). With
-    ``uri`` the name must use the ``file:`` scheme; after the fragment is dropped
-    and the path percent-decoded, it is in-memory when the path is ``:memory:`` or
-    the query sets ``mode=memory``. Anything else counts as a file, so callers err
-    towards treating the database as a file. Options passed through ``connect_args``
-    or a custom ``creator`` are not visible here.
+    Reads the filename and ``uri`` flag the dialect passes to ``sqlite3`` and
+    accepts an allow-list of clear forms, without copying SQLite's URI grammar:
+
+    - the filename is exactly ``:memory:``, whatever the ``uri`` flag says;
+    - with ``uri``: ``file:`` plus a path that percent-decodes to ``:memory:``
+      (SQLite drops any ``#`` fragment first);
+    - with ``uri``: ``file:<name>?<query>`` where the query is only plain
+      ``name=value`` options of ASCII letters, digits and underscores, joined by
+      ``&``, with at least one ``mode`` option and every ``mode`` equal to ``memory``.
+
+    Anything unclear counts as a file, so the close guard stays on: percent-encoding
+    or any other character in the query, a missing ``file:`` scheme, or no ``uri``
+    flag. Options passed through ``connect_args`` or a custom ``creator`` are not
+    visible here.
     """
     if engine.dialect.name != "sqlite":
         return False
     args, options = engine.dialect.create_connect_args(engine.url)
     if not args:
         return False
-    if not options.get("uri"):
-        return args[0] == _SQLITE_MEMORY
-    return _is_memory_uri(args[0])
+    if args[0] == _SQLITE_MEMORY:
+        return True
+    return bool(options.get("uri")) and _is_memory_uri(args[0])
 
 
 def _is_memory_uri(filename: str) -> bool:
@@ -102,8 +111,14 @@ def _is_memory_uri(filename: str) -> bool:
     path, _, query = filename.removeprefix("file:").partition("#")[0].partition("?")
     if unquote(path) == _SQLITE_MEMORY:
         return True
-    modes = parse_qs(query, keep_blank_values=True).get("mode")
-    return modes is not None and all(mode == "memory" for mode in modes)
+    if not _PLAIN_URI_QUERY.fullmatch(query):
+        return False
+    modes = [
+        value
+        for name, value in (option.split("=") for option in query.split("&"))
+        if name == "mode"
+    ]
+    return bool(modes) and all(mode == "memory" for mode in modes)
 
 
 def normalized_url(url: str | URL) -> URL:
