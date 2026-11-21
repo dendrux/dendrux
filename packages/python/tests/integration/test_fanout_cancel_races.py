@@ -10,6 +10,7 @@ import pytest
 
 from dendrux.errors import RunCancelledError
 from tests.integration.test_fanout_adoption import lead
+from tests.integration.test_fanout_cancel import HANG_TIMEOUT
 from tests.integration.test_fanout_store_races import (
     _pools,
     _postgres_only,
@@ -39,17 +40,17 @@ async def test_r5_x4_mark_wins_against_eight_batch_binders(
             real = binder._lock_managed_root
 
             async def locked(session: Any, plan: Any) -> None:
-                await barrier.wait()
-                await release.wait()
+                await asyncio.wait_for(barrier.wait(), HANG_TIMEOUT)
+                await asyncio.wait_for(release.wait(), HANG_TIMEOUT)
                 await real(session, plan)
 
             monkeypatch.setattr(binder, "_lock_managed_root", locked)
 
         for binder in binders:
             hold(binder)
-        async with asyncio.timeout(20):
+        async with asyncio.timeout(HANG_TIMEOUT):
             tasks = [asyncio.create_task(b.bind_managed_children(request)) for b in binders]
-            await barrier.wait()
+            await asyncio.wait_for(barrier.wait(), HANG_TIMEOUT)
             try:
                 cancelled = await lead(state_store=canceller).cancel_run(root, tenant_id="t1")
             finally:
@@ -88,7 +89,7 @@ async def test_r5_x4_bind_transaction_wins_then_cancel_sees_the_whole_batch(
             await child_write(*args, **kwargs)
             if not partial.is_set():
                 partial.set()
-                await release.wait()
+                await asyncio.wait_for(release.wait(), HANG_TIMEOUT)
 
         async def marking_root(*args: Any, **kwargs: Any) -> Any:
             marking.set()
@@ -96,14 +97,14 @@ async def test_r5_x4_bind_transaction_wins_then_cancel_sees_the_whole_batch(
 
         monkeypatch.setattr(binder, "_bind_child", held)
         monkeypatch.setattr(canceller, "mark_cancel_requested", marking_root)
-        async with asyncio.timeout(20):
+        async with asyncio.timeout(HANG_TIMEOUT):
             binding = asyncio.create_task(binder.bind_managed_children(request))
-            await partial.wait()
+            await asyncio.wait_for(partial.wait(), HANG_TIMEOUT)
             cancellation = asyncio.create_task(
                 lead(state_store=canceller).cancel_run(root, tenant_id="t1")
             )
             try:
-                await marking.wait()
+                await asyncio.wait_for(marking.wait(), HANG_TIMEOUT)
                 # The writer holds the root lock with only one child inserted.
                 assert (await counts(engine, root))["children"] == 0
             finally:

@@ -52,6 +52,8 @@ from dendrux.runtime._limit_checks import (
     MAX_NOTE_TEXT_BYTES,
     MAX_PAUSE_REASON_CHARS,
 )
+from dendrux.runtime._managed_pending import read_workflow
+from dendrux.runtime._pending import _PendingReader
 from dendrux.runtime._tenant_checks import _tenant_scope_chosen
 from dendrux.runtime.context import DEFAULT_LEASE_INTERVAL_S, MIN_LEASE_INTERVAL_S
 from dendrux.runtime.state import UNSCOPED, ReclaimableRun, TenantScope, require_store_method
@@ -2506,7 +2508,7 @@ class Agent:
         """One result read; ``moved`` when the pending read saw another public status."""
         from dendrux.errors import RunNotFoundError
         from dendrux.guardrails._engine import deanonymize_text
-        from dendrux.runtime._run_pending import _PendingReader, attach_facing
+        from dendrux.runtime._run_pending import attach_facing
         from dendrux.runtime.runner import _cached_output, _public_meta, _recovery_info
 
         facade = _PendingReader(store)
@@ -2751,14 +2753,11 @@ class Agent:
     ) -> PauseOutcome:
         """Ask a running run to pause durably at its next checkpoint.
 
-        Cooperative, like :meth:`cancel_run`: a RUNNING run gets a
-        ``pause_requested`` flag and the runner that owns it pauses at the
-        top of its next iteration — or between the approved calls of a
-        resumed approval batch — before any further side effect. The run
-        becomes ``PAUSED`` with its full history persisted, emits
-        ``run.paused`` with ``reason="requested"``, and the waiting
-        ``run()`` / stream returns that paused result. In-flight LLM calls
-        and tools are never preempted. Cancellation wins over pause.
+        Like :meth:`cancel_run`, this sets ``pause_requested`` on a RUNNING run.
+        Its owner pauses at the next iteration, or between approved calls, before
+        further side effects. It persists full history as PAUSED and emits
+        ``run.paused(reason="requested")``; the waiting run/stream returns it.
+        In-flight LLM calls/tools finish normally. Cancellation wins over pause.
 
         - WAITING_* run: no-op (already durable); nothing latches, so the
           next submit continues normally.
@@ -2766,20 +2765,16 @@ class Agent:
         - If the run reaches a WAITING_* pause first, that pause satisfies
           the request and clears it.
 
-        Resume a PAUSED run with :meth:`submit_resume`, ``resume(run_id)``
-        or ``resume_stream(run_id)`` (no payload); :meth:`cancel_run`
-        finalizes it as cancelled. Notes submitted while paused are
-        delivered after resume.
+        Continue with :meth:`submit_resume`, ``resume`` or ``resume_stream`` (no payload);
+        notes arrive after resume. :meth:`cancel_run` finalizes a paused run as cancelled.
 
-        ``cascade=True`` (default) also flags every non-terminal descendant
-        over a point-in-time snapshot (deepest first, root last). This is
-        flag propagation only, not a resumable call stack: a paused child
-        returns its paused ``RunResult`` to the parent's delegating tool,
-        which records whatever the tool returns; the parent pauses at its
-        own next checkpoint. Resuming the child later never rewrites the
-        parent's recorded tool result — the delegating tool or the app owns
-        correlating and re-injecting the child's outcome. Resume is per run
-        (``RunStore.get_subtree`` lists them).
+        Managed roots flag the whole bound workflow even with ``cascade=False``,
+        deepest first; running ReAct leaves pause without revoking claims.
+        SingleCall children ignore requested pauses. For other runs,
+        ``cascade=True`` flags descendants over a point-in-time snapshot,
+        deepest first and root last. This only propagates flags: resuming
+        a child never rewrites its parent's recorded tool result. The app
+        owns correlating that outcome; resume remains per run.
 
         Args:
             run_id: The run to pause.
@@ -2854,7 +2849,12 @@ class Agent:
         """Runs a pause request flags, deepest first and ``record`` last."""
         if self._subagents:
             return await _managed_cancel.workflow_pause_order(
-                self, store, record, walk_tree=_managed_route.walk_tree
+                self,
+                store,
+                record,
+                walk_tree=_managed_route.walk_tree,
+                read_hop=_PendingReader(store)._read_hop,
+                read_workflow=read_workflow,
             )
         if not cascade:
             return [record.id]
