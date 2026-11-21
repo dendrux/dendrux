@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 
+from dendrux.db._pool_guard import guard_sqlite_closes
 from dendrux.runtime.durability import _safe_database_call
 from dendrux.runtime.stores.sql.base import SQLStateStore
 
@@ -26,6 +27,7 @@ class SQLiteStateStore(SQLStateStore):
     def __init__(
         self, engine: AsyncEngine, *, live_updates: LiveUpdates | bool | None = None
     ) -> None:
+        guard_sqlite_closes(engine)
         super().__init__(engine, live_updates=live_updates)
         memory = (
             engine.url.database in (None, "", ":memory:", "file::memory:")
