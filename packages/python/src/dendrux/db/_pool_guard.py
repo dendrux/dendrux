@@ -56,7 +56,7 @@ from sqlalchemy import event
 from sqlalchemy.pool import SingletonThreadPool, StaticPool
 
 from dendrux import _codes
-from dendrux.db._engine_options import is_memory_sqlite_url
+from dendrux.db._engine_options import is_memory_sqlite
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable
@@ -196,7 +196,7 @@ def guard_sqlite_closes(engine: AsyncEngine) -> None:
     listeners and no driver wrapper.
     """
     driver = (engine.dialect.name, engine.dialect.driver)
-    if driver != ("sqlite", "aiosqlite") or is_memory_sqlite_url(engine.url):
+    if driver != ("sqlite", "aiosqlite") or is_memory_sqlite(engine):
         return
     target = engine.sync_engine
     if event.contains(target, "checkout", _track_sqlite_statements):

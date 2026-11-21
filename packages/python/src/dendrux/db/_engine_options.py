@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar
+from urllib.parse import parse_qs, unquote
 
 from sqlalchemy.engine import URL, make_url
 
@@ -13,8 +14,11 @@ POOL_PRE_PING = True
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from sqlalchemy.ext.asyncio import AsyncEngine
+
 _MYSQL_DRIVER = "mysql+asyncmy"
 _MYSQL_UTC_INIT = "SET time_zone='+00:00'"
+_SQLITE_MEMORY = ":memory:"
 _T = TypeVar("_T")
 
 
@@ -70,11 +74,36 @@ def mysql_engine_options(supplied: dict[str, Any]) -> dict[str, Any]:
     return options
 
 
-def is_memory_sqlite_url(url: URL) -> bool:
-    """True when a SQLite URL names an in-memory database, in plain or URI form."""
-    return (
-        url.database in (None, "", ":memory:", "file::memory:") or url.query.get("mode") == "memory"
-    )
+def is_memory_sqlite(engine: AsyncEngine) -> bool:
+    """True only when ``engine`` clearly opens an in-memory SQLite database.
+
+    Reads the filename and ``uri`` flag the dialect passes to ``sqlite3`` for the
+    engine URL, then applies SQLite's rules. Without ``uri`` only ``:memory:`` is
+    in-memory (SQLAlchemy turns every other name into an absolute path). With
+    ``uri`` the name must use the ``file:`` scheme; after the fragment is dropped
+    and the path percent-decoded, it is in-memory when the path is ``:memory:`` or
+    the query sets ``mode=memory``. Anything else counts as a file, so callers err
+    towards treating the database as a file. Options passed through ``connect_args``
+    or a custom ``creator`` are not visible here.
+    """
+    if engine.dialect.name != "sqlite":
+        return False
+    args, options = engine.dialect.create_connect_args(engine.url)
+    if not args:
+        return False
+    if not options.get("uri"):
+        return args[0] == _SQLITE_MEMORY
+    return _is_memory_uri(args[0])
+
+
+def _is_memory_uri(filename: str) -> bool:
+    if not filename.startswith("file:"):
+        return False  # SQLite opens a URI without the file: scheme as a plain name
+    path, _, query = filename.removeprefix("file:").partition("#")[0].partition("?")
+    if unquote(path) == _SQLITE_MEMORY:
+        return True
+    modes = parse_qs(query, keep_blank_values=True).get("mode")
+    return modes is not None and all(mode == "memory" for mode in modes)
 
 
 def normalized_url(url: str | URL) -> URL:

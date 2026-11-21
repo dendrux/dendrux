@@ -58,3 +58,40 @@ async def test_file_sqlite_is_still_guarded(tmp_path) -> None:
         assert await _driver_is_wrapped(engine)
     finally:
         await engine.dispose()
+
+
+# (URL, opens an in-memory database). The second value is checked against what SQLite
+# actually opened before the guard and the store are judged.
+URL_KINDS = [
+    ("sqlite+aiosqlite://", True),
+    ("sqlite+aiosqlite:///:memory:", True),
+    ("sqlite+aiosqlite:///file::memory:?cache=shared&uri=true", True),
+    ("sqlite+aiosqlite:///file:named?mode=memory&cache=shared&uri=true", True),
+    ("sqlite+aiosqlite:///file:%3Amemory%3A?uri=true", True),  # percent-encoded name
+    ("sqlite+aiosqlite:///file::memory:#ignored?uri=true", True),  # SQLite drops the fragment
+    ("sqlite+aiosqlite:///ordinary.db?mode=memory", False),  # no uri=true: query not forwarded
+    ("sqlite+aiosqlite:///disabled.db?mode=memory&uri=false", False),
+    ("sqlite+aiosqlite:///no_scheme.db?mode=memory&uri=true", False),  # URI needs file:
+    ("sqlite+aiosqlite:///file::memory:", False),  # URI off: a file with that literal name
+    ("sqlite+aiosqlite:///file::memory:?uri=false", False),
+    ("sqlite+aiosqlite:///file:other.db?mode=MEMORY&uri=true", False),  # unclear: stay guarded
+    ("sqlite+aiosqlite:///normal.db", False),
+]
+
+
+@pytest.mark.parametrize(("url", "memory"), URL_KINDS)
+async def test_guard_and_store_follow_the_database_sqlite_opens(
+    url, memory, tmp_path, monkeypatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    engine = create_async_engine(url)
+    try:
+        if "MEMORY" not in url:  # SQLite refuses an unknown mode; nothing to open
+            async with engine.connect() as connection:
+                main = (await connection.exec_driver_sql("PRAGMA database_list")).one()
+            assert (main[2] == "") is memory, "the case table names the wrong database kind"
+        store = SQLiteStateStore(engine)
+        assert store.capabilities.deployment == ("single_process" if memory else "single_host")
+        assert _listening(engine) == ([] if memory else [name for name, _ in _LISTENERS])
+    finally:
+        await engine.dispose()

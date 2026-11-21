@@ -16,11 +16,36 @@ from sqlalchemy.exc import SAWarning
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
+from dendrux.db.models import Base
+from dendrux.runtime.stores._factory import store_for_engine
+
 
 @pytest.mark.parametrize("engine", ["sqlite_file"], indirect=True)
 async def test_cancelled_store_write_releases_lock_with_retained_traceback(
     engine, store, monkeypatch
 ) -> None:
+    await _cancel_a_write_then_write_elsewhere(engine, store, monkeypatch)
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "mode=memory",  # no uri=true: SQLAlchemy opens the plain path and drops the query
+        "mode=memory&uri=false",
+    ],
+)
+async def test_disk_url_that_mentions_memory_keeps_the_guard(tmp_path, monkeypatch, query) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'on-disk.db'}?{query}")
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        await _cancel_a_write_then_write_elsewhere(engine, store_for_engine(engine), monkeypatch)
+    finally:
+        await engine.dispose()
+
+
+async def _cancel_a_write_then_write_elsewhere(engine, store, monkeypatch) -> None:
+    """Cancel a store write mid-transaction, keep its traceback, then write from another engine."""
     await store.create_run("parent", "agent")
     stepped = asyncio.Event()
     never = asyncio.Event()
