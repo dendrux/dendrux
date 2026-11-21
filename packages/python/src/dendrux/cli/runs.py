@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from enum import StrEnum
-from typing import Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any
 
 import typer
 from rich.console import Console
@@ -15,6 +15,9 @@ from dendrux._lifecycle import STORAGE_FORMAT_CHECKPOINTED
 from dendrux._redact import mask_database_urls_in
 from dendrux.runtime._bounds import MAX_LIST_OFFSET, MAX_PAGE
 from dendrux.types import RunStatus
+
+if TYPE_CHECKING:
+    from sqlalchemy import ColumnElement, Select
 
 DEFAULT_RUN_LIMIT = 20
 
@@ -42,6 +45,9 @@ def list_runs(
     offset: int = typer.Option(0, "--offset", help="Skip this many runs."),
     status: str = typer.Option("", "--status", "-s", help="Filter by status."),
     tenant: str = typer.Option("", "--tenant", "-t", help="Filter by tenant ID."),
+    exclude_waiting: bool = typer.Option(
+        False, "--exclude-waiting", help="Leave out runs waiting on subagents."
+    ),
     storage_format: Annotated[
         StorageFormat | None, typer.Option("--format", help="Filter by storage format.")
     ] = None,
@@ -54,6 +60,7 @@ def list_runs(
             status or None,
             tenant or None,
             int(storage_format.value) if storage_format else None,
+            include_waiting=not exclude_waiting,
         )
     )
 
@@ -64,6 +71,8 @@ async def _list_runs(
     status: str | None,
     tenant_id: str | None,
     storage_format: int | None = None,
+    *,
+    include_waiting: bool = True,
 ) -> None:
     try:
         from dendrux.db.session import get_engine, reset_engine
@@ -91,32 +100,20 @@ async def _list_runs(
                 limit=max(1, min(limit, MAX_PAGE)),
                 offset=max(0, offset),
                 status=status,
+                include_waiting=include_waiting,
                 **scope,
             )
         else:
-            from sqlalchemy import select
+            from dendrux.runtime.stores.sql._sql_reads import _waiting_for_expression
 
-            from dendrux.db.models import AgentRun
-
-            # Filter before LIMIT/OFFSET without requiring a new store API contract.
-            statement = select(
-                AgentRun.id,
-                AgentRun.agent_name,
-                AgentRun.status,
-                AgentRun.iteration_count,
-                AgentRun.total_input_tokens,
-                AgentRun.total_output_tokens,
-                AgentRun.model,
-                AgentRun.created_at,
-            ).where(AgentRun.storage_format == storage_format)
-            if status:
-                statement = statement.where(AgentRun.status == status)
-            if tenant_id:
-                statement = statement.where(AgentRun.tenant_id == tenant_id)
-            statement = (
-                statement.order_by(AgentRun.created_at.desc(), AgentRun.id.desc())
-                .limit(max(1, min(limit, MAX_PAGE)))
-                .offset(max(0, min(offset, MAX_LIST_OFFSET)))
+            statement = _format_statement(
+                storage_format=storage_format,
+                status=status,
+                tenant_id=tenant_id,
+                limit=limit,
+                offset=offset,
+                waiting_for=_waiting_for_expression(store),
+                include_waiting=include_waiting,
             )
             async with engine.connect() as conn:
                 runs = list(await conn.execute(statement))
@@ -131,6 +128,7 @@ async def _list_runs(
     table.add_column("ID", style="cyan", no_wrap=True)
     table.add_column("Agent", style="bold")
     table.add_column("Status", no_wrap=True)
+    table.add_column("Waiting for", no_wrap=True)
     table.add_column("Iters", justify="right")
     table.add_column("Tokens", justify="right")
     table.add_column("Model")
@@ -152,7 +150,8 @@ async def _list_runs(
         table.add_row(
             escape(run.id),
             escape(run.agent_name),
-            f"[{status_style}]{run.status}[/{status_style}]",
+            f"[{status_style}]{run.status}[/{status_style}]" if status_style else run.status,
+            escape(run.waiting_for) if run.waiting_for else "—",
             str(run.iteration_count),
             f"{total_tokens:,}" if total_tokens else "—",
             run.model or "—",
@@ -160,3 +159,43 @@ async def _list_runs(
         )
 
     console.print(table)
+
+
+def _format_statement(
+    *,
+    storage_format: int,
+    status: str | None,
+    tenant_id: str | None,
+    limit: int,
+    offset: int,
+    waiting_for: ColumnElement[str | None],
+    include_waiting: bool,
+) -> Select[Any]:
+    from dendrux.db.models import AgentRun
+
+    statement = (
+        AgentRun.__table__.select()
+        .with_only_columns(
+            AgentRun.id,
+            AgentRun.agent_name,
+            AgentRun.status,
+            AgentRun.iteration_count,
+            AgentRun.total_input_tokens,
+            AgentRun.total_output_tokens,
+            AgentRun.model,
+            AgentRun.created_at,
+            waiting_for.label("waiting_for"),
+        )
+        .where(AgentRun.storage_format == storage_format)
+    )
+    if status:
+        statement = statement.where(AgentRun.status == status)
+    if tenant_id:
+        statement = statement.where(AgentRun.tenant_id == tenant_id)
+    if not include_waiting:
+        statement = statement.where(waiting_for.is_(None))
+    return (
+        statement.order_by(AgentRun.created_at.desc(), AgentRun.id.desc())
+        .limit(max(1, min(limit, MAX_PAGE)))
+        .offset(max(0, min(offset, MAX_LIST_OFFSET)))
+    )

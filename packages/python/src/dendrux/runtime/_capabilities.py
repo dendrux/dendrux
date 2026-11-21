@@ -15,6 +15,7 @@ from dendrux.errors import StoreCapabilityError
 from dendrux.runtime.state import StoreCapabilities
 
 _REQUIREMENTS: dict[str, dict[str, tuple[str, ...]]] = {
+    "waiting_filter": {"list_runs": ("include_waiting",), "count_runs": ("include_waiting",)},
     "fenced_writes": {
         name: ("claim_epoch",)
         for name in (
@@ -203,3 +204,16 @@ def capabilities(store: Any) -> StoreCapabilities:
     if isinstance(declared, property):
         declared = declared.__get__(store, type(store))
     return declared if isinstance(declared, StoreCapabilities) else StoreCapabilities()
+
+
+def waiting_filter_options(store: Any, *, include_waiting: bool) -> dict[str, Any]:
+    """Discover the optional filter; preserve legacy signatures for default reads."""
+    if not isinstance(include_waiting, bool):
+        raise TypeError("include_waiting must be a bool")
+    if include_waiting:
+        return {}
+    validate_capabilities(store)
+    if not capabilities(store).waiting_filter:
+        _refuse(store, "waiting_filter", "list_runs/count_runs", ("include_waiting",))
+    # Dynamic kwargs belong to this optional extension, outside the legacy StateStore protocol.
+    return {"include_waiting": False}

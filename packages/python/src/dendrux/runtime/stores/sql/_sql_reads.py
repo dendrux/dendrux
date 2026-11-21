@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING, Any, cast
 
-from sqlalchemy import select
+from sqlalchemy import ColumnElement, and_, case, select
 
 from dendrux._lifecycle import StoredEventType
 from dendrux._meta_keys import (
@@ -14,6 +14,7 @@ from dendrux._meta_keys import (
     OBSERVATION_META_KEY,
     STOP_REASON_META_KEY,
 )
+from dendrux.db.models import AgentRun
 from dendrux.runtime._bounds import DEFAULT_LIST_LIMIT, DEFAULT_READ_LIMIT, MAX_PAGE
 from dendrux.runtime._bounds import IN_CHUNK as _IN_CHUNK
 from dendrux.runtime.durability import _safe_database_call
@@ -42,6 +43,19 @@ if TYPE_CHECKING:
     from datetime import datetime
 
 _TRACE_POSITION_STRIDE = 1000
+
+
+def _waiting_for_expression(store: _StoreHost) -> ColumnElement[str | None]:
+    return case(
+        (
+            and_(
+                AgentRun.status == "paused",
+                store.json_get(AgentRun.pause_data, ["pause_reason"], "str") == "managed_wait",
+            ),
+            "subagents",
+        ),
+        else_=None,
+    )
 
 
 class _SqlReads(_StoreHost):
@@ -343,12 +357,15 @@ class _SqlReads(_StoreHost):
         from dendrux.db.models import AgentRun
 
         async with self._session_factory() as session:
-            stmt = _apply_tenant_scope(select(AgentRun).where(AgentRun.id == run_id), tenant_id)
+            stmt = _apply_tenant_scope(
+                select(AgentRun, _waiting_for_expression(self)).where(AgentRun.id == run_id),
+                tenant_id,
+            )
             result = await session.execute(stmt)
-            row = result.scalar_one_or_none()
+            row = result.one_or_none()
             if row is None:
                 return None
-            return _run_to_record(row)
+            return _run_to_record(row[0], waiting_for=row[1])
 
     async def get_next_trace_index(self, run_id: str) -> int:
         """Read the next trace order from the run/order index, without payloads."""
@@ -546,6 +563,7 @@ class _SqlReads(_StoreHost):
         started_after: datetime | None = None,
         started_before: datetime | None = None,
         metadata_filter: dict[str, Any] | None = None,
+        include_waiting: bool = True,
     ) -> list[RunRecord]:
         """Runs newest first, filtered in SQL. Never loads ``pause_data`` or ``pii_mapping``.
 
@@ -566,7 +584,7 @@ class _SqlReads(_StoreHost):
             # runs share timestamps and offset paging would otherwise skip
             # or duplicate rows across pages.
             stmt = (
-                select(AgentRun)
+                select(AgentRun, _waiting_for_expression(self))
                 .options(
                     defer(AgentRun.pause_data, raiseload=True),
                     defer(AgentRun.pii_mapping, raiseload=True),
@@ -582,12 +600,12 @@ class _SqlReads(_StoreHost):
                 started_after=started_after,
                 started_before=started_before,
                 metadata_filter=metadata_filter,
+                include_waiting=include_waiting,
             )
             stmt = stmt.limit(capped_limit).offset(clamped_offset)
 
             result = await session.execute(stmt)
-            rows = result.scalars().all()
-            return [_run_to_record(r) for r in rows]
+            return [_run_to_record(row, waiting_for=label) for row, label in result.all()]
 
     async def count_pauses_per_run(
         self,
@@ -624,6 +642,7 @@ class _SqlReads(_StoreHost):
         started_after: datetime | None = None,
         started_before: datetime | None = None,
         metadata_filter: dict[str, Any] | None = None,
+        include_waiting: bool = True,
     ) -> int:
         """Count runs matching the ``list_runs`` filters (same tenant semantics)."""
         from sqlalchemy import func, select
@@ -641,6 +660,7 @@ class _SqlReads(_StoreHost):
                 started_after=started_after,
                 started_before=started_before,
                 metadata_filter=metadata_filter,
+                include_waiting=include_waiting,
             )
             result = await session.execute(stmt)
             total = result.scalar_one()
@@ -657,6 +677,7 @@ class _SqlReads(_StoreHost):
         started_after: datetime | None,
         started_before: datetime | None,
         metadata_filter: dict[str, Any] | None = None,
+        include_waiting: bool = True,
     ) -> Any:
         from sqlalchemy import false
 
@@ -669,6 +690,8 @@ class _SqlReads(_StoreHost):
         _require_aware_utc("started_before", started_before)
 
         stmt = _apply_tenant_scope(stmt, tenant_id)
+        if not include_waiting:
+            stmt = stmt.where(_waiting_for_expression(self).is_(None))
         if status is not None:
             if isinstance(status, list):
                 if not status:

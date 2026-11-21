@@ -34,6 +34,7 @@ from dendrux.runtime.state import (
 )
 from dendrux.runtime.stores.sql import _sql_support
 from dendrux.runtime.stores.sql._sql_host import _StoreHost
+from dendrux.runtime.stores.sql._sql_reads import _waiting_for_expression
 from dendrux.runtime.stores.sql._sql_support import logger
 from dendrux.runtime.stores.sql._types import RunParentCursor
 
@@ -269,6 +270,7 @@ class _SqlTree(_StoreHost):
         light: bool,
         max_nodes: int | None,
         loaded: int,
+        waiting_labels: dict[str, str | None] | None = None,
     ) -> list[AgentRun]:
         from sqlalchemy.orm import load_only
 
@@ -277,6 +279,8 @@ class _SqlTree(_StoreHost):
         stmt = _apply_tenant_scope(
             select(AgentRun).where(AgentRun.parent_run_id.in_(parent_ids)), tenant_id
         )
+        if waiting_labels is not None:
+            stmt = stmt.add_columns(_waiting_for_expression(self))
         if light:
             stmt = stmt.options(load_only(AgentRun.id, AgentRun.parent_run_id, AgentRun.tenant_id))
         if max_nodes is not None:
@@ -284,6 +288,10 @@ class _SqlTree(_StoreHost):
         result = await session.execute(
             self._parent_run_query(stmt.order_by(AgentRun.created_at, AgentRun.id))
         )
+        if waiting_labels is not None:
+            rows = result.all()
+            waiting_labels.update((row.id, label) for row, label in rows)
+            return [row for row, _ in rows]
         return list(result.scalars())
 
     async def _bfs_descendants(
@@ -294,6 +302,7 @@ class _SqlTree(_StoreHost):
         tenant_id: TenantScope = UNSCOPED,
         light: bool = False,
         max_nodes: int | None = None,
+        waiting_labels: dict[str, str | None] | None = None,
     ) -> list[tuple[AgentRun, int]]:
         """Descendants of ``root_id`` as ``(row, depth)`` in BFS order, root excluded.
 
@@ -320,6 +329,7 @@ class _SqlTree(_StoreHost):
                         light=light,
                         max_nodes=max_nodes,
                         loaded=len(found) + len(rows),
+                        waiting_labels=waiting_labels,
                     )
                 )
                 if max_nodes is not None and len(found) + len(rows) >= max_nodes:
@@ -448,21 +458,32 @@ class _SqlTree(_StoreHost):
         from dendrux.db.models import AgentRun
 
         async with self._session_factory() as session:
-            stmt = _apply_tenant_scope(select(AgentRun).where(AgentRun.id == run_id), tenant_id)
-            root = (await session.execute(stmt)).scalar_one_or_none()
-            if root is None:
+            stmt = _apply_tenant_scope(
+                select(AgentRun, _waiting_for_expression(self)).where(AgentRun.id == run_id),
+                tenant_id,
+            )
+            row = (await session.execute(stmt)).one_or_none()
+            if row is None:
                 return None
+            root, label = row
+            waiting_labels = {root.id: label}
 
             rows = [
                 (root, 0),
                 *await self._bfs_descendants(
-                    session, root.id, tenant_id=tenant_id, max_nodes=max_nodes
+                    session,
+                    root.id,
+                    tenant_id=tenant_id,
+                    max_nodes=max_nodes,
+                    waiting_labels=waiting_labels,
                 ),
             ]
             usage = await self._usage_by_run(session, [r.id for r, _ in rows])
             nodes = [
                 SubtreeNodeRecord(
-                    run=_run_to_record(r), depth=d, usage=usage.get(r.id, UsageRollup())
+                    run=_run_to_record(r, waiting_for=waiting_labels[r.id]),
+                    depth=d,
+                    usage=usage.get(r.id, UsageRollup()),
                 )
                 for r, d in rows
             ]
