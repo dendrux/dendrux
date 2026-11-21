@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 from pydantic import BaseModel, field_validator
+from pydantic_core import PydanticCustomError
 
 from dendrux import Agent, SingleCall
 from dendrux.llm.mock import MockLLM
@@ -31,6 +32,15 @@ class Strict(BaseModel):
         raise ValueError(f"rejected {value} {SENTINEL}-validator")
 
 
+class CustomType(BaseModel):
+    label: str
+
+    @field_validator("label")
+    @classmethod
+    def _typed(cls, value: str) -> str:
+        raise PydanticCustomError(f"bad_{value}", "rejected")
+
+
 class Plain(BaseModel):
     count: int
 
@@ -43,6 +53,7 @@ class Forbid(BaseModel):
 _CASES: dict[str, tuple[type[BaseModel], str]] = {
     "custom_validator": (Strict, f'{{"count": 1, "label": "{SENTINEL}-label"}}'),
     "type_error": (Plain, f'{{"count": "{SENTINEL}-count"}}'),
+    "custom_error_type": (CustomType, f'{{"label": "{SENTINEL}-kind"}}'),
     "bad_json": (Plain, f"{{not json {SENTINEL}"),
     "extra_key": (Forbid, f'{{"count": 1, "{SENTINEL}-key": 2}}'),
 }
@@ -101,3 +112,10 @@ async def test_message_names_error_kinds_and_field_locations() -> None:
     assert "Plain" in str(info.value)
     assert "count" in info.value.validation_error
     assert "int_parsing" in info.value.validation_error
+
+
+def test_known_error_types_are_kept_and_unknown_ones_named_custom_error() -> None:
+    from dendrux.llm.structured import _safe_error_type
+
+    assert _safe_error_type("int_parsing") == "int_parsing"
+    assert _safe_error_type(f"bad_{SENTINEL}") == "custom_error"

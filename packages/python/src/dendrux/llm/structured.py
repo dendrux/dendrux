@@ -10,9 +10,10 @@ agents — only knows about providers and Pydantic models.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar, get_args
 
 from pydantic import BaseModel, ValidationError
+from pydantic_core.core_schema import ErrorType
 
 from dendrux.llm._calls import complete_call
 from dendrux.types import StructuredOutputValidationError
@@ -24,6 +25,12 @@ if TYPE_CHECKING:
 T = TypeVar("T", bound=BaseModel)
 
 _MAX_SUMMARISED_ERRORS = 10
+_KNOWN_ERROR_TYPES = frozenset(get_args(ErrorType))
+
+
+def _safe_error_type(error_type: str) -> str:
+    """Keep Pydantic's built-in error kinds; a custom kind may be built from model text."""
+    return error_type if error_type in _KNOWN_ERROR_TYPES else "custom_error"
 
 
 def _declared_names(node: object, names: set[str]) -> set[str]:
@@ -52,7 +59,7 @@ def _value_free_summary(exc: ValidationError, schema: dict[str, Any]) -> str:
     parts = []
     for item in errors[:_MAX_SUMMARISED_ERRORS]:
         loc = ".".join(str(p) if isinstance(p, int) or p in declared else "*" for p in item["loc"])
-        parts.append(f"{loc or '<root>'}: {item['type']}")
+        parts.append(f"{loc or '<root>'}: {_safe_error_type(item['type'])}")
     more = len(errors) - len(parts)
     suffix = f"; and {more} more" if more > 0 else ""
     count = len(errors)
