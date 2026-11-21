@@ -279,7 +279,6 @@ def test_safe_exception_reporting_is_not_flagged(tmp_path: Path) -> None:
 # Each test builds one scratch tree and runs Semgrep once. ---
 
 _FUNCTION = "async def {name}(store, run_id, code, name, text):\n    {body}\n\n"
-_METHOD = "class {cls}:\n    async def {name}(self, store, run_id):\n        {body}\n\n"
 _FAIL = "await store.finalize_run(run_id, status=RunStatus.ERROR.value)"
 _REBUILD = "await store.finalize_with_event(run_id, status=RunStatus.ERROR.value, event_type=EV)"
 _CANCEL = "await store.finalize_run(run_id, status=RunStatus.CANCELLED.value)"
@@ -332,7 +331,14 @@ ALLOWED_COPIES = [
         "_pause_with_event",
         _CANCEL,
     ),
-    ("cancel-finalize-outside-helper", "agent.py", _METHOD, "Agent", "_cancel_one", _CANCEL),
+    (
+        "cancel-finalize-outside-helper",
+        "runtime/_cancel.py",
+        _FUNCTION,
+        "",
+        "cancel_one",
+        _CANCEL,
+    ),
     ("run-started-outside-startup", "runtime/runner.py", _FUNCTION, "", "_start_new_run", _STARTED),
     (
         "new-run-fingerprint-outside-helper",

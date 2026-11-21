@@ -188,7 +188,7 @@ and run.error.
 | `new-run-fingerprint-outside-helper` | `compute_idempotency_fingerprint(` and the output-type name f-string under `runtime/`, `agent.py`, `loops/`, outside `_new_run_metadata`; kept: `_idempotent_hit_after_image_error` |
 | `run-started-outside-startup` | `StoredEventType.RUN_STARTED` passed to an event write (also through a local writer alias) outside `_start_new_run` |
 | `error-finalize-outside-helper` | finalizing with the error status, or writing `run.error`, outside `_persist_run_failure`; kept: `_reclaim._handle_rebuild_failure` |
-| `cancel-finalize-outside-helper` | finalizing with the cancelled status outside `_persist_run_cancellation`; kept: `_finalize_loop_cancelled`, `_pause_with_event`, `Agent._cancel_one` |
+| `cancel-finalize-outside-helper` | finalizing with the cancelled status outside `_persist_run_cancellation`; kept: `_finalize_loop_cancelled`, `_pause_with_event`, `_cancel.cancel_one` |
 
 `hardcoded-terminal-status-set` also matches `RunStatus.X.value` operands.
 

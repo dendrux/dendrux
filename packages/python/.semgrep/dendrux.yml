@@ -403,7 +403,7 @@ rules:
         - "dendrux.runtime._run_events:_persist_run_cancellation"
         - "dendrux.runtime._run_outcome:_finalize_loop_cancelled"
         - "dendrux.runtime._run_events:_pause_with_event"
-        - "dendrux.agent:Agent._cancel_one"
+        - "dendrux.runtime._cancel:cancel_one"
     patterns:
       - pattern: $F(..., status=$V, ...)
       - metavariable-regex:
