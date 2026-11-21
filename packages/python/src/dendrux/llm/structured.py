@@ -23,6 +23,41 @@ if TYPE_CHECKING:
 
 T = TypeVar("T", bound=BaseModel)
 
+_MAX_SUMMARISED_ERRORS = 10
+
+
+def _declared_names(node: object, names: set[str]) -> set[str]:
+    """Collect every property name a JSON Schema declares, at any depth."""
+    if isinstance(node, dict):
+        props = node.get("properties")
+        if isinstance(props, dict):
+            names.update(key for key in props if isinstance(key, str))
+        for value in node.values():
+            _declared_names(value, names)
+    elif isinstance(node, list):
+        for item in node:
+            _declared_names(item, names)
+    return names
+
+
+def _value_free_summary(exc: ValidationError, schema: dict[str, Any]) -> str:
+    """Describe a validation failure by error kind and location only.
+
+    Pydantic's own text carries the rejected input and custom validator
+    messages, both model output. Locations keep only names the schema
+    declares (a model-chosen key shows as ``*``) and list indexes.
+    """
+    declared = _declared_names(schema, set())
+    errors = exc.errors(include_input=False, include_url=False, include_context=False)
+    parts = []
+    for item in errors[:_MAX_SUMMARISED_ERRORS]:
+        loc = ".".join(str(p) if isinstance(p, int) or p in declared else "*" for p in item["loc"])
+        parts.append(f"{loc or '<root>'}: {item['type']}")
+    more = len(errors) - len(parts)
+    suffix = f"; and {more} more" if more > 0 else ""
+    count = len(errors)
+    return f"{count} validation error{'s' if count != 1 else ''} ({'; '.join(parts)}{suffix})"
+
 
 async def structured_complete(
     provider: LLMProvider,
@@ -78,7 +113,7 @@ async def structured_complete(
         error = StructuredOutputValidationError(
             raw_response=raw_text,
             output_type_name=output_type.__name__,
-            validation_error=str(exc),
+            validation_error=_value_free_summary(exc, schema),
             usage=response.usage,
             model=response.model,
             stop_reason=response.stop_reason,
