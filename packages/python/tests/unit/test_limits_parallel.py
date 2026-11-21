@@ -115,3 +115,8 @@ def test_default_parallel_limit_is_not_governed():
 def test_parallel_limit_override_is_governed():
     assert _governed_limits(Limits(max_parallel_subagents=8))["max_parallel_subagents"] == 8
     assert _governed_limits(Limits(max_parallel_subagents=16))["max_parallel_subagents"] == 16
+
+
+def test_fanout_diagnostic_refuses_legacy_count_field():
+    with pytest.raises(ValueError, match="Invalid structured log fields"):
+        _codes.log_code(logging.getLogger("dendrux.test"), _codes.MANAGED_FANOUT_LIMIT, count=2)

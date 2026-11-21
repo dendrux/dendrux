@@ -231,7 +231,7 @@ async def test_two_managed_calls_are_refused_with_fanout_limit_and_counts(caplog
     assert len(recorder.results) == 2
     for result in recorder.results:
         assert result.meta == {
-            "code": "managed_batch_unsupported",
+            "code": "managed_fanout_limit",
             "reason": "fanout_limit",
             "limit": 1,
             "requested": 2,
@@ -239,8 +239,11 @@ async def test_two_managed_calls_are_refused_with_fanout_limit_and_counts(caplog
         body = json.loads(result.payload)
         assert body["reason"] == "fanout_limit"
         assert (body["limit"], body["requested"]) == (1, 2)
-        assert body["error"] == _managed_batch._MANAGED_BATCH_MESSAGE
-    assert "managed_batch_unsupported" in caplog.text
+        assert body["error"] == (
+            "Refused: 2 subagent calls in one response; the limit is 1. "
+            "Call at most 1 subagent at once."
+        )
+    assert "managed_batch_unsupported" not in caplog.text
     assert "managed_fanout_limit" in caplog.text
     assert BRIEF not in caplog.text
 
@@ -318,3 +321,29 @@ def test_invalid_subagent_entry_is_refused_before_exclusive_names(exclusive: Any
             exclusive_subagents=exclusive,
         )
     assert info.value.reason == "not_agent"
+
+
+@pytest.mark.parametrize("limit", [1, 2, 4, 32])
+def test_fanout_refusal_code_is_distinct(limit):
+    result = _managed_batch._managed_batch_result(
+        ToolCall("a", {"task": BRIEF}),
+        BatchDecision("refuse", limit + 1, "fanout_limit"),
+        limit=limit,
+    )
+    assert result.meta["code"] == "managed_fanout_limit"
+
+
+@pytest.mark.parametrize("limit", [1, 2, 4, 32])
+def test_fanout_refusal_text_states_requested_count_and_limit(limit):
+    result = _managed_batch._managed_batch_result(
+        ToolCall("a", {"task": BRIEF}),
+        BatchDecision("refuse", limit + 1, "fanout_limit"),
+        limit=limit,
+    )
+    subagents = "subagent" if limit == 1 else "subagents"
+    expected = (
+        f"Refused: {limit + 1} subagent calls in one response; the limit is {limit}. "
+        f"Call at most {limit} {subagents} at once."
+    )
+    assert result.error == json.loads(result.payload)["error"] == expected
+    assert BRIEF not in result.payload

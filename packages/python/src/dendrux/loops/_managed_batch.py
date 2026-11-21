@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, TypedDict, cast
 
 from dendrux import _codes
 from dendrux.loops import _pause_shared
@@ -36,8 +36,8 @@ _MANAGED_BATCH_MESSAGE = (
 )
 
 _FANOUT_LIMIT_MESSAGE = (
-    "Too many subagent calls in one turn (at most {limit}). "
-    "No tool in this batch ran; call fewer subagents per turn."
+    "Refused: {requested} subagent calls in one response; the limit is {limit}. "
+    "Call at most {limit} {subagents} at once."
 )
 
 _EXCLUSIVE_MESSAGE = (
@@ -193,9 +193,45 @@ def _managed_batch_unsupported(calls: Sequence[ToolCall], lookups: ToolLookups) 
 def _refusal_message(decision: BatchDecision, limit: int) -> str:
     if decision.reason == "exclusive":
         return _EXCLUSIVE_MESSAGE
-    if decision.reason == "fanout_limit" and limit > 1:
-        return _FANOUT_LIMIT_MESSAGE.format(limit=limit)
+    if decision.reason == "fanout_limit":
+        return _FANOUT_LIMIT_MESSAGE.format(
+            requested=decision.count,
+            limit=limit,
+            subagents="subagent" if limit == 1 else "subagents",
+        )
     return _MANAGED_BATCH_MESSAGE
+
+
+def refusal_code(decision: BatchDecision | None) -> _codes.Code:
+    """The stable diagnostic for a refusal, shared by results and both log paths."""
+    if decision is not None and decision.reason == "fanout_limit":
+        return _codes.MANAGED_FANOUT_LIMIT
+    return _codes.MANAGED_BATCH_UNSUPPORTED
+
+
+class _RefusalLogFields(TypedDict, total=False):
+    count: int
+    requested: int
+    limit: int
+    store_capability: bool
+
+
+def log_refusal(
+    logger: logging.Logger,
+    run_id: str,
+    decision: BatchDecision | None,
+    *,
+    count: int,
+    limit: int,
+    store_capability: bool | None = None,
+) -> None:
+    """Log original fan-out counts, or the refused batch size for other reasons."""
+    fields: _RefusalLogFields = {"count": count}
+    if decision is not None and decision.reason == "fanout_limit":
+        fields = {"requested": decision.count, "limit": limit}
+        if store_capability is not None:
+            fields["store_capability"] = store_capability
+    _codes.log_code(logger, refusal_code(decision), run_id=run_id, **fields)
 
 
 def _managed_batch_result(
@@ -208,7 +244,7 @@ def _managed_batch_result(
         body["reason"] = decision.reason
         if decision.reason == "fanout_limit":
             body["limit"], body["requested"] = limit, decision.count
-    meta = {"code": MANAGED_BATCH_UNSUPPORTED, **{k: v for k, v in body.items() if k != "error"}}
+    meta = {"code": refusal_code(decision).name, **{k: v for k, v in body.items() if k != "error"}}
     return ToolResult(
         name=tc.name,
         call_id=tc.id,
@@ -223,23 +259,24 @@ async def refuse_managed_batch(
     calls: Sequence[ToolCall], batch: _ToolBatch, decision: BatchDecision, policy: BatchPolicy
 ) -> None:
     """Answer every call of a refused batch before any hook, approval or effect."""
-    _codes.log_code(
-        logger,
-        _codes.MANAGED_BATCH_UNSUPPORTED,
-        run_id=batch.run_id,
-        count=len(calls),
-        reason=decision.reason,
-        limit=policy.limit,
-        requested=decision.count,
-    )
     if decision.reason == "fanout_limit":
-        _codes.log_code(
+        log_refusal(
             logger,
-            _codes.MANAGED_FANOUT_LIMIT,
-            run_id=batch.run_id,
-            requested=decision.count,
+            batch.run_id,
+            decision,
+            count=len(calls),
             limit=policy.limit,
             store_capability=policy.fanout_capable,
+        )
+    else:
+        _codes.log_code(
+            logger,
+            refusal_code(decision),
+            run_id=batch.run_id,
+            count=len(calls),
+            reason=decision.reason,
+            limit=policy.limit,
+            requested=decision.count,
         )
     mark = getattr(batch.recorder, "mark_managed_refusal", None)
     if mark is not None:
