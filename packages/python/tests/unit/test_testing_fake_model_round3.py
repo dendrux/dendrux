@@ -16,7 +16,7 @@ from dendrux import Agent
 from dendrux.db.models import Base
 from dendrux.loops.single import SingleCall
 from dendrux.runtime.stores._factory import store_for_engine
-from dendrux.testing import FakeModel, FakeModelScriptError, structured
+from dendrux.testing import FakeModel, FakeModelScriptError, say, structured, when
 from dendrux.testing._schema_check import SchemaUnsupportedError, first_mismatch
 from dendrux.types import Message, Role
 
@@ -267,3 +267,60 @@ async def test_saved_run_errors_and_all_events_are_value_free(tmp_path, model, s
     finally:
         await agent.close()
         await engine.dispose()
+
+
+# ---- R2: predicates are the same only when they are the same object ----
+
+
+def module_level_predicate(messages: list[Message]) -> bool:
+    return True
+
+
+def test_a_shared_module_level_predicate_certifies_a_rebuilt_script():
+    left = FakeModel({"a": [when(module_level_predicate, say("answer"))]})
+    right = FakeModel({"a": [when(module_level_predicate, say("answer"))]})
+    left.assert_no_script_errors(right)
+
+
+def test_equal_looking_closures_are_different_predicates():
+    def factory():
+        return lambda messages: True
+
+    left = FakeModel({"a": [when(factory(), say("answer"))]})
+    right = FakeModel({"a": [when(factory(), say("answer"))]})
+    with pytest.raises(AssertionError, match="same script"):
+        left.assert_no_script_errors(right)
+
+
+async def test_globals_in_a_pure_predicate_cannot_certify_another_script():
+    body = "def predicate(messages): return ENABLED"
+    off: dict[str, object] = {"ENABLED": False}
+    on: dict[str, object] = {"ENABLED": True}
+    exec(body, off)  # noqa: S102 - two fixture modules with one body and different config
+    exec(body, on)  # noqa: S102
+    expected = FakeModel({"a": [when(off["predicate"], say("answer"))]})
+    other = FakeModel({"a": [when(on["predicate"], say("answer"))]})
+    await other.provider("a").complete(history())
+    with pytest.raises(AssertionError, match="same script"):
+        expected.assert_all_used(other)
+
+
+class Config:
+    def __init__(self, enabled: bool) -> None:
+        self.enabled = enabled
+
+    def __repr__(self) -> str:
+        return "<Config>"
+
+
+def configured_predicate(enabled: bool):
+    config = Config(enabled)
+    return lambda messages, config=config: config.enabled
+
+
+async def test_non_plain_predicate_defaults_cannot_certify_another_script():
+    expected = FakeModel({"a": [when(configured_predicate(False), say("answer"))]})
+    other = FakeModel({"a": [when(configured_predicate(True), say("answer"))]})
+    await other.provider("a").complete(history())
+    with pytest.raises(AssertionError, match="same script"):
+        expected.assert_all_used(other)

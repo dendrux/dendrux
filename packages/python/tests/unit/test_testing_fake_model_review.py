@@ -329,9 +329,13 @@ async def test_assert_all_used_refuses_a_different_script():
     assert "SENTINEL" not in str(info.value) and "same script" in str(info.value)
 
 
+def always(messages: list) -> bool:
+    return True
+
+
 async def test_assert_all_used_accepts_a_rebuilt_equal_script():
     def script():
-        return {"a": [say("x"), when(lambda m: True, call("t", n=1))]}
+        return {"a": [say("x"), when(always, call("t", n=1))]}
 
     first, second = FakeModel(script()), FakeModel(script())
     await first.provider("a").complete(history())

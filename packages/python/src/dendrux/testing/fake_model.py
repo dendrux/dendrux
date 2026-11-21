@@ -6,7 +6,6 @@ import copy
 import dataclasses
 import hashlib
 import json
-import types
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -103,6 +102,10 @@ def when(predicate: Callable[[list[Message]], bool], response: _Step | LLMRespon
     whose predicate is true answers; otherwise the plain entry answers; with
     neither, the call raises ``FakeModelScriptError``. Plain entries keep one
     slot each. The predicate must be pure: it may run on any process.
+
+    ``assert_all_used`` across instances treats two predicates as the same only
+    when they are the same object. Define predicates at module level, so a script
+    rebuilt for a second process uses the same functions.
     """
     if not callable(predicate):
         raise TypeError("when() needs a callable predicate")
@@ -132,26 +135,6 @@ def _usage(messages: Sequence[Message], text: str | None) -> UsageStats:
     )
 
 
-def _code_key(code: Any) -> Any:
-    consts = [_code_key(c) if hasattr(c, "co_code") else repr(c) for c in code.co_consts]
-    return [code.co_code.hex(), consts, list(code.co_names)]
-
-
-def _callable_key(fn: Any) -> Any:
-    """Conservative identity for a predicate: same code and same plain captured values.
-
-    Anything else (callable objects, bound methods, closures over objects) is the same
-    only when it is the same object, so a rebuilt script with such a predicate is refused.
-    """
-    if isinstance(fn, types.FunctionType):
-        cells = [c.cell_contents for c in fn.__closure__ or ()]
-        if all(isinstance(v, (bool, int, float, str, bytes, type(None))) for v in cells):
-            defaults = [fn.__defaults__, fn.__kwdefaults__]
-            return ["fn", _code_key(fn.__code__), cells, repr(defaults)]
-    owner = getattr(fn, "__self__", None)
-    return ["obj", id(owner if owner is not None else fn), getattr(fn, "__name__", "")]
-
-
 def _response_key(entry: LLMResponse) -> Any:
     fields = {
         f.name: getattr(entry, f.name)
@@ -166,7 +149,9 @@ def _step_key(entry: Entry) -> Any:
     if isinstance(entry, _Step):
         return ["step", entry.text, entry.structured, [list(c) for c in entry.calls]]
     if isinstance(entry, _When):
-        return ["when", _callable_key(entry.predicate), _step_key(entry.response)]
+        # A predicate is the same only when it is the same object: equal-looking code
+        # can read different globals or captured objects.
+        return ["when", id(entry.predicate), _step_key(entry.response)]
     return ["raw", _response_key(entry)]
 
 
@@ -213,7 +198,8 @@ class FakeModel:
         Pass the agent's ``output_type`` to check every ``structured(...)`` answer with
         the real Pydantic type, as ``SingleCall`` will. Without it, the answer is checked
         against the call's ``output_schema`` by a small checker that refuses (code
-        ``unsupported_schema``) any schema keyword it cannot judge, such as ``pattern``.
+        ``unsupported_schema``) any schema keyword or form outside its allowlist, such
+        as ``format`` or ``pattern``.
         """
         if name not in self._slots:
             raise FakeModelScriptError(
@@ -252,8 +238,9 @@ class FakeModel:
 
         After a simulated second process, pass the first instance as ``others``:
         each instance only sees the calls made through it. Every instance must be
-        built from the same script, otherwise the check is refused. A slot counts
-        as used when one of its alternatives answered.
+        built from the same script, otherwise the check is refused: equal data,
+        and ``when`` predicates that are the same objects. A slot counts as used
+        when one of its alternatives answered.
         """
         self.assert_no_script_errors(*others)
         unused = []

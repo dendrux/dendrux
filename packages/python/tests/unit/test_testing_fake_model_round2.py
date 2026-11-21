@@ -135,12 +135,6 @@ def test_fingerprint_distinguishes_captured_predicate_values():
         expected.assert_no_script_errors(other)
 
 
-def test_fingerprint_accepts_an_equal_rebuilt_predicate():
-    left = FakeModel({"a": [when(predicate(True), say("answer"))]})
-    right = FakeModel({"a": [when(predicate(True), say("answer"))]})
-    left.assert_no_script_errors(right)
-
-
 @pytest.mark.parametrize("field", ["stop_reason", "reasoning"])
 async def test_fingerprint_distinguishes_behavioral_raw_fields(field):
     values = {"stop_reason": ("end_turn", "max_tokens"), "reasoning": ("one", "two")}
