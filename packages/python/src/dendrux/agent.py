@@ -33,17 +33,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, overload
 
 from dendrux import _codes
-from dendrux._lifecycle import (
-    PAUSE_STATUS_VALUES,
-    CancelReason,
-    PauseReason,
-    StoredEventType,
-)
 from dendrux._lifecycle import TERMINAL_STATUSES as _TERMINAL_STATUSES
 from dendrux._lifecycle import WAITING_STATUSES as _WAITING_STATUS_VALUES
+from dendrux._lifecycle import PauseReason
 from dendrux._sentinel import _OMITTED, _OmittedType, _UnsetType
 from dendrux.media._store import DEFAULT_GC_AGE, DEFAULT_GC_LIMIT
-from dendrux.runtime import _managed, _managed_budget, _managed_cancel, _managed_route
+from dendrux.runtime import _cancel, _managed, _managed_budget, _managed_cancel, _managed_route
 from dendrux.runtime._blob_catalog import MIN_GC_AGE
 from dendrux.runtime._continuation_guardrails import _continuation_projection
 from dendrux.runtime._entry_checks import entry_checks, require_boolean
@@ -60,7 +55,7 @@ from dendrux.runtime.state import UNSCOPED, ReclaimableRun, TenantScope, require
 from dendrux.skills._internal import is_script, validate_executor
 from dendrux.skills._session import NAMES, SkillSession, continuation, current
 from dendrux.tool import get_tool_def, is_tool
-from dendrux.types import ULID_CHARS, RunStatus
+from dendrux.types import ULID_CHARS, Budget, RunStatus
 
 DEFAULT_MAX_ITERATIONS = 10
 DEFAULT_TOOL_THREADS_PER_AGENT = 8
@@ -91,7 +86,6 @@ if TYPE_CHECKING:
     from dendrux.types import (
         ApprovalDecision,
         BeforeToolHook,
-        Budget,
         ImageRef,
         Limits,
         PauseOutcome,
@@ -240,38 +234,6 @@ def _skipped_source_entry(source: Any, exc: Exception) -> dict[str, Any]:
     if isinstance(exc, MCPAuthorizationRequired):
         entry["reason"] = exc.reason
     return entry
-
-
-def _record_to_run_result(record: Any) -> RunResult:
-    """Project a RunRecord onto a RunResult for cancel/no-op return paths."""
-    from dendrux.types import RunResult, RunStatus, UsageStats
-
-    usage = UsageStats(
-        input_tokens=record.total_input_tokens,
-        output_tokens=record.total_output_tokens,
-        total_tokens=record.total_input_tokens + record.total_output_tokens,
-        cost_usd=record.total_cost_usd,
-        cache_read_input_tokens=record.total_cache_read_tokens,
-        cache_creation_input_tokens=record.total_cache_creation_tokens,
-    )
-    from dendrux.runtime.runner import _error_info_from_meta, _stop_reason_from_meta
-
-    status = RunStatus(record.status)
-    return RunResult(
-        run_id=record.id,
-        status=status,
-        answer=record.answer,
-        error=record.error,
-        error_info=_error_info_from_meta(record.meta),
-        iteration_count=record.iteration_count,
-        usage=usage,
-        meta={"cancel_requested": bool(record.cancel_requested)},
-        stop_reason=(
-            _stop_reason_from_meta(getattr(record, "meta", None))
-            if status == RunStatus.SUCCESS
-            else None
-        ),
-    )
 
 
 async def _verify_schema_initialized(engine: AsyncEngine, url: str) -> None:
@@ -2522,7 +2484,7 @@ class Agent:
         )
         if record is None or record.agent_name != self.name:
             raise RunNotFoundError(run_id)
-        result = _record_to_run_result(record)
+        result = _cancel.record_to_run_result(record)
         result.recovery = await _recovery_info(store, record, best_effort=False)
         mapping = await facade.get_pii_mapping(run_id, tenant_id=tenant_id) or {}
         result.answer = deanonymize_text(record.answer, mapping)[0]
@@ -2628,122 +2590,19 @@ class Agent:
         tenant_id = entry_checks(
             self, "cancel_run", tenant_id, default_tenant=UNSCOPED, run_id=run_id
         )
-        from dendrux.errors import PersistenceNotConfiguredError, RunNotFoundError
+        from dendrux.errors import PersistenceNotConfiguredError
 
         store = await self._resolve_state_store()
         if store is None:
             raise PersistenceNotConfiguredError()
-
-        # Preflight: distinguish missing from terminal so callers get
-        # specific errors / no-op behavior without ambiguity.
-        record = await store.get_run(run_id)
-        if record is None or not _in_tenant_scope(record, tenant_id):
-            raise RunNotFoundError(run_id)
-        cascade, pages = await _managed_cancel.cancel_scope(store, record, cascade=cascade)
-        outcomes: list[dict[str, str]] = []
-        cascade_count = 0
-        to_signal: list[str] = []
-        frontier_signals = cascade and _managed_cancel.can_mark_cancel(store)
-        try:
-            traversal_truncated = False
-            if cascade:
-                cascade_count, traversal_truncated = await self._cancel_descendant_outcomes(
-                    store,
-                    run_id,
-                    record.tenant_id,
-                    frontier_signals,
-                    outcomes,
-                    to_signal,
-                    pages,
-                )
-
-            if record.status in _TERMINAL_STATUSES:
-                outcomes.append({"run_id": run_id, "outcome": "terminal"})
-            else:
-                outcome = await self._cancel_one(store, run_id, signal=False)
-                if outcome != "terminal" and not frontier_signals:
-                    to_signal.append(run_id)
-                outcomes.append({"run_id": run_id, "outcome": outcome})
-            if cascade or record.status not in _TERMINAL_STATUSES:
-                record = await store.get_run(run_id)
-                if record is None:  # pragma: no cover — concurrent deletion
-                    raise RunNotFoundError(run_id)
-            result = _record_to_run_result(record)
-            from dendrux.runtime.runner import _recovery_info
-
-            result.recovery = await _recovery_info(store, record)
-            if result.status.value in _TERMINAL_STATUSES:
-                from dendrux.runtime.runner import _attach_undelivered_notes
-
-                await _attach_undelivered_notes(store, run_id, result)
-            if cascade:
-                result.meta["cascade"] = outcomes
-                result.meta["cascade_count"] = cascade_count + 1
-                result.meta["cascade_truncated"] = traversal_truncated or cascade_count + 1 > len(
-                    outcomes
-                )
-            return result
-        finally:
-            for rid in to_signal:
-                self._task_manager.cancel(rid)
-
-    async def _cancel_descendant_outcomes(
-        self,
-        store: StateStore,
-        run_id: str,
-        tenant_id: str | None,
-        frontier_signals: bool,
-        outcomes: list[dict[str, str]],
-        to_signal: list[str],
-        pages: _managed_cancel.CancelPageReader | None = None,
-    ) -> tuple[int, bool]:
-        return await _managed_cancel.cancel_descendants(
-            self, store, run_id, tenant_id, frontier_signals, outcomes, to_signal, pages
+        return await _cancel.cancel_run(
+            store,
+            run_id,
+            tenant_id=tenant_id,
+            cascade=cascade,
+            max_nodes=self._budget.max_subtree_nodes if self._budget else Budget.max_subtree_nodes,
+            signal=self._task_manager.cancel,
         )
-
-    async def _mark_cancel_subtree(
-        self,
-        store: StateStore,
-        run_id: str,
-        *,
-        tenant_id: str | None,
-        pages: _managed_cancel.CancelPageReader | None = None,
-    ) -> tuple[list[list[str]], bool]:
-        return await _managed_cancel.mark_subtree(
-            self, store, run_id, tenant_id=tenant_id, pages=pages
-        )
-
-    async def _cancel_one(self, store: StateStore, run_id: str, *, signal: bool = True) -> str:
-        """Cancel one run: set the flag, CAS-finalize it if paused, signal in-process."""
-        from dendrux.types import RunStatus
-
-        # Set cooperative cancel flag (observed by runner checkpoints) AND
-        # attempt atomic CAS finalize over the paused statuses. If paused:
-        # CAS wins instantly. If running: CAS misses, the runner sees the
-        # flag at its next checkpoint and finalizes itself.
-        if not await store.request_cancel(run_id):
-            return "terminal"
-        # Paused-run cancel: we own the terminal event, written in the CAS's
-        # transaction (sequence allocated under the row lock) so it always
-        # sorts after the runner's run.paused. Running-run cancel: the runner
-        # emits run.cancelled at a checkpoint.
-        from dendrux.runtime.runner import _transition_with_event
-
-        try:
-            cancel_won = await _transition_with_event(
-                store,
-                run_id,
-                status=RunStatus.CANCELLED.value,
-                allowed_current_statuses=list(PAUSE_STATUS_VALUES),
-                event_type=StoredEventType.RUN_CANCELLED.value,
-                event_data={"reason": CancelReason.CANCEL_REQUESTED.value},
-            )
-        except BaseException:
-            self._task_manager.cancel(run_id)
-            raise
-        if signal:
-            self._task_manager.cancel(run_id)
-        return RunStatus.CANCELLED.value if cancel_won else CancelReason.CANCEL_REQUESTED.value
 
     async def request_pause(
         self,
