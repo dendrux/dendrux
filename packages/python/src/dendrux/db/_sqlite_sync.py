@@ -35,7 +35,12 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.schema import CreateColumn, CreateIndex, DefaultClause
 from sqlalchemy.sql.elements import False_, Null, TextClause, True_
 
-from dendrux.db._pool_guard import close_fully, serialized, shares_one_connection
+from dendrux.db._pool_guard import (
+    close_fully,
+    guard_sqlite_closes,
+    serialized,
+    shares_one_connection,
+)
 from dendrux.db._schema_check import ensure_schema_current
 from dendrux.db._settings import seed_settings
 from dendrux.db._storage_schema import ACTIVATION_INDEXES
@@ -69,6 +74,7 @@ async def create_sqlite_schema(engine: AsyncEngine) -> None:
     """
     if engine.dialect.name != "sqlite":
         return
+    guard_sqlite_closes(engine)
     if not shares_one_connection(engine):
         async with engine.connect() as conn:
             await conn.run_sync(create_sqlite_schema_sync)
