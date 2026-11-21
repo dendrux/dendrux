@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 
 T = TypeVar("T", bound=BaseModel)
 
-_MAX_SUMMARISED_ERRORS = 10
+_MAX_SUMMARISED_KINDS = 10
 _KNOWN_ERROR_TYPES = frozenset(get_args(ErrorType))
 
 
@@ -33,37 +33,20 @@ def _safe_error_type(error_type: str) -> str:
     return error_type if error_type in _KNOWN_ERROR_TYPES else "custom_error"
 
 
-def _declared_names(node: object, names: set[str]) -> set[str]:
-    """Collect every property name a JSON Schema declares, at any depth."""
-    if isinstance(node, dict):
-        props = node.get("properties")
-        if isinstance(props, dict):
-            names.update(key for key in props if isinstance(key, str))
-        for value in node.values():
-            _declared_names(value, names)
-    elif isinstance(node, list):
-        for item in node:
-            _declared_names(item, names)
-    return names
-
-
-def _value_free_summary(exc: ValidationError, schema: dict[str, Any]) -> str:
-    """Describe a validation failure by error kind and location only.
+def _value_free_summary(exc: ValidationError) -> str:
+    """Describe a validation failure by error count and kinds only.
 
     Pydantic's own text carries the rejected input and custom validator
-    messages, both model output. Locations keep only names the schema
-    declares (a model-chosen key shows as ``*``) and list indexes.
+    messages, and error locations can hold model-chosen keys, so neither is
+    copied. Kinds are allowlisted, deduplicated in first-seen order and capped.
     """
-    declared = _declared_names(schema, set())
     errors = exc.errors(include_input=False, include_url=False, include_context=False)
-    parts = []
-    for item in errors[:_MAX_SUMMARISED_ERRORS]:
-        loc = ".".join(str(p) if isinstance(p, int) or p in declared else "*" for p in item["loc"])
-        parts.append(f"{loc or '<root>'}: {_safe_error_type(item['type'])}")
-    more = len(errors) - len(parts)
-    suffix = f"; and {more} more" if more > 0 else ""
+    kinds = list(dict.fromkeys(_safe_error_type(item["type"]) for item in errors))
+    shown = ", ".join(kinds[:_MAX_SUMMARISED_KINDS])
+    more = len(kinds) - _MAX_SUMMARISED_KINDS
+    suffix = f", and {more} more" if more > 0 else ""
     count = len(errors)
-    return f"{count} validation error{'s' if count != 1 else ''} ({'; '.join(parts)}{suffix})"
+    return f"{count} validation error{'s' if count != 1 else ''} ({shown}{suffix})"
 
 
 async def structured_complete(
@@ -120,12 +103,14 @@ async def structured_complete(
         error = StructuredOutputValidationError(
             raw_response=raw_text,
             output_type_name=output_type.__name__,
-            validation_error=_value_free_summary(exc, schema),
+            validation_error=_value_free_summary(exc),
             usage=response.usage,
             model=response.model,
             stop_reason=response.stop_reason,
         )
         error._response = response
-        raise error from exc
+        # ``from None``: the Pydantic cause carries the rejected values and would
+        # be formatted by any diagnostic that logs this error's chain.
+        raise error from None
 
     return response, output

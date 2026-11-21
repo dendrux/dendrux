@@ -110,8 +110,7 @@ async def test_message_names_error_kinds_and_field_locations() -> None:
     with pytest.raises(StructuredOutputValidationError) as info:
         await structured_complete(llm, [Message(role=Role.USER, content="x")], model)
     assert "Plain" in str(info.value)
-    assert "count" in info.value.validation_error
-    assert "int_parsing" in info.value.validation_error
+    assert info.value.validation_error == "1 validation error (int_parsing)"
 
 
 def test_known_error_types_are_kept_and_unknown_ones_named_custom_error() -> None:
