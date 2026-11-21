@@ -5,8 +5,9 @@ Pydantic model. This checker works from an allowlist. It checks ``type``, ``prop
 ``required``, ``additionalProperties``, ``items`` (one schema), ``enum``, ``const``,
 ``anyOf``, ``allOf``, ``oneOf`` (exactly one), the numeric bounds,
 ``minLength``/``maxLength``, ``minItems``/``maxItems``, the boolean schemas ``true`` and
-``false``, and a ``$ref`` that names a root ``$defs`` or ``definitions`` entry (with only
-annotations beside it). It ignores annotations such as ``title`` and ``default``.
+``false``, and a ``$ref`` that names a root ``$defs`` or ``definitions`` entry by a plain
+name (letters, digits, ``_``, ``.``, ``-``; nothing is decoded) with only annotations
+beside it. It ignores annotations such as ``title`` and ``default``.
 ``const`` and ``enum`` compare as JSON values, so ``true`` is not ``1``. Any other keyword
 or form (``format``, ``pattern``, an unknown keyword, any other or a missing ``$ref`` and
 so on) is refused with :class:`SchemaUnsupportedError`; it is never passed silently.
@@ -16,6 +17,7 @@ script and not from the schema shows as ``<key>``.
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING, Any, get_args
 
 from pydantic import TypeAdapter, ValidationError
@@ -74,12 +76,14 @@ def _is_schema_map(value: object) -> bool:
     return isinstance(value, dict) and all(_is_schema(v) for v in value.values())
 
 
+# No decoding: a name needing percent or ``~`` escapes is refused, never guessed at.
+_REF = re.compile(r"#/(\$defs|definitions)/([A-Za-z0-9_.-]+)")
+
+
 def _def_name(ref: str) -> tuple[str, str] | None:
-    """``("$defs", name)`` for ``#/$defs/<name>`` (or ``definitions``), else None."""
-    parts = ref.split("/")
-    if len(parts) != 3 or parts[0] != "#" or parts[1] not in _CONTAINERS or not parts[2]:
-        return None
-    return parts[1], parts[2].replace("~1", "/").replace("~0", "~")
+    """``(container, name)`` for ``#/$defs/<name>`` or ``#/definitions/<name>``, else None."""
+    found = _REF.fullmatch(ref)
+    return (found[1], found[2]) if found else None
 
 
 def _is_schema_list(value: object) -> bool:

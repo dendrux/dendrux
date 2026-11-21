@@ -71,7 +71,7 @@ def test_only_defs_and_definitions_entries_can_be_referenced(ref):
 
 @pytest.mark.parametrize("container", ["$defs", "definitions"])
 def test_defs_and_definitions_entries_are_resolved_and_checked(container):
-    schema = {container: {"a/b~c": {"type": "integer"}}, "$ref": f"#/{container}/a~1b~0c"}
+    schema = {container: {"Model_a.b-1": {"type": "integer"}}, "$ref": f"#/{container}/Model_a.b-1"}
     assert first_mismatch(1, schema) is None
     assert first_mismatch("x", schema) == "$: wrong type, expected integer"
 
