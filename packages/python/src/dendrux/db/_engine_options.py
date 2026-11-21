@@ -70,6 +70,13 @@ def mysql_engine_options(supplied: dict[str, Any]) -> dict[str, Any]:
     return options
 
 
+def is_memory_sqlite_url(url: URL) -> bool:
+    """True when a SQLite URL names an in-memory database, in plain or URI form."""
+    return (
+        url.database in (None, "", ":memory:", "file::memory:") or url.query.get("mode") == "memory"
+    )
+
+
 def normalized_url(url: str | URL) -> URL:
     parsed = make_url(url)
     driver = {

@@ -33,11 +33,13 @@ cancelled, but once the caller is cancelled it waits at most
 keeps running in the background, and the single-connection lock (if the caller
 holds one) stays held until that close finishes.
 
-:func:`guard_sqlite_closes` makes every close of a ``sqlite+aiosqlite`` connection
-(returned, invalidated after a cancelled write, or garbage collected) first close
-the cursors it handed out and roll back. Otherwise a cursor kept alive by a retained
-exception traceback leaves the closed connection as a SQLite zombie that holds the
-file's write lock and journal, and every later writer times out.
+:func:`guard_sqlite_closes` makes every physical close of a ``sqlite+aiosqlite``
+file-database connection (closed by the pool, invalidated after a cancelled write,
+or garbage collected) first close the cursors it handed out and roll back.
+Otherwise a cursor kept alive by a retained exception traceback leaves the closed
+connection as a SQLite zombie that holds the file's write lock and journal, and
+every later writer times out. A plain return to the pool is not a physical close
+and is not covered.
 """
 
 from __future__ import annotations
@@ -54,6 +56,7 @@ from sqlalchemy import event
 from sqlalchemy.pool import SingletonThreadPool, StaticPool
 
 from dendrux import _codes
+from dendrux.db._engine_options import is_memory_sqlite_url
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable
@@ -188,9 +191,12 @@ def _finalize_before_close(dbapi_connection: Any, *_args: object) -> None:
 def guard_sqlite_closes(engine: AsyncEngine) -> None:
     """Finalize statements and roll back before each aiosqlite connection closes.
 
-    Idempotent. A no-op for every engine other than ``sqlite+aiosqlite``.
+    Idempotent. A no-op for every engine other than a ``sqlite+aiosqlite`` file
+    database: in-memory SQLite has no file lock to leave behind, so it gets no
+    listeners and no driver wrapper.
     """
-    if engine.dialect.name != "sqlite" or engine.dialect.driver != "aiosqlite":
+    driver = (engine.dialect.name, engine.dialect.driver)
+    if driver != ("sqlite", "aiosqlite") or is_memory_sqlite_url(engine.url):
         return
     target = engine.sync_engine
     if event.contains(target, "checkout", _track_sqlite_statements):
