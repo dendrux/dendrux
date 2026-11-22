@@ -19,6 +19,7 @@ from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
+import dendrux
 from dendrux import Agent, tool
 from dendrux.db.models import AgentRun, ReactTrace, RunEvent, TokenUsage, ToolCallRecord
 from dendrux.errors import (
@@ -324,20 +325,31 @@ async def test_pg_adoption_contenders_and_stale_parent(
             await conn.execute(AgentRun.__table__.delete().where(AgentRun.agent_name == "lead"))
 
 
+def cancel_root(kind: str, store: Any, root_id: str) -> Any:
+    """Cancel through a separate Agent or the standalone entry point."""
+    if kind == "agent":
+        return fresh_root(store)[0].cancel_run(root_id, tenant_id=TENANT)
+    return dendrux.cancel_run(root_id, tenant_id=TENANT, state_store=store)
+
+
+@pytest.mark.parametrize("canceller", ["agent", "module"])
 async def test_pg_cancel_versus_adoption_claim_never_revives_the_root(
-    store: Any, engine: Any, monkeypatch: Any
+    store: Any, engine: Any, monkeypatch: Any, canceller: str
 ) -> None:
     _postgres(engine)
     outcomes = set()
     for _ in range(4):
         root_id, _ = await crash_before_adoption(store, engine, monkeypatch)
         root, root_llm, child_llm = fresh_root(store, LLMResponse(text="root done"))
-        canceller, _, _ = fresh_root(store)
-        results = await asyncio.gather(
-            root.reclaim(root_id, tenant_id=TENANT),
-            canceller.cancel_run(root_id, tenant_id=TENANT),
-            return_exceptions=True,
-        )
+        second = create_async_engine(engine.url, pool_size=1, max_overflow=0)
+        try:
+            results = await asyncio.gather(
+                root.reclaim(root_id, tenant_id=TENANT),
+                cancel_root(canceller, store_for_engine(second), root_id),
+                return_exceptions=True,
+            )
+        finally:
+            await second.dispose()
         for r in results:
             if isinstance(r, BaseException):
                 assert isinstance(r, (RunNotReclaimableError, RunCancelledError)), r
@@ -361,6 +373,45 @@ async def test_pg_cancel_versus_adoption_claim_never_revives_the_root(
         async with engine.begin() as conn:
             await conn.execute(AgentRun.__table__.delete().where(AgentRun.agent_name == "lead"))
     assert outcomes
+
+
+async def test_pg_claim_first_keeps_the_cancel_request_for_the_new_owner(
+    store: Any, engine: Any, monkeypatch: Any
+) -> None:
+    """The adoption claim wins; the module cancel loses its CAS but its request stops the owner."""
+    _postgres(engine)
+    root_id, child_id = await crash_before_adoption(store, engine, monkeypatch)
+    root, root_llm, child_llm = fresh_root(store, call("reviewer", {"task": BRIEF}, "r2"))
+    root_llm.gate_at = 0  # the new owner's first model call, after its adoption claim
+    owner = asyncio.create_task(root.reclaim(root_id, tenant_id=TENANT))
+    second = create_async_engine(engine.url, pool_size=1, max_overflow=0)
+    try:
+        await asyncio.wait_for(root_llm.entered.wait(), 10)
+        claimed = (await rows(engine, AgentRun, AgentRun.id == root_id))[0]
+        result = await dendrux.cancel_run(
+            root_id, tenant_id=TENANT, state_store=store_for_engine(second)
+        )
+        marked = (await rows(engine, AgentRun, AgentRun.id == root_id))[0]
+    finally:
+        root_llm.gate.set()
+        await second.dispose()
+    settled = (await asyncio.gather(owner, return_exceptions=True))[0]
+    assert claimed.status == "running"
+    assert (result.status, result.meta["cancel_requested"]) == (RunStatus.RUNNING, True)
+    assert (marked.status, marked.cancel_requested) == ("running", True)
+    assert marked.claim_epoch == claimed.claim_epoch
+    if isinstance(settled, BaseException):
+        assert isinstance(settled, RunCancelledError), settled
+    else:
+        assert settled.status == RunStatus.CANCELLED
+    final = (await rows(engine, AgentRun, AgentRun.id == root_id))[0]
+    assert final.status == "cancelled"
+    assert [c.id for c in await rows(engine, AgentRun, AgentRun.parent_run_id == root_id)] == [
+        child_id
+    ]
+    assert child_llm.calls == 0
+    events = await rows(engine, RunEvent, RunEvent.agent_run_id == root_id)
+    assert [e.event_type for e in events].count("run.cancelled") == 1
 
 
 # ---------------------------------------------------------------------------
