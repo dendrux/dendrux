@@ -607,16 +607,19 @@ class TestRunStoreScoping:
             "00000000000000000000000105", status="waiting_client_tool", pause_data={"big": "x"}
         )
         statements: list[str] = []
+        columns: list[str] = []
 
-        @event.listens_for(engine.sync_engine, "before_cursor_execute")
+        @event.listens_for(engine.sync_engine, "after_cursor_execute")
         def _capture(_c: Any, _cur: Any, statement: str, *_a: Any) -> None:
             statements.append(statement)
+            columns.extend(column[0] for column in _cur.description)
 
         (record,) = await state.list_runs()
         assert record.id == "00000000000000000000000105"
         select_sql = next(s for s in statements if s.lstrip().upper().startswith("SELECT"))
-        assert "pause_data" not in select_sql
-        assert "pii_mapping" not in select_sql
+        assert "CASE WHEN" in select_sql
+        assert "pause_data" not in columns
+        assert "pii_mapping" not in columns
 
     async def test_offset_is_capped(self, state: Any, store: RunStore) -> None:
         with pytest.raises(ValueError, match="offset"):

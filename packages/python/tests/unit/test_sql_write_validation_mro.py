@@ -850,11 +850,38 @@ SWEEP_RELOCATIONS = {
 }
 
 
+def _canonical_waiting_reads(members):
+    # F6 changes observation APIs only. Keep the original hash for every other member.
+    optional = {
+        "list_runs": ", include_waiting: 'bool' = True",
+        "count_runs": ", include_waiting: 'bool' = True",
+        "_bfs_descendants": ", waiting_labels: 'dict[str, str | None] | None' = None",
+        "_descendant_batch": ", waiting_labels: 'dict[str, str | None] | None' = None",
+    }
+    for name, addition in optional.items():
+        assert members[name]["signature"].count(addition) == 1, name
+        members[name]["signature"] = members[name]["signature"].replace(addition, "")
+    assert members.get("get_waiting_for") == {
+        "kind": "function",
+        "signature": (
+            "(self, run_id: 'str', *, tenant_id: 'TenantScope' = UNSCOPED) -> 'str | None'"
+        ),
+        "layers": [
+            ("durability.py", "call"),
+            ("durability.py", "call"),
+            ("_sql_reads.py", "get_waiting_for"),
+        ],
+        "owner": "SQLStateStore",
+    }
+    del members["get_waiting_for"]
+
+
 def _canonical_writes_snapshot(snapshot, cls):
     import copy
 
     assert snapshot["mro"] == EXPECTED_MRO[cls.__name__]
     result = copy.deepcopy(snapshot)
+    _canonical_waiting_reads(result["members"])
     for name, (old_owner, new_owner) in WRITES_RELOCATIONS[cls.__name__].items():
         assert name in result["members"]
         member = result["members"][name]
@@ -1144,6 +1171,10 @@ async def test_explicit_private_wrapper_and_sanitized_database_failures(cls, nam
         "kind",
         "missing-member",
         "extra-member",
+        "waiting-reader-signature",
+        "waiting-reader-wrappers",
+        "waiting-list-default",
+        "waiting-subtree-default",
     ],
 )
 def test_proposed_exact_write_relocation_still_refuses_unplanned_snapshot_changes(cls, change):
@@ -1207,6 +1238,18 @@ def test_proposed_exact_write_relocation_still_refuses_unplanned_snapshot_change
         layers[0], layers[-2] = layers[-2], layers[0]
     elif change == "signature":
         raw["members"]["update_many"]["signature"] += " changed"
+    elif change == "waiting-reader-signature":
+        raw["members"]["get_waiting_for"]["signature"] += " changed"
+    elif change == "waiting-reader-wrappers":
+        raw["members"]["get_waiting_for"]["layers"].pop(0)
+    elif change == "waiting-list-default":
+        raw["members"]["list_runs"]["signature"] = raw["members"]["list_runs"]["signature"].replace(
+            "include_waiting: 'bool' = True", "include_waiting: 'bool' = False"
+        )
+    elif change == "waiting-subtree-default":
+        raw["members"]["_bfs_descendants"]["signature"] = raw["members"]["_bfs_descendants"][
+            "signature"
+        ].replace("waiting_labels: 'dict[str, str | None] | None' = None", "waiting_labels=None")
     elif change == "kind":
         raw["members"]["update_many"]["kind"] = "staticmethod"
     elif change == "missing-member":

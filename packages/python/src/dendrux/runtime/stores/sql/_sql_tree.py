@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from functools import partial
 from typing import TYPE_CHECKING
 
 from sqlalchemy import select
@@ -311,6 +312,9 @@ class _SqlTree(_StoreHost):
         everything below them. ``light`` loads only id / parent / tenant so
         usage-only callers don't pull large JSON columns.
         """
+        batch = self._descendant_batch
+        if waiting_labels is not None:
+            batch = partial(batch, waiting_labels=waiting_labels)
         seen: set[str] = {root_id}
         current_level = [root_id]
         found: list[tuple[AgentRun, int]] = []
@@ -321,7 +325,7 @@ class _SqlTree(_StoreHost):
             rows: list[AgentRun] = []
             for i in range(0, len(current_level), _IN_CHUNK):
                 rows.extend(
-                    await self._descendant_batch(
+                    await batch(
                         session,
                         root_id,
                         current_level[i : i + _IN_CHUNK],
@@ -329,7 +333,6 @@ class _SqlTree(_StoreHost):
                         light=light,
                         max_nodes=max_nodes,
                         loaded=len(found) + len(rows),
-                        waiting_labels=waiting_labels,
                     )
                 )
                 if max_nodes is not None and len(found) + len(rows) >= max_nodes:

@@ -56,7 +56,9 @@ async def test_waiting_label_list_detail_subtree(
         for run_id in (root, child):
             detail = await reader.get_run(run_id, tenant_id="t")
             assert detail is not None and detail.status == status
-            assert detail.waiting_for == label
+            label_reader = _capabilities.waiting_filter_reader(store)
+            assert label_reader is not None
+            assert await label_reader(run_id, tenant_id="t") == label
     else:
         tree = await reader.get_subtree(root, tenant_id="t")
         assert tree is not None
@@ -67,7 +69,6 @@ async def test_waiting_label_list_detail_subtree(
     for run_id in (root, child):
         raw = await store.get_run(run_id)
         assert raw is not None and raw.status == status
-        assert raw.waiting_for == label
     expected = set() if label else {root, child}
     filtered = await reader.list_runs(tenant_id="t", include_waiting=False)
     assert {row.id for row in filtered} == expected
@@ -142,7 +143,8 @@ class _LegacyStore:
 
 
 @basic()
-async def test_legacy_waiting_label_defaults_and_filter_refuses() -> None:
+async def test_legacy_waiting_label_defaults_and_filter_refuses(dendrux_kit: Kit) -> None:
+    """Request the kit fixture so this contract has certification attribution."""
     reader = _LegacyStore()
     assert (await reader.list_runs())[0].waiting_for is None
     detail = await reader.get_run("legacy")

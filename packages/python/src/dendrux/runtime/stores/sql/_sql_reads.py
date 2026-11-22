@@ -357,15 +357,23 @@ class _SqlReads(_StoreHost):
         from dendrux.db.models import AgentRun
 
         async with self._session_factory() as session:
-            stmt = _apply_tenant_scope(
-                select(AgentRun, _waiting_for_expression(self)).where(AgentRun.id == run_id),
-                tenant_id,
-            )
+            stmt = _apply_tenant_scope(select(AgentRun).where(AgentRun.id == run_id), tenant_id)
             result = await session.execute(stmt)
-            row = result.one_or_none()
+            row = result.scalar_one_or_none()
             if row is None:
                 return None
-            return _run_to_record(row[0], waiting_for=row[1])
+            return _run_to_record(row)
+
+    async def get_waiting_for(
+        self, run_id: str, *, tenant_id: TenantScope = UNSCOPED
+    ) -> str | None:
+        """Read the scoped display label without changing the runtime run projection."""
+        stmt = _apply_tenant_scope(
+            select(_waiting_for_expression(self)).where(AgentRun.id == run_id), tenant_id
+        )
+        async with self._session_factory() as session:
+            # The selected CASE returns only the literal label or SQL NULL.
+            return cast("str | None", await session.scalar(stmt))
 
     async def get_next_trace_index(self, run_id: str) -> int:
         """Read the next trace order from the run/order index, without payloads."""
@@ -600,8 +608,9 @@ class _SqlReads(_StoreHost):
                 started_after=started_after,
                 started_before=started_before,
                 metadata_filter=metadata_filter,
-                include_waiting=include_waiting,
             )
+            if not include_waiting:
+                stmt = stmt.where(_waiting_for_expression(self).is_(None))
             stmt = stmt.limit(capped_limit).offset(clamped_offset)
 
             result = await session.execute(stmt)
@@ -660,8 +669,9 @@ class _SqlReads(_StoreHost):
                 started_after=started_after,
                 started_before=started_before,
                 metadata_filter=metadata_filter,
-                include_waiting=include_waiting,
             )
+            if not include_waiting:
+                stmt = stmt.where(_waiting_for_expression(self).is_(None))
             result = await session.execute(stmt)
             total = result.scalar_one()
             return int(total)
@@ -677,7 +687,6 @@ class _SqlReads(_StoreHost):
         started_after: datetime | None,
         started_before: datetime | None,
         metadata_filter: dict[str, Any] | None = None,
-        include_waiting: bool = True,
     ) -> Any:
         from sqlalchemy import false
 
@@ -690,8 +699,6 @@ class _SqlReads(_StoreHost):
         _require_aware_utc("started_before", started_before)
 
         stmt = _apply_tenant_scope(stmt, tenant_id)
-        if not include_waiting:
-            stmt = stmt.where(_waiting_for_expression(self).is_(None))
         if status is not None:
             if isinstance(status, list):
                 if not status:

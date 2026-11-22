@@ -116,3 +116,36 @@ async def test_facade_waiting_labels_through_lazy_wrapper(store, engine, surface
 async def test_legacy_filter_refusal_is_independent_of_labels(operation) -> None:
     with pytest.raises(StoreCapabilityError):
         await getattr(RunStore(_LegacyStore()), operation)(include_waiting=False)
+
+
+async def test_public_detail_label_query_keeps_runtime_read_unchanged(store, engine) -> None:
+    await store.create_run("detail-wait", "Test", tenant_id="t")
+    await store.pause_run(
+        "detail-wait", status="paused", pause_data={"pause_reason": "managed_wait"}
+    )
+    await store.create_run("detail-running", "Test", tenant_id="t")
+    statements = []
+
+    def capture(conn, cursor, statement, parameters, context, many):
+        statements.append(statement)
+
+    event.listen(engine.sync_engine, "before_cursor_execute", capture)
+    try:
+        raw = await store.get_run("detail-wait", tenant_id="t")
+        assert raw.waiting_for is None
+        assert len(statements) == 1 and "CASE WHEN" not in statements[0]
+        statements.clear()
+        detail = await RunStore(store).get_run("detail-wait", tenant_id="t")
+        assert detail.waiting_for == "subagents"
+        assert len(statements) == 2
+        assert "CASE WHEN" not in statements[0]
+        assert "CASE WHEN" in statements[1] and "history" not in statements[1]
+        statements.clear()
+        assert await RunStore(store).get_run("detail-wait", tenant_id="other") is None
+        assert len(statements) == 1
+        statements.clear()
+        running = await RunStore(store).get_run("detail-running", tenant_id="t")
+        assert running.waiting_for is None
+        assert len(statements) == 1
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", capture)
