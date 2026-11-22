@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import AsyncExitStack
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from dendrux import Agent
+import dendrux
+from dendrux import Agent, sweep, tool
 from dendrux.db.models import AgentRun, TokenUsage, ToolCallRecord
 from dendrux.errors import ManagedChildControlError, RunCancelledError, RunControlError
 from dendrux.runtime import _managed, _managed_cancel
@@ -27,6 +29,7 @@ from dendrux.types import (
     generate_ulid,
 )
 from tests._helpers.recovery_checkpoint import expire
+from tests._helpers.scripted_provider import ScriptedLLM, tool_call
 from tests.integration.test_managed_adoption import (
     child_agent,
     crash_before_adoption,
@@ -48,6 +51,13 @@ def controller(store: Any, **kwargs: Any) -> Agent:
         strict_tenancy=False,
         **kwargs,
     )
+
+
+def cancel_via(kind: str, store: Any, run_id: str) -> Any:
+    """Cancel through an Agent or the standalone entry; both share one administrative service."""
+    if kind == "agent":
+        return controller(store).cancel_run(run_id)
+    return dendrux.cancel_run(run_id, tenant_id=TENANT, state_store=store)
 
 
 async def chain(store: Any) -> tuple[str, str, str]:
@@ -299,9 +309,10 @@ async def parallel_stores(engine: Any, stack: AsyncExitStack, count: int = 8) ->
     return stores
 
 
+@pytest.mark.parametrize("canceller", ["agent", "module"])
 @pytest.mark.parametrize("round_", range(3))
 async def test_pg_cancel_versus_eight_binders_has_no_orphans(
-    store: Any, engine: Any, round_: int
+    store: Any, engine: Any, round_: int, canceller: str
 ) -> None:
     async with AsyncExitStack() as stack:
         stores = await parallel_stores(engine, stack)
@@ -313,7 +324,7 @@ async def test_pg_cancel_versus_eight_binders_has_no_orphans(
             return await other.bind_managed_child(bind_request(root, call_id))
 
         tasks = [asyncio.create_task(bind(other)) for other in stores]
-        tasks.append(asyncio.create_task(controller(stores[0]).cancel_run(root)))
+        tasks.append(asyncio.create_task(cancel_via(canceller, stores[0], root)))
         ready.set()
         results = await asyncio.gather(*tasks, return_exceptions=True)
     for result in results:
@@ -341,9 +352,10 @@ def submission_root(store: Any) -> Agent:
     )
 
 
+@pytest.mark.parametrize("canceller", ["agent", "module"])
 @pytest.mark.parametrize("round_", range(3))
 async def test_pg_cancel_versus_eight_leaf_submissions(
-    store: Any, engine: Any, round_: int
+    store: Any, engine: Any, round_: int, canceller: str
 ) -> None:
     async with AsyncExitStack() as stack:
         stores = await parallel_stores(engine, stack)
@@ -357,7 +369,7 @@ async def test_pg_cancel_versus_eight_leaf_submissions(
                 )
                 for a in agents
             ),
-            controller(stores[0]).cancel_run(root),
+            cancel_via(canceller, stores[0], root),
             return_exceptions=True,
         )
     for outcome in results:
@@ -373,8 +385,11 @@ async def test_pg_cancel_versus_eight_leaf_submissions(
     assert sum(a.provider.calls for a in agents) <= 1
 
 
+@pytest.mark.parametrize("canceller", ["agent", "module"])
 @pytest.mark.parametrize("round_", range(3))
-async def test_pg_cancel_versus_eight_reclaims(store: Any, engine: Any, round_: int) -> None:
+async def test_pg_cancel_versus_eight_reclaims(
+    store: Any, engine: Any, round_: int, canceller: str
+) -> None:
     from tests.integration.test_managed_recovery import _dead_child, lead, reviewer
 
     async with AsyncExitStack() as stack:
@@ -392,7 +407,7 @@ async def test_pg_cancel_versus_eight_reclaims(store: Any, engine: Any, round_: 
         ]
         results = await asyncio.gather(
             *(a.reclaim(root, tenant_id=TENANT) for a in agents),
-            controller(stores[0]).cancel_run(root),
+            cancel_via(canceller, stores[0], root),
             return_exceptions=True,
         )
     for outcome in results:
@@ -411,9 +426,10 @@ async def test_pg_cancel_versus_eight_reclaims(store: Any, engine: Any, round_: 
     assert sum(a.provider.calls for a in agents) <= 1
 
 
+@pytest.mark.parametrize("canceller", ["agent", "module"])
 @pytest.mark.parametrize("round_", range(3))
 async def test_pg_cancel_versus_eight_adoptions(
-    store: Any, engine: Any, monkeypatch: Any, round_: int
+    store: Any, engine: Any, monkeypatch: Any, round_: int, canceller: str
 ) -> None:
     from dendrux.db.models import ReactTrace, RunEvent
 
@@ -423,7 +439,7 @@ async def test_pg_cancel_versus_eight_adoptions(
         agents = [fresh_root(other, LLMResponse(text="done"))[0] for other in stores]
         results = await asyncio.gather(
             *(a.reclaim(root, tenant_id=TENANT) for a in agents),
-            controller(stores[0]).cancel_run(root),
+            cancel_via(canceller, stores[0], root),
             return_exceptions=True,
         )
     for outcome in results:
@@ -444,6 +460,136 @@ async def test_pg_cancel_versus_eight_adoptions(
     assert len(await rows(engine, TokenUsage, TokenUsage.agent_run_id == child)) == 1
     assert sum(a.provider.calls for a in agents) <= 1
     assert sum(a.subagents[0].provider.calls for a in agents) == 0
+
+
+async def run_events(engine: Any, run_id: str) -> list[Any]:
+    from dendrux.db.models import RunEvent
+
+    events = await rows(engine, RunEvent, RunEvent.agent_run_id == run_id)
+    return sorted(events, key=lambda event: event.sequence_index)
+
+
+@tool()
+async def noop() -> str:
+    """Return at once."""
+    return "ok"
+
+
+@pytest.mark.parametrize(("gate_at", "expected"), [(0, "cancelled"), (1, "success")])
+async def test_pg_module_cancels_versus_live_running_owner(
+    store: Any, engine: Any, gate_at: int, expected: str
+) -> None:
+    """Cancellers only set the durable request; the owner settles; nothing is revived."""
+    async with AsyncExitStack() as stack:
+        owner_store, *stores = await parallel_stores(engine, stack, count=5)
+        llm = ScriptedLLM([tool_call("noop", pid="n1"), LLMResponse(text="done")], gate_at=gate_at)
+        owner = Agent(name="owner", prompt="p", provider=llm, tools=[noop], state_store=owner_store)
+        task = asyncio.create_task(owner.run("go", tenant_id=TENANT))
+        try:
+            await asyncio.wait_for(llm.entered.wait(), 10)
+            run_id = (await store.list_runs())[0].id
+            before = await store.get_run(run_id)
+            results = await asyncio.gather(
+                *(dendrux.cancel_run(run_id, tenant_id=TENANT, state_store=s) for s in stores)
+            )
+            during = await store.get_run(run_id)
+        finally:
+            llm.gate.set()
+        outcome = await asyncio.wait_for(task, 10)
+    assert {(r.status, r.meta["cancel_requested"]) for r in results} == {(RunStatus.RUNNING, True)}
+    assert (during.status, during.claim_epoch) == ("running", before.claim_epoch)
+    assert outcome.status.value == expected
+    final = await store.get_run(run_id)
+    assert (final.status, final.claim_epoch) == (expected, before.claim_epoch)
+    events = [e.event_type for e in await run_events(engine, run_id)]
+    terminal = [e for e in events if e in {"run.cancelled", "run.completed"}]
+    assert terminal == [f"run.{'completed' if expected == 'success' else 'cancelled'}"]
+    assert events[-1] == terminal[0]
+    again = await dendrux.cancel_run(run_id, tenant_id=TENANT, state_store=store)
+    assert again.status.value == expected
+    assert [e.event_type for e in await run_events(engine, run_id)] == events
+
+
+@pytest.mark.parametrize("callers", ["module", "mixed"])
+@pytest.mark.parametrize("round_", range(3))
+async def test_pg_concurrent_cancels_settle_each_run_once(
+    store: Any, engine: Any, callers: str, round_: int
+) -> None:
+    """Eight parallel cancellers: one CAS winner per run and one ordered run.cancelled event."""
+    async with AsyncExitStack() as stack:
+        stores = await parallel_stores(engine, stack)
+        _, root, child, _ = await paused_workflow(store)
+        kinds = ["module"] * 8 if callers == "module" else ["agent", "module"] * 4
+        ready = asyncio.Event()
+
+        async def cancel(kind: str, other: Any) -> Any:
+            await ready.wait()
+            return await cancel_via(kind, other, root)
+
+        tasks = [asyncio.create_task(cancel(k, o)) for k, o in zip(kinds, stores, strict=True)]
+        ready.set()
+        results = await asyncio.gather(*tasks)
+    assert {r.status for r in results} == {RunStatus.CANCELLED}
+    for run_id in (root, child):
+        winners = [
+            item
+            for r in results
+            for item in r.meta["cascade"]
+            if item == {"run_id": run_id, "outcome": "cancelled"}
+        ]
+        assert len(winners) == 1, (run_id, [r.meta["cascade"] for r in results])
+        assert (await store.get_run(run_id)).status == "cancelled"
+        events = await run_events(engine, run_id)
+        cancelled = [e for e in events if e.event_type == "run.cancelled"]
+        assert len(cancelled) == 1
+        assert events[-1] is cancelled[0]
+        # The leaf paused through run.paused; the root's managed wait is a bind, not an event.
+        if run_id == child:
+            assert any(e.event_type == "run.paused" for e in events[:-1])
+
+
+async def stale(engine: Any, run_id: str) -> None:
+    async with engine.begin() as conn:
+        await conn.execute(
+            update(AgentRun)
+            .where(AgentRun.id == run_id)
+            .values(last_progress_at=datetime.now(UTC) - timedelta(minutes=10))
+        )
+
+
+@pytest.mark.parametrize("canceller", ["agent", "module"])
+@pytest.mark.parametrize("shape", ["legacy", "managed"])
+async def test_pg_flagged_dead_owner_is_settled_cancelled_by_sweep(
+    store: Any, engine: Any, canceller: str, shape: str
+) -> None:
+    """A RUNNING owner died after the request; concurrent sweeps settle it CANCELLED once."""
+    from tests.integration.test_managed_recovery import _dead_child
+
+    async with AsyncExitStack() as stack:
+        stores = await parallel_stores(engine, stack, count=4)
+        if shape == "managed":
+            root, dead = await _dead_child(store, engine)
+            target = dead.id
+        else:
+            root = target = generate_ulid()
+            await store.create_run(root, "dead", tenant_id=TENANT)
+        await cancel_via(canceller, store, root)
+        flagged = await store.get_run(target)
+        assert (flagged.status, flagged.cancel_requested) == ("running", True)
+        await stale(engine, target)
+        results = await asyncio.gather(
+            *(sweep(state_store=s, stale_running=timedelta(minutes=1)) for s in stores)
+        )
+    settled = [r for result in results for r in result.stale_running if r.run_id == target]
+    assert len(settled) == 1, results
+    assert all(r.run_id != target for result in results for r in result.reclaimable)
+    final = await store.get_run(target)
+    assert final.status == "cancelled"
+    assert final.claim_epoch > flagged.claim_epoch
+    events = await run_events(engine, target)
+    assert [e.event_type for e in events].count("run.cancelled") == 1
+    assert events[-1].event_type == "run.cancelled"
+    assert (await store.get_run(root)).status == "cancelled"
 
 
 @pytest.mark.parametrize("entry", ["run", "stream", "resume", "resume_stream"])
