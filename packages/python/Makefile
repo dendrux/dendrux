@@ -1,4 +1,4 @@
-.PHONY: dev-sync cov-mysql test test-fast test-area test-pg test-kit test-merge test-lists test-shard-proof test-model-check test-model-install test-dbs-up test-dbs-down test-redis-up test-redis-down test-redis test-mysql bench load load-quick load-pg load-mysql load-mariadb lint typecheck arch crap cognitive size ruff-ratchet duplicates deadcode cycles semgrep stale-patches move-check move-proof quality quality-stamp api-check format package-smoke ci clean
+.PHONY: dev-sync cov-mysql test test-fast test-area test-pg test-kit test-merge test-lists test-shard-proof test-model-check test-model-install test-dbs-up test-dbs-down test-redis-up test-redis-down test-redis test-mysql bench load load-quick load-pg load-mysql load-mariadb lint typecheck arch crap cognitive size ruff-ratchet duplicates deadcode cycles semgrep stale-patches move-check move-proof quality quality-stamp api-check format package-smoke tla ci clean
 .DEFAULT_GOAL := test
 
 # Match a fresh CI install: exact dev tools and the newest allowed runtime dependencies.
@@ -246,6 +246,12 @@ format:
 
 package-smoke:
 	python scripts/mcp_distribution_smoke.py
+
+# The TLA+ model of run ownership, cancel and recovery, as CI runs it (../../formal/README.md).
+# Needs Java 11+ and tla2tools.jar v1.7.4 (TLA2TOOLS_JAR; default ~/.local/share/tlaplus/).
+# TLA_MODE=quick skips the two long safety runs.
+tla:
+	../../formal/check.sh $(TLA_MODE)
 
 ci: lint typecheck arch test crap quality api-check
 

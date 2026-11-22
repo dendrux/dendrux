@@ -604,3 +604,31 @@ jobs:
 
       - name: Compare the public API with v0.5.0
         run: python packages/python/tools/api_breaks.py --against v0.5.0
+
+  # The TLA+ model of run ownership, cancel and recovery (formal/README.md). The passing
+  # configs must pass and every bug variant must be caught; formal/check.sh decides both.
+  tla-model-check:
+    name: TLA+ model check
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Download tla2tools.jar v1.7.4 and verify it
+        run: |
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/tla2tools.jar" \
+            https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+          echo "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88  $RUNNER_TEMP/tla2tools.jar" \
+            | sha256sum -c -
+
+      - name: Run TLC on every config
+        env:
+          TLA2TOOLS_JAR: ${{ runner.temp }}/tla2tools.jar
+        run: formal/check.sh
