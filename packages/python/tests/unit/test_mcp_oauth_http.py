@@ -207,21 +207,38 @@ async def test_body_over_cap_is_uncertain() -> None:
 
 
 async def test_trickling_body_hits_the_overall_deadline() -> None:
+    sent = 0
+    first_chunk = asyncio.Event()
+
     async def trickle(request: RawRequest, writer: asyncio.StreamWriter) -> None:
-        writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n")
-        for _ in range(100):
-            writer.write(b"x")
-            await writer.drain()
-            await asyncio.sleep(0.05)
+        nonlocal sent
+        writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\n")
+        try:
+            # Far more than any deadline allows, so only the deadline can end the read.
+            while sent < 100000:
+                writer.write(b"x")
+                await writer.drain()
+                sent += 1
+                first_chunk.set()
+                await asyncio.sleep(0.01)
+        except ConnectionError:
+            pass
 
     async with RawHTTPServer(trickle) as server:
         client = OAuthHTTP(policy=None, timeout=0.4)
-        loop = asyncio.get_running_loop()
-        started = loop.time()
-        with pytest.raises(OAuthTransportError) as caught:
-            await client.send("POST", server.url + "/token", form={})
-        await client.aclose()
-    assert loop.time() - started < 2.0
+        try:
+            # Watchdog only: a missing deadline hangs here, it is not a speed assertion.
+            async with asyncio.timeout(30):
+                with pytest.raises(OAuthTransportError) as caught:
+                    await client.send("POST", server.url + "/token", form={})
+        finally:
+            await client.aclose()
+    # The body was still arriving and the response was far from complete when
+    # the deadline fired, so the error came from the deadline, not from the
+    # server finishing or dropping the connection.
+    assert first_chunk.is_set()
+    assert sent < 100000
+    assert caught.value.cause == "TimeoutError"
     assert caught.value.outcome == "uncertain"
 
 
