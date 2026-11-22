@@ -278,6 +278,34 @@ def _postgres(engine: Any) -> None:
         pytest.skip("independent-session contenders run on Postgres")
 
 
+TERMINAL_EVENTS = {"run.completed": "success", "run.error": "error", "run.cancelled": "cancelled"}
+
+
+async def settle_all(*tasks: Any, timeout: float = 10) -> list[Any]:
+    """Join every task within a bound (stragglers are cancelled); return results or errors."""
+    return await asyncio.gather(
+        *(asyncio.wait_for(task, timeout) for task in tasks), return_exceptions=True
+    )
+
+
+async def terminal_history(engine: Any, run_id: str) -> list[tuple[int, str]]:
+    """A settled run has exactly one terminal event, matching its status, as its last event."""
+    events = sorted(
+        await rows(engine, RunEvent, RunEvent.agent_run_id == run_id),
+        key=lambda event: event.sequence_index,
+    )
+    history = [(e.sequence_index, e.event_type) for e in events]
+    status = (await rows(engine, AgentRun, AgentRun.id == run_id))[0].status
+    terminal = [kind for _, kind in history if kind in TERMINAL_EVENTS]
+    if status in TERMINAL_EVENTS.values():
+        assert len(terminal) == 1, (run_id, status, history)
+        assert history[-1][1] == terminal[0], (run_id, status, history)
+        assert TERMINAL_EVENTS[terminal[0]] == status, (run_id, status, history)
+    else:
+        assert terminal == [], (run_id, status, history)
+    return history
+
+
 async def test_pg_adoption_contenders_and_stale_parent(
     store: Any, engine: Any, monkeypatch: Any
 ) -> None:
@@ -364,12 +392,18 @@ async def test_pg_cancel_versus_adoption_claim_never_revives_the_root(
         if final.status == "cancelled" and intent.outcome == "started":
             assert root_llm.calls == 0 and not await observations(engine, root_id)
         outcomes.add((final.status, intent.outcome))
+        history = await terminal_history(engine, root_id)
         # A cancelled root is never revived by a later adoption attempt.
         if final.status == "cancelled":
             again, again_llm, _ = fresh_root(store, LLMResponse(text="x"))
             await again.reclaim(root_id, tenant_id=TENANT)
             assert again_llm.calls == 0
             assert (await rows(engine, AgentRun, AgentRun.id == root_id))[0].status == "cancelled"
+        # A later cancel of either outcome changes nothing and appends nothing.
+        calls = (root_llm.calls, child_llm.calls)
+        await cancel_root(canceller, store, root_id)
+        assert await terminal_history(engine, root_id) == history
+        assert (root_llm.calls, child_llm.calls) == calls
         async with engine.begin() as conn:
             await conn.execute(AgentRun.__table__.delete().where(AgentRun.agent_name == "lead"))
     assert outcomes
@@ -393,9 +427,10 @@ async def test_pg_claim_first_keeps_the_cancel_request_for_the_new_owner(
         )
         marked = (await rows(engine, AgentRun, AgentRun.id == root_id))[0]
     finally:
+        # Join the owner on every path before its engine goes away; keep the first error.
         root_llm.gate.set()
+        [settled] = await settle_all(owner)
         await second.dispose()
-    settled = (await asyncio.gather(owner, return_exceptions=True))[0]
     assert claimed.status == "running"
     assert (result.status, result.meta["cancel_requested"]) == (RunStatus.RUNNING, True)
     assert (marked.status, marked.cancel_requested) == ("running", True)
@@ -410,8 +445,8 @@ async def test_pg_claim_first_keeps_the_cancel_request_for_the_new_owner(
         child_id
     ]
     assert child_llm.calls == 0
-    events = await rows(engine, RunEvent, RunEvent.agent_run_id == root_id)
-    assert [e.event_type for e in events].count("run.cancelled") == 1
+    history = await terminal_history(engine, root_id)
+    assert history[-1][1] == "run.cancelled"
 
 
 # ---------------------------------------------------------------------------
