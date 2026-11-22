@@ -470,20 +470,31 @@ Next ==
 (*    cancel_run is called again.                                          *)
 (* Nothing forces a crash, a resume of a paused run, an adoption, an       *)
 (* abandoned-waiting sweep or on_stale="error".                            *)
+(*                                                                         *)
+(* Each group is one weak-fairness condition over a disjunction, which    *)
+(* keeps TLC's liveness check small. That is as strong as one condition   *)
+(* per task, run or step here: every step in a group changes the state,  *)
+(* and a behavior has finitely many of them (epochs, tasks and canceller  *)
+(* phases are bounded), so no enabled step can be starved forever.        *)
 (***************************************************************************)
+OwnerProgress ==
+    \E t \in tasks : OwnerCheckpoint(t) \/ OwnerStop(t)
+
+Recovery ==
+    \E r \in Runs :
+        \/ Unowned(r) /\ (SweepMark(r) \/ SweepStale(r, "reclaim"))
+        \/ \E w \in Workers : Reclaim(w, r)
+
+CancelProgress ==
+    \E k \in Cancellers :
+        \/ CMarkRoot(k) \/ CScan(k) \/ CMarkKids(k) \/ CCas(k) \/ CDone(k)
+        \/ \E r \in Runs : CPick(k, r)
+
 Fairness ==
-    /\ \A w \in Workers, r \in Runs :
-          /\ WF_vars(\E t \in tasks : t.w = w /\ t.r = r /\ OwnerCheckpoint(t))
-          /\ WF_vars(\E t \in tasks : t.w = w /\ t.r = r /\ OwnerStop(t))
-    /\ \A r \in Runs :
-          /\ WF_vars(Unowned(r) /\ SweepMark(r))
-          /\ WF_vars(Unowned(r) /\ SweepStale(r, "reclaim"))
-          /\ WF_vars(\E w \in Workers : Reclaim(w, r))
-    /\ \A k \in Cancellers :
-          /\ WF_vars(CMarkRoot(k)) /\ WF_vars(CScan(k)) /\ WF_vars(CMarkKids(k))
-          /\ WF_vars(\E r \in Runs : CPick(k, r))
-          /\ WF_vars(CCas(k)) /\ WF_vars(CDone(k))
-          /\ (CancelRetried => WF_vars(CRetry(k)))
+    /\ WF_vars(OwnerProgress)
+    /\ WF_vars(Recovery)
+    /\ WF_vars(CancelProgress)
+    /\ CancelRetried => WF_vars(\E k \in Cancellers : CRetry(k))
 
 SafetySpec == Init /\ [][Next]_vars
 
