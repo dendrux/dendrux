@@ -17408,10 +17408,15 @@
   "digest": "b375119ec2cb"
  },
  "src/dendrux/runtime/stores/sql/_sql_reads.py::_SqlReads.count_runs": {
-  "complexity": 1,
+  "complexity": 2,
   "coverage": 1.0,
-  "crap": 1.0,
-  "digest": "da2bea5d3b50"
+  "crap": 2.0,
+  "digest": "ef90f70b757b",
+  "waived": {
+   "date": "2026-11-22",
+   "reason": "owner 2026-11-22: accepted rises of up to 2 from the waiting_for option (include_waiting branch, paused-detail label lookup)",
+   "rule": "worse"
+  }
  },
  "src/dendrux/runtime/stores/sql/_sql_reads.py::_SqlReads.get_llm_interactions": {
   "complexity": 7,
@@ -17486,10 +17491,15 @@
   "digest": "edd26b78b6bd"
  },
  "src/dendrux/runtime/stores/sql/_sql_reads.py::_SqlReads.list_runs": {
-  "complexity": 2,
+  "complexity": 3,
   "coverage": 1.0,
-  "crap": 2.0,
-  "digest": "f1ccb86be217"
+  "crap": 3.0,
+  "digest": "1cda26ed3121",
+  "waived": {
+   "date": "2026-11-22",
+   "reason": "owner 2026-11-22: accepted rises of up to 2 from the waiting_for option (include_waiting branch, paused-detail label lookup)",
+   "rule": "worse"
+  }
  },
  "src/dendrux/runtime/stores/sql/_sql_runs.py::_SqlRuns._check_idempotency": {
   "complexity": 5,
@@ -19950,10 +19960,15 @@
   "digest": "d5e6cbb537e3"
  },
  "src/dendrux/store/__init__.py::RunStore.get_run": {
-  "complexity": 2,
+  "complexity": 4,
   "coverage": 1.0,
-  "crap": 2.0,
-  "digest": "176a53e971e6"
+  "crap": 4.0,
+  "digest": "3961616ed30d",
+  "waived": {
+   "date": "2026-11-22",
+   "reason": "owner 2026-11-22: accepted rises of up to 2 from the waiting_for option (include_waiting branch, paused-detail label lookup)",
+   "rule": "worse"
+  }
  },
  "src/dendrux/store/__init__.py::RunStore.get_subtree": {
   "complexity": 3,
