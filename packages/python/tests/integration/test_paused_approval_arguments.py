@@ -58,7 +58,7 @@ async def test_paused_approval_batch_hides_remaining_arguments(store):
             tenant_id="A",
             after_sequence_index=active.sequence_index - 1,
             until_terminal=False,
-            max_duration_s=2,
+            max_duration_s=60,
         ) as feed:
             async for item in feed:
                 assert secret not in json.dumps(item.data)
