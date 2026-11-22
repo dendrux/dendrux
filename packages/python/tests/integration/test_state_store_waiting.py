@@ -206,3 +206,28 @@ async def test_public_detail_label_query_keeps_runtime_read_unchanged(store, eng
         assert len(statements) == 1
     finally:
         event.remove(engine.sync_engine, "before_cursor_execute", capture)
+
+
+async def test_subtree_labels_cost_one_extra_read_not_one_per_run(store, engine) -> None:
+    """Runtime BFS stays label-free; the public subtree adds one chunked label query."""
+    await store.create_run("root", "Test")
+    for i in range(12):
+        await store.create_run(f"kid-{i}", "Test", parent_run_id="root")
+    await store.create_run("grandkid", "Test", parent_run_id="kid-0")
+    await store.pause_run(
+        "grandkid", status="paused", pause_data={"v": 4, "pause_reason": "managed_wait"}
+    )
+    statements: list[str] = []
+
+    def capture(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    event.listen(engine.sync_engine, "before_cursor_execute", capture)
+    try:
+        tree = await RunStore(store).get_subtree("root")
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", capture)
+    assert {n.run.run_id: n.run.waiting_for for n in tree.nodes}["grandkid"] == "subagents"
+    # root + 3 BFS levels (kids, grandkid, empty) + usage + labels
+    assert len(statements) == 6
+    assert sum("pause_data" in s and "WHERE agent_runs.id IN" in s for s in statements) == 1

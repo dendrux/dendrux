@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from functools import partial
 from typing import TYPE_CHECKING
 
 from sqlalchemy import select
 
 from dendrux import _codes
+from dendrux.db.models import AgentRun
 from dendrux.runtime._bounds import (
     DEFAULT_READ_LIMIT,
     DEFAULT_SUBTREE_DEPTH,
@@ -43,8 +43,6 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from sqlalchemy.ext.asyncio import AsyncSession
-
-    from dendrux.db.models import AgentRun
 
 
 class _SqlTree(_StoreHost):
@@ -271,7 +269,6 @@ class _SqlTree(_StoreHost):
         light: bool,
         max_nodes: int | None,
         loaded: int,
-        waiting_labels: dict[str, str | None] | None = None,
     ) -> list[AgentRun]:
         from sqlalchemy.orm import load_only
 
@@ -280,8 +277,6 @@ class _SqlTree(_StoreHost):
         stmt = _apply_tenant_scope(
             select(AgentRun).where(AgentRun.parent_run_id.in_(parent_ids)), tenant_id
         )
-        if waiting_labels is not None:
-            stmt = stmt.add_columns(_waiting_for_expression(self))
         if light:
             stmt = stmt.options(load_only(AgentRun.id, AgentRun.parent_run_id, AgentRun.tenant_id))
         if max_nodes is not None:
@@ -289,10 +284,6 @@ class _SqlTree(_StoreHost):
         result = await session.execute(
             self._parent_run_query(stmt.order_by(AgentRun.created_at, AgentRun.id))
         )
-        if waiting_labels is not None:
-            rows = result.all()
-            waiting_labels.update((row.id, label) for row, label in rows)
-            return [row for row, _ in rows]
         return list(result.scalars())
 
     async def _bfs_descendants(
@@ -303,7 +294,6 @@ class _SqlTree(_StoreHost):
         tenant_id: TenantScope = UNSCOPED,
         light: bool = False,
         max_nodes: int | None = None,
-        waiting_labels: dict[str, str | None] | None = None,
     ) -> list[tuple[AgentRun, int]]:
         """Descendants of ``root_id`` as ``(row, depth)`` in BFS order, root excluded.
 
@@ -312,9 +302,6 @@ class _SqlTree(_StoreHost):
         everything below them. ``light`` loads only id / parent / tenant so
         usage-only callers don't pull large JSON columns.
         """
-        batch = self._descendant_batch
-        if waiting_labels is not None:
-            batch = partial(batch, waiting_labels=waiting_labels)
         seen: set[str] = {root_id}
         current_level = [root_id]
         found: list[tuple[AgentRun, int]] = []
@@ -325,7 +312,7 @@ class _SqlTree(_StoreHost):
             rows: list[AgentRun] = []
             for i in range(0, len(current_level), _IN_CHUNK):
                 rows.extend(
-                    await batch(
+                    await self._descendant_batch(
                         session,
                         root_id,
                         current_level[i : i + _IN_CHUNK],
@@ -453,6 +440,21 @@ class _SqlTree(_StoreHost):
                 )
         return out
 
+    async def _waiting_labels_by_run(
+        self, session: AsyncSession, run_ids: list[str]
+    ) -> dict[str, str | None]:
+        """``waiting_for`` label per run id, one query per ``_IN_CHUNK`` ids.
+
+        Ids come from an already tenant-scoped traversal, so no scope is applied.
+        """
+        out: dict[str, str | None] = {}
+        for i in range(0, len(run_ids), _IN_CHUNK):
+            stmt = select(AgentRun.id, _waiting_for_expression(self)).where(
+                AgentRun.id.in_(run_ids[i : i + _IN_CHUNK])
+            )
+            out.update((rid, label) for rid, label in (await session.execute(stmt)).all())
+        return out
+
     async def get_subtree(
         self, run_id: str, *, tenant_id: TenantScope = UNSCOPED, max_nodes: int | None = None
     ) -> SubtreeRecord | None:
@@ -461,15 +463,10 @@ class _SqlTree(_StoreHost):
         from dendrux.db.models import AgentRun
 
         async with self._session_factory() as session:
-            stmt = _apply_tenant_scope(
-                select(AgentRun, _waiting_for_expression(self)).where(AgentRun.id == run_id),
-                tenant_id,
-            )
-            row = (await session.execute(stmt)).one_or_none()
-            if row is None:
+            stmt = _apply_tenant_scope(select(AgentRun).where(AgentRun.id == run_id), tenant_id)
+            root = (await session.execute(stmt)).scalar_one_or_none()
+            if root is None:
                 return None
-            root, label = row
-            waiting_labels = {root.id: label}
 
             rows = [
                 (root, 0),
@@ -478,10 +475,11 @@ class _SqlTree(_StoreHost):
                     root.id,
                     tenant_id=tenant_id,
                     max_nodes=max_nodes,
-                    waiting_labels=waiting_labels,
                 ),
             ]
-            usage = await self._usage_by_run(session, [r.id for r, _ in rows])
+            ids = [r.id for r, _ in rows]
+            usage = await self._usage_by_run(session, ids)
+            waiting_labels = await self._waiting_labels_by_run(session, ids)
             nodes = [
                 SubtreeNodeRecord(
                     run=_run_to_record(r, waiting_for=waiting_labels[r.id]),
