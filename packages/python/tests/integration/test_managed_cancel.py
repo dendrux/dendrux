@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import time
+from collections import Counter
 from contextlib import AsyncExitStack
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from functools import partial, wraps
+from typing import TYPE_CHECKING, Any
 
 import pytest
-from sqlalchemy import update
+from sqlalchemy import text, update
 from sqlalchemy.ext.asyncio import create_async_engine
 
 import dendrux
@@ -35,9 +38,14 @@ from tests.integration.test_managed_adoption import (
     crash_before_adoption,
     fresh_root,
     rows,
+    settle_all,
+    terminal_history,
 )
 from tests.integration.test_managed_bind import bind_request, managed_parent
 from tests.integration.test_managed_routing import ContextLLM, call, read_sheet
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
 
 TENANT = "t1"
 
@@ -305,8 +313,37 @@ async def parallel_stores(engine: Any, stack: AsyncExitStack, count: int = 8) ->
     for _ in range(count):
         other = create_async_engine(engine.url, pool_size=1, max_overflow=0)
         stack.push_async_callback(other.dispose)
+        async with other.connect() as conn:  # warm the one pooled connection before the race
+            await conn.execute(text("SELECT 1"))
         stores.append(store_for_engine(other))
     return stores
+
+
+async def together(*calls: Callable[[], Awaitable[Any]]) -> list[Any]:
+    """Release every call through one barrier and join them all; return results or errors."""
+    ready = asyncio.Event()
+
+    async def gated(call: Callable[[], Awaitable[Any]]) -> Any:
+        await ready.wait()
+        return await call()
+
+    tasks = [asyncio.create_task(gated(call)) for call in calls]
+    await asyncio.sleep(0)  # every task is parked on the barrier
+    ready.set()
+    return await settle_all(*tasks)
+
+
+async def settled_histories(engine: Any, *run_ids: str) -> list[Any]:
+    return [await terminal_history(engine, run_id) for run_id in run_ids]
+
+
+async def later_cancel_changes_nothing(engine: Any, store: Any, root: str, *run_ids: str) -> None:
+    """A follow-up control attempt appends no event and revives no run."""
+    before = await settled_histories(engine, root, *run_ids)
+    statuses = [(await store.get_run(rid)).status for rid in (root, *run_ids)]
+    await dendrux.cancel_run(root, tenant_id=TENANT, state_store=store)
+    assert await settled_histories(engine, root, *run_ids) == before
+    assert [(await store.get_run(rid)).status for rid in (root, *run_ids)] == statuses
 
 
 @pytest.mark.parametrize("canceller", ["agent", "module"])
@@ -315,18 +352,12 @@ async def test_pg_cancel_versus_eight_binders_has_no_orphans(
     store: Any, engine: Any, round_: int, canceller: str
 ) -> None:
     async with AsyncExitStack() as stack:
-        stores = await parallel_stores(engine, stack)
+        *stores, cancel_store = await parallel_stores(engine, stack, count=9)
         root, call_id = await managed_parent(store)
-        ready = asyncio.Event()
-
-        async def bind(other: Any) -> Any:
-            await ready.wait()
-            return await other.bind_managed_child(bind_request(root, call_id))
-
-        tasks = [asyncio.create_task(bind(other)) for other in stores]
-        tasks.append(asyncio.create_task(cancel_via(canceller, stores[0], root)))
-        ready.set()
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        results = await together(
+            *(partial(other.bind_managed_child, bind_request(root, call_id)) for other in stores),
+            partial(cancel_via, canceller, cancel_store, root),
+        )
     for result in results:
         assert not isinstance(result, BaseException) or isinstance(result, RunCancelledError), (
             result
@@ -340,6 +371,33 @@ async def test_pg_cancel_versus_eight_binders_has_no_orphans(
     if children:
         assert intents[0].meta["managed"]["child_run_id"] == children[0].id
         assert children[0].cancel_requested
+
+
+@pytest.mark.parametrize("canceller", ["agent", "module"])
+@pytest.mark.parametrize("first", ["cancel", "bind"])
+async def test_pg_cancel_and_bind_in_a_fixed_order(
+    store: Any, engine: Any, first: str, canceller: str
+) -> None:
+    """Both orders, made explicit: a marked parent refuses the bind; a bound child is marked."""
+    async with AsyncExitStack() as stack:
+        binder, cancel_store = await parallel_stores(engine, stack, count=2)
+        root, call_id = await managed_parent(store)
+        if first == "cancel":
+            await cancel_via(canceller, cancel_store, root)
+            with pytest.raises(RunCancelledError):
+                await binder.bind_managed_child(bind_request(root, call_id))
+        else:
+            bound = await binder.bind_managed_child(bind_request(root, call_id))
+            assert bound.outcome == "created"
+            await cancel_via(canceller, cancel_store, root)
+    children = await rows(engine, AgentRun, AgentRun.parent_run_id == root)
+    intents = await rows(engine, ToolCallRecord, ToolCallRecord.agent_run_id == root)
+    assert len(children) == len(intents) == (0 if first == "cancel" else 1)
+    root_row = await store.get_run(root)
+    assert root_row.cancel_requested or root_row.status == "cancelled"
+    if children:
+        assert intents[0].meta["managed"]["child_run_id"] == children[0].id
+        assert children[0].cancel_requested or children[0].status == "cancelled"
 
 
 def submission_root(store: Any) -> Agent:
@@ -358,19 +416,22 @@ async def test_pg_cancel_versus_eight_leaf_submissions(
     store: Any, engine: Any, round_: int, canceller: str
 ) -> None:
     async with AsyncExitStack() as stack:
-        stores = await parallel_stores(engine, stack)
+        *stores, cancel_store = await parallel_stores(engine, stack, count=9)
         _, root, child, pending = await paused_workflow(store)
         agents = [submission_root(other) for other in stores]
         result = ToolResult(name="read_sheet", call_id=pending.tool_calls[0].id, payload='"ok"')
-        results = await asyncio.gather(
+        results = await together(
             *(
-                a.submit_tool_results(
-                    root, [result], tenant_id=TENANT, expected_pause_id=pending.pause_id
+                partial(
+                    a.submit_tool_results,
+                    root,
+                    [result],
+                    tenant_id=TENANT,
+                    expected_pause_id=pending.pause_id,
                 )
                 for a in agents
             ),
-            cancel_via(canceller, stores[0], root),
-            return_exceptions=True,
+            partial(cancel_via, canceller, cancel_store, root),
         )
     for outcome in results:
         assert not isinstance(outcome, BaseException) or isinstance(outcome, RunControlError), (
@@ -383,6 +444,9 @@ async def test_pg_cancel_versus_eight_leaf_submissions(
     assert len(await rows(engine, AgentRun)) == 2
     assert sum(a.subagents[0].provider.calls for a in agents) <= 1
     assert sum(a.provider.calls for a in agents) <= 1
+    calls = [(a.provider.calls, a.subagents[0].provider.calls) for a in agents]
+    await later_cancel_changes_nothing(engine, store, root, child)
+    assert [(a.provider.calls, a.subagents[0].provider.calls) for a in agents] == calls
 
 
 @pytest.mark.parametrize("canceller", ["agent", "module"])
@@ -393,7 +457,7 @@ async def test_pg_cancel_versus_eight_reclaims(
     from tests.integration.test_managed_recovery import _dead_child, lead, reviewer
 
     async with AsyncExitStack() as stack:
-        stores = await parallel_stores(engine, stack)
+        *stores, cancel_store = await parallel_stores(engine, stack, count=9)
         root, child = await _dead_child(store, engine)
         await expire(store, engine, child.id)
         before = await store.get_run(child.id)
@@ -405,10 +469,9 @@ async def test_pg_cancel_versus_eight_reclaims(
             )
             for other in stores
         ]
-        results = await asyncio.gather(
-            *(a.reclaim(root, tenant_id=TENANT) for a in agents),
-            cancel_via(canceller, stores[0], root),
-            return_exceptions=True,
+        results = await together(
+            *(partial(a.reclaim, root, tenant_id=TENANT) for a in agents),
+            partial(cancel_via, canceller, cancel_store, root),
         )
     for outcome in results:
         assert not isinstance(outcome, BaseException) or isinstance(outcome, RunControlError), (
@@ -424,6 +487,9 @@ async def test_pg_cancel_versus_eight_reclaims(
     assert len(await rows(engine, AgentRun)) == 2
     assert sum(a.subagents[0].provider.calls for a in agents) <= 1
     assert sum(a.provider.calls for a in agents) <= 1
+    calls = [(a.provider.calls, a.subagents[0].provider.calls) for a in agents]
+    await later_cancel_changes_nothing(engine, store, root, child.id)
+    assert [(a.provider.calls, a.subagents[0].provider.calls) for a in agents] == calls
 
 
 @pytest.mark.parametrize("canceller", ["agent", "module"])
@@ -434,13 +500,12 @@ async def test_pg_cancel_versus_eight_adoptions(
     from dendrux.db.models import ReactTrace, RunEvent
 
     async with AsyncExitStack() as stack:
-        stores = await parallel_stores(engine, stack)
+        *stores, cancel_store = await parallel_stores(engine, stack, count=9)
         root, child = await crash_before_adoption(store, engine, monkeypatch)
         agents = [fresh_root(other, LLMResponse(text="done"))[0] for other in stores]
-        results = await asyncio.gather(
-            *(a.reclaim(root, tenant_id=TENANT) for a in agents),
-            cancel_via(canceller, stores[0], root),
-            return_exceptions=True,
+        results = await together(
+            *(partial(a.reclaim, root, tenant_id=TENANT) for a in agents),
+            partial(cancel_via, canceller, cancel_store, root),
         )
     for outcome in results:
         assert not isinstance(outcome, BaseException) or isinstance(outcome, RunControlError), (
@@ -460,6 +525,9 @@ async def test_pg_cancel_versus_eight_adoptions(
     assert len(await rows(engine, TokenUsage, TokenUsage.agent_run_id == child)) == 1
     assert sum(a.provider.calls for a in agents) <= 1
     assert sum(a.subagents[0].provider.calls for a in agents) == 0
+    calls = [(a.provider.calls, a.subagents[0].provider.calls) for a in agents]
+    await later_cancel_changes_nothing(engine, store, root, child)
+    assert [(a.provider.calls, a.subagents[0].provider.calls) for a in agents] == calls
 
 
 async def run_events(engine: Any, run_id: str) -> list[Any]:
@@ -479,23 +547,27 @@ async def noop() -> str:
 async def test_pg_module_cancels_versus_live_running_owner(
     store: Any, engine: Any, gate_at: int, expected: str
 ) -> None:
-    """Cancellers only set the durable request; the owner settles; nothing is revived."""
+    """Checkpoint orders, made explicit: cancels finish while the owner waits in a model call."""
     async with AsyncExitStack() as stack:
         owner_store, *stores = await parallel_stores(engine, stack, count=5)
         llm = ScriptedLLM([tool_call("noop", pid="n1"), LLMResponse(text="done")], gate_at=gate_at)
         owner = Agent(name="owner", prompt="p", provider=llm, tools=[noop], state_store=owner_store)
         task = asyncio.create_task(owner.run("go", tenant_id=TENANT))
+        cancels: list[asyncio.Task[Any]] = []
         try:
             await asyncio.wait_for(llm.entered.wait(), 10)
             run_id = (await store.list_runs())[0].id
             before = await store.get_run(run_id)
-            results = await asyncio.gather(
-                *(dendrux.cancel_run(run_id, tenant_id=TENANT, state_store=s) for s in stores)
-            )
+            cancels = [
+                asyncio.create_task(dendrux.cancel_run(run_id, tenant_id=TENANT, state_store=s))
+                for s in stores
+            ]
+            results = await asyncio.gather(*cancels)
             during = await store.get_run(run_id)
         finally:
+            # Join every task on every path before the engines are disposed.
             llm.gate.set()
-        outcome = await asyncio.wait_for(task, 10)
+            *_, outcome = await settle_all(*cancels, task)
     assert {(r.status, r.meta["cancel_requested"]) for r in results} == {(RunStatus.RUNNING, True)}
     assert (during.status, during.claim_epoch) == ("running", before.claim_epoch)
     assert outcome.status.value == expected
@@ -508,6 +580,114 @@ async def test_pg_module_cancels_versus_live_running_owner(
     again = await dendrux.cancel_run(run_id, tenant_id=TENANT, state_store=store)
     assert again.status.value == expected
     assert [e.event_type for e in await run_events(engine, run_id)] == events
+
+
+# Canceller start relative to the owner's release, in ms (negative: owner released later).
+RACE_OFFSETS_MS = (-6, -3, -2, -1, -0.5, 0, 0, 0, 0.5, 1, 2, 3, 4, 6, 9, 14, 20, 30, 45, 70, 100)
+
+
+def timed(spans: list[tuple[float, float]], method: Any) -> Any:
+    """Wrap a store method (keeping its signature for capability checks) to time its work."""
+
+    @wraps(method)
+    async def call(*args: Any, **kwargs: Any) -> Any:
+        begun = time.monotonic()
+        try:
+            return await method(*args, **kwargs)
+        finally:
+            spans.append((begun, time.monotonic()))
+
+    return call
+
+
+@pytest.mark.parametrize("script", ["final", "tool_then_final"])
+async def test_pg_module_cancels_race_owner_finalization(
+    store: Any, engine: Any, monkeypatch: Any, script: str
+) -> None:
+    """Owner and cancellers are released together, so cancel writes race the owner's finalize.
+
+    Either the request lands first (the owner then completes, or stops at a checkpoint) or the
+    owner's finalize wins (the canceller finds a terminal row). Both orders must occur, and
+    neither may revive the run, change its epoch or write a second terminal event.
+    """
+    orders: Counter[str] = Counter()
+    overlaps = 0
+    async with AsyncExitStack() as stack:
+        owner_store, *cancel_stores = await parallel_stores(engine, stack, count=3)
+        finalize_spans: list[tuple[float, float]] = []
+        request_spans: list[tuple[float, float]] = []
+        monkeypatch.setattr(
+            owner_store,
+            "finalize_with_event",
+            timed(finalize_spans, owner_store.finalize_with_event),
+        )
+        for other in cancel_stores:
+            for name in ("request_cancel", "mark_cancel_requested"):
+                monkeypatch.setattr(other, name, timed(request_spans, getattr(other, name)))
+        for offset in RACE_OFFSETS_MS * 2:
+            finalize_spans.clear()
+            request_spans.clear()
+            order = await race_once(store, engine, owner_store, cancel_stores, offset, script)
+            orders[order] += 1
+            overlaps += any(
+                begun < f_end and f_begun < end
+                for begun, end in request_spans
+                for f_begun, f_end in finalize_spans
+            )
+    print(f"\nRACE {script}: orders={dict(orders)} sql_overlaps={overlaps}")
+    seen = {key.split(":")[0] for key in orders}
+    assert seen == {"cancel_first", "finalize_first"}, orders
+
+
+async def race_once(
+    store: Any, engine: Any, owner_store: Any, cancel_stores: list[Any], offset: float, script: str
+) -> str:
+    responses = [LLMResponse(text="done")]
+    if script == "tool_then_final":
+        responses.insert(0, tool_call("noop", pid="n1"))
+    llm = ContextLLM(responses)
+    llm.gate_at = 0  # hold the owner in its first model call; both start from there
+    owner = Agent(name="owner", prompt="p", provider=llm, tools=[noop], state_store=owner_store)
+    start = asyncio.Event()
+    run_task = asyncio.create_task(owner.run("go", tenant_id=TENANT))
+    tasks: list[asyncio.Task[Any]] = []
+    try:
+        await asyncio.wait_for(llm.entered.wait(), 10)
+        run_id = llm.served[-1]
+        epoch = (await store.get_run(run_id)).claim_epoch
+
+        async def release() -> None:
+            await start.wait()
+            await asyncio.sleep(max(-offset, 0) / 1000)
+            llm.gate.set()
+
+        async def cancel(other: Any) -> Any:
+            await start.wait()
+            await asyncio.sleep(max(offset, 0) / 1000)
+            return await dendrux.cancel_run(run_id, tenant_id=TENANT, state_store=other)
+
+        tasks = [asyncio.create_task(release())]
+        tasks += [asyncio.create_task(cancel(other)) for other in cancel_stores]
+        start.set()
+        results = await asyncio.gather(*tasks[1:])
+    finally:
+        llm.gate.set()
+        *_, outcome = await settle_all(*tasks, run_task)
+    assert not isinstance(outcome, BaseException), outcome
+    outcomes = {item["outcome"] for r in results for item in r.meta["cascade"]}
+    assert outcomes <= {"terminal", "cancel_requested"}, outcomes
+    final = await store.get_run(run_id)
+    assert final.status == outcome.status.value
+    assert final.status in {"success", "cancelled"}
+    assert final.claim_epoch == epoch
+    history = await terminal_history(engine, run_id)
+    again = await dendrux.cancel_run(run_id, tenant_id=TENANT, state_store=store)
+    assert again.status.value == final.status
+    assert await terminal_history(engine, run_id) == history
+    # The request landed first if the owner stopped on it, or a canceller saw it RUNNING.
+    landed = final.status == "cancelled" or "cancel_requested" in outcomes
+    order = "cancel_first" if landed else "finalize_first"
+    return f"{order}:{final.status}"
 
 
 @pytest.mark.parametrize("callers", ["module", "mixed"])
