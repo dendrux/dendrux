@@ -441,12 +441,14 @@ class _SqlTree(_StoreHost):
         return out
 
     async def _waiting_labels_by_run(
-        self, session: AsyncSession, run_ids: list[str]
+        self, session: AsyncSession, rows: list[tuple[AgentRun, int]]
     ) -> dict[str, str | None]:
-        """``waiting_for`` label per run id, one query per ``_IN_CHUNK`` ids.
+        """``waiting_for`` label per paused run, one query per ``_IN_CHUNK`` paused ids.
 
-        Ids come from an already tenant-scoped traversal, so no scope is applied.
+        Only stored-paused runs can carry a label, so a subtree with none costs no query.
+        ``rows`` are ``(run, depth)`` from a tenant-scoped traversal, so no scope is applied.
         """
+        run_ids = [r.id for r, _ in rows if r.status == "paused"]
         out: dict[str, str | None] = {}
         for i in range(0, len(run_ids), _IN_CHUNK):
             stmt = select(AgentRun.id, _waiting_for_expression(self)).where(
@@ -479,10 +481,10 @@ class _SqlTree(_StoreHost):
             ]
             ids = [r.id for r, _ in rows]
             usage = await self._usage_by_run(session, ids)
-            waiting_labels = await self._waiting_labels_by_run(session, ids)
+            waiting_labels = await self._waiting_labels_by_run(session, rows)
             nodes = [
                 SubtreeNodeRecord(
-                    run=_run_to_record(r, waiting_for=waiting_labels[r.id]),
+                    run=_run_to_record(r, waiting_for=waiting_labels.get(r.id)),
                     depth=d,
                     usage=usage.get(r.id, UsageRollup()),
                 )

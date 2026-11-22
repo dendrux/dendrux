@@ -231,3 +231,22 @@ async def test_subtree_labels_cost_one_extra_read_not_one_per_run(store, engine)
     # root + 3 BFS levels (kids, grandkid, empty) + usage + labels
     assert len(statements) == 6
     assert sum("pause_data" in s and "WHERE agent_runs.id IN" in s for s in statements) == 1
+
+
+async def test_subtree_without_paused_runs_makes_no_label_query(store, engine) -> None:
+    await store.create_run("root", "Test")
+    await store.create_run("kid", "Test", parent_run_id="root")
+    statements: list[str] = []
+
+    def capture(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    event.listen(engine.sync_engine, "before_cursor_execute", capture)
+    try:
+        tree = await RunStore(store).get_subtree("root")
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", capture)
+    assert {n.run.waiting_for for n in tree.nodes} == {None}
+    # root + 2 BFS levels (kid, empty) + usage; paused subtree above costs exactly one more
+    assert len(statements) == 4
+    assert not any("pause_data" in s and "WHERE agent_runs.id IN" in s for s in statements)
