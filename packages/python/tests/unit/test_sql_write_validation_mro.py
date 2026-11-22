@@ -873,7 +873,8 @@ def _canonical_waiting_reads(members):
     }
     del members["get_waiting_for"]
     assert members["_waiting_labels_by_run"]["signature"] == (
-        "(self, session: 'AsyncSession', run_ids: 'list[str]') -> 'dict[str, str | None]'"
+        "(self, session: 'AsyncSession', rows: 'list[tuple[AgentRun, int]]')"
+        " -> 'dict[str, str | None]'"
     ), "_waiting_labels_by_run"
     del members["_waiting_labels_by_run"]
 
