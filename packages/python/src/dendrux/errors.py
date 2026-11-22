@@ -1372,17 +1372,17 @@ class BudgetConfigurationError(_KwargsReduceMixin, ValueError):
 class TenantScopeRequiredError(_KwargsReduceMixin, ValueError):
     """An entry point was called without ``tenant_id`` on an ``Agent(strict_tenancy=True)``.
 
-    ``operation`` names the method (``"run"``, ``"submit_input"``, ...).
+    ``operation`` names the method; a non-empty ``message`` replaces the default text.
     """
 
-    _init_fields = ("operation",)
+    _init_fields = ("operation", "message")
 
-    def __init__(self, operation: str) -> None:
+    def __init__(self, operation: str, *, message: str | None = None) -> None:
         self.operation = operation
-        super().__init__(
-            f"{operation}() requires an explicit tenant_id= because the agent has "
-            "strict_tenancy=True. For delegated runs, pass tenant_id on the outer run."
-        )
+        self.message = message
+        default = f"{operation}() requires an explicit tenant_id= because the agent has "
+        default += "strict_tenancy=True. For delegated runs, pass tenant_id on the outer run."
+        super().__init__(message or default)
 
 
 class NoteLimitExceededError(_KwargsReduceMixin, ValueError):

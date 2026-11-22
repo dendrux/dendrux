@@ -48,6 +48,7 @@ from dendrux.runtime._bounds import (
     SWEEP_MAX_RUNS_MAX,
 )
 from dendrux.runtime._capabilities import capabilities, validate_capabilities
+from dendrux.runtime._run_events import _shielded_cleanup
 from dendrux.runtime.durability import _live_updates_boundary
 from dendrux.runtime.state import SweepResult, _validate_sweep_age
 
@@ -398,7 +399,7 @@ async def sweep(
             )
         finally:
             if engine is not None:
-                await engine.dispose()
+                await _shielded_cleanup(engine.dispose)
 
 
 def _validate_scan_limits(
@@ -475,7 +476,8 @@ async def _create_temp_store(
         else:
             await ensure_schema_current(engine)
     except BaseException:
-        await engine.dispose()
+        # Finish disposal even if the caller cancels meanwhile, then re-raise that cancel.
+        await _shielded_cleanup(engine.dispose)
         raise
 
     store = store_for_engine(engine)

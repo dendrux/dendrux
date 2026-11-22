@@ -17,10 +17,10 @@ from dendrux.errors import (
 )
 from dendrux.runtime._bounds import MAX_SMALL_PAGE
 from dendrux.runtime._managed_tree import WaitNode, _descend
-from dendrux.types import Budget, RunResult, RunStatus, ToolResult, _usage_from_dict
+from dendrux.types import RunResult, RunStatus, ToolResult, _usage_from_dict
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
     from dendrux.agent import Agent
     from dendrux.loops.base import LoopNotifier, LoopRecorder
@@ -494,15 +494,18 @@ async def managed_child_header(store: Any, record: RunRecord) -> bool:
 
 
 async def mark_subtree(
-    agent: Any,
     store: Any,
     run_id: str,
     *,
     tenant_id: str | None,
+    limit: int,
+    signal: Callable[[str], object],
     pages: CancelPageReader | None = None,
 ) -> tuple[list[list[str]], bool]:
-    """Mark before scanning each bounded frontier, and retain skipped-child diagnostics."""
-    limit = agent._budget.max_subtree_nodes if agent._budget else Budget.max_subtree_nodes
+    """Mark before scanning each bounded frontier, and retain skipped-child diagnostics.
+
+    ``limit`` bounds the visited runs; ``signal`` interrupts local work for each marked run.
+    """
     if not can_mark_cancel(store):
         return await legacy_cancel_levels(store, run_id, tenant_id, limit)
     mark = _state().require_store_method(store, "mark_cancel_requested")
@@ -513,7 +516,7 @@ async def mark_subtree(
         # Wait for creators holding parent FOR SHARE before scanning committed children.
         if await mark(frontier, tenant_id=tenant_id):
             for rid in frontier:
-                agent._task_manager.cancel(rid)
+                signal(rid)
         if truncated:
             break
         following, truncated = await _scan_frontier(pages, frontier, tenant_id, visited, limit)
@@ -564,31 +567,3 @@ def _record_child(
         _codes.log_code(logger, _codes.CASCADE_CHILD_SKIPPED, run_id=child)
     else:
         following.append(child)
-
-
-async def cancel_descendants(
-    agent: Any,
-    store: Any,
-    run_id: str,
-    tenant_id: str | None,
-    frontier_signals: bool,
-    outcomes: list[dict[str, str]],
-    to_signal: list[str],
-    pages: CancelPageReader | None = None,
-) -> tuple[int, bool]:
-    """Settle deepest descendants and project bounded cancellation/skip outcomes."""
-    levels, truncated = await agent._mark_cancel_subtree(
-        store, run_id, tenant_id=tenant_id, pages=pages
-    )
-    if pages is not None:
-        outcomes.extend({"run_id": rid, "outcome": "skipped"} for rid in pages.skipped_run_ids)
-    count = 0
-    descendants = (rid for level in reversed(levels) for rid in level if rid != run_id)
-    for rid in descendants:
-        outcome = await agent._cancel_one(store, rid, signal=False)
-        if outcome != "terminal" and not frontier_signals:
-            to_signal.append(rid)
-        count += 1
-        if len(outcomes) < _CANCEL_OUTCOME_LIMIT:
-            outcomes.append({"run_id": rid, "outcome": outcome})
-    return count, truncated

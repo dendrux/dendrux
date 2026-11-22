@@ -44,6 +44,7 @@ from dendrux.errors import (
 from dendrux.loops.single import SingleCall
 from dendrux.media import Image, ToolOutput
 from dendrux.pricing import ModelPricing, PriceTable
+from dendrux.runtime.cancel import cancel_run
 from dendrux.runtime.context import DelegationDepthExceededError, aheartbeat, heartbeat
 from dendrux.runtime.runner import run
 from dendrux.runtime.state import UNSCOPED
@@ -138,6 +139,7 @@ __all__ = [
     "ToolResultTransform",
     "UNSCOPED",
     "aheartbeat",
+    "cancel_run",
     "heartbeat",
     "run",
     "sweep",
