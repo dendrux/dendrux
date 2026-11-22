@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Run every TLC check of formal/DendruxRuns.tla and compare with the expected result.
 #
-#   formal/check.sh            all checks
-#   formal/check.sh quick      skip the two long safety runs
+#   formal/check.sh            all checks (real configs, bug variants, reachability probes)
+#   formal/check.sh quick      skip the longest configs
 #
 # Environment:
 #   TLA2TOOLS_JAR  path to tla2tools.jar v1.7.4 (default ~/.local/share/tlaplus/tla2tools.jar)
@@ -29,12 +29,16 @@ fi
 scratch="$(mktemp -d)"
 trap 'rm -rf "$scratch"' EXIT
 
-# config | expected: PASS, or the name of the property TLC must report as violated
+# config | expected: PASS; the name of the property TLC must report as violated;
+# or REACH:<probe>, a reachability probe whose violation is the witness.
 checks=(
   "DendruxRuns.cfg|PASS"
+  "DendruxRunsRecovery.cfg|PASS"
+  "DendruxRunsTruncation.cfg|PASS"
   "DendruxRunsTwoCancels.cfg|PASS"
   "DendruxRunsLive.cfg|PASS"
   "DendruxRunsLivePauses.cfg|PASS"
+  "DendruxRunsLiveRecovery.cfg|PASS"
   "bugs/BugCancelRunning.cfg|NoCancellerFinalizesRunning"
   "bugs/BugSweepNoBump.cfg|StaleWriteFails"
   "bugs/BugFinalizeNoEpoch.cfg|StaleWriteFails"
@@ -42,12 +46,19 @@ checks=(
   "bugs/BugBindIgnoresCancel.cfg|OrphanWindow"
   "bugs/NoCancelRetry.cfg|CancelLeadsToTerminal"
 )
+for probe in "$here"/probes/*.cfg; do
+  name="$(basename "$probe" .cfg)"
+  checks+=("probes/$name.cfg|REACH:$name")
+done
+
+# Skipped by quick mode.
+long_configs="DendruxRunsTwoCancels.cfg DendruxRunsLivePauses.cfg"
 
 failed=0
 for entry in "${checks[@]}"; do
   cfg="${entry%%|*}"
   expected="${entry##*|}"
-  if [[ "$mode" == "quick" && ( "$cfg" == "DendruxRuns.cfg" || "$cfg" == "DendruxRunsTwoCancels.cfg" ) ]]; then
+  if [[ "$mode" == "quick" && " $long_configs " == *" $cfg "* ]]; then
     echo "SKIP  $cfg (quick mode)"
     continue
   fi
@@ -75,14 +86,20 @@ for entry in "${checks[@]}"; do
       failed=1
     fi
   else
-    if [[ "$expected" == "CancelLeadsToTerminal" ]]; then
+    if [[ "$expected" == REACH:* ]]; then
+      expected="${expected#REACH:}"
+      pattern="(Invariant|Action property) ${expected} is violated"
+      label="REACHED"
+    elif [[ "$expected" == "CancelLeadsToTerminal" ]]; then
       # TLC does not name a violated liveness property; this config checks only that one.
       pattern="Temporal properties were violated"
+      label="CAUGHT"
     else
       pattern="Invariant ${expected} is violated"
+      label="CAUGHT"
     fi
-    if [[ $code -ne 0 ]] && grep -q "$pattern" "$log"; then
-      echo "CAUGHT $cfg: $expected violated (${secs}s) $states"
+    if [[ $code -ne 0 ]] && grep -qE "$pattern" "$log"; then
+      echo "$label $cfg: $expected violated (${secs}s) $states"
     else
       echo "MISSED $cfg: expected a violation of $expected, TLC exit $code"
       cat "$log"
