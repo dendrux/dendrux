@@ -281,11 +281,47 @@ def _postgres(engine: Any) -> None:
 TERMINAL_EVENTS = {"run.completed": "success", "run.error": "error", "run.cancelled": "cancelled"}
 
 
-async def settle_all(*tasks: Any, timeout: float = 10) -> list[Any]:
-    """Join every task within a bound (stragglers are cancelled); return results or errors."""
-    return await asyncio.gather(
-        *(asyncio.wait_for(task, timeout) for task in tasks), return_exceptions=True
-    )
+async def settle_all(*tasks: Any, timeout: float = 10, grace: float = 2) -> list[Any]:
+    """Join every task within a hard deadline; return each result or error, in order.
+
+    ``asyncio.wait`` never waits past its timeout. (``wait_for`` would: it waits for a
+    cancelled task to finish, and Dendrux drains shielded cleanup to completion.) Tasks
+    unfinished at ``timeout`` are cancelled and get ``grace`` seconds to stop; any still
+    running then fail the test by name instead of holding the join and the pool open.
+    """
+    if not tasks:
+        return []
+    _, pending = await asyncio.wait(tasks, timeout=timeout)
+    for task in pending:
+        task.cancel()
+    if pending:
+        _, pending = await asyncio.wait(pending, timeout=grace)
+    if pending:
+        names = sorted(repr(task) for task in pending)
+        raise AssertionError(f"tasks still pending after {timeout + grace}s: {names}")
+    return [
+        asyncio.CancelledError() if task.cancelled() else task.exception() or task.result()
+        for task in tasks
+    ]
+
+
+async def test_settle_all_is_a_hard_bound_even_for_shielded_cleanup() -> None:
+    """A task draining shielded cleanup cannot hold the join past its deadline."""
+    from dendrux.runtime.tasks import _drain_cleanup
+
+    gate = asyncio.Event()
+    stuck = asyncio.create_task(_drain_cleanup(gate.wait()))
+    quick = asyncio.create_task(asyncio.sleep(0, result="ok"))
+    join = asyncio.create_task(settle_all(stuck, quick, timeout=0.05, grace=0.05))
+    try:
+        done, _ = await asyncio.wait({join}, timeout=1)
+        assert join in done, "settle_all waited on a task that ignores cancellation"
+        with pytest.raises(AssertionError, match="still pending"):
+            join.result()
+    finally:
+        gate.set()
+        await asyncio.wait({stuck, join}, timeout=5)
+        assert stuck.done() and join.done()
 
 
 async def terminal_history(engine: Any, run_id: str) -> list[tuple[int, str]]:
