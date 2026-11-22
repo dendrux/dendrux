@@ -266,7 +266,7 @@ async function startChat(input) {
 }
 ```
 
-After a page reload, a dropped request or a retried idempotent call, call `GET /runs/{id}/pending` to rebuild the form or the tool call. Nothing is lost, because the pause lives in your database.
+After a page reload, a dropped request or a retried idempotent call, call `GET /runs/{id}/pending` to rebuild the form or the tool call. The pause is still there, because it lives in your database.
 
 `call.id` is the dendrux-owned ULID for the tool call. Use it (not the provider's id) when shipping back the result. The runtime correlates by `call_id`. `payload` is a JSON-encoded string. Encode whatever the LLM should see; dendrux passes it through as the tool message content.
 

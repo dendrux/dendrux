@@ -5,7 +5,7 @@ description: The three situations dendrux is built for, the ones it isn't, and a
 
 # Is dendrux for you?
 
-Dendrux does one thing exceptionally well: it lets an agent run **stop and wait for something outside the process, then resume later** with nothing lost. Everything else in the library exists to make that safe, auditable, and easy.
+Dendrux does one thing exceptionally well: it lets an agent run **stop and wait for something outside the process, then resume later** from its saved state. Everything else in the library exists to make that safe, auditable, and easy.
 
 So the question that decides whether dendrux is for you is short:
 
@@ -17,7 +17,7 @@ If yes, dendrux is built for exactly that. If no, you may not need a persistence
 
 **1. A human has to approve, answer, or intervene mid-run.** Refunds over a threshold, a destructive action, a clarifying question the model can't resolve alone. The run pauses at `waiting_approval` or `waiting_human_input`, persists, and resumes when the person responds, possibly hours later, possibly from a different process. See [Human-in-the-loop approval](/docs/recipes/hitl-approval).
 
-**2. A tool runs on the client, not your server.** A spreadsheet cell the user has to fill, a browser action, a desktop app, a device. The server can't execute that tool, so the run pauses at `waiting_client_tool`, ships the call to the client, and resumes when the client posts the result back. This is the case most agent libraries don't have an answer for. See [Client-side tools](/docs/recipes/client-tools).
+**2. A tool runs on the client, not your server.** A spreadsheet cell the user has to fill, a browser action, a desktop app, a device. The server can't execute that tool, so the run pauses at `waiting_client_tool`, ships the call to the client, and resumes when the client posts the result back. See [Client-side tools](/docs/recipes/client-tools).
 
 **3. A run is long, multi-step, and must survive a restart and be auditable.** Deploys happen, processes get OOM-killed, machines reboot. With dendrux the run's full state is on disk, so a fresh process resumes it by ID, and every LLM call, tool execution, and pause is recorded as evidence you can query. See [State persistence](/docs/architecture/state-persistence) and the [observability stack](/docs/recipes/observability).
 
