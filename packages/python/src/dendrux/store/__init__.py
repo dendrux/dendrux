@@ -848,8 +848,7 @@ class RunStore:
     ) -> list[RunSummary]:
         """List filtered runs newest first; limit 1..1000, offset at most 10,000.
 
-        Omit ``tenant_id`` (``UNSCOPED``) for all tenants, pass a string for one
-        tenant, or ``None`` for untenanted runs only (changed in 0.5.0).
+        Omit ``tenant_id`` for all tenants, pass a string for one, or ``None`` for untenanted runs.
         ``started_after`` / ``started_before`` must be aware; comparisons use UTC.
         ``metadata_filter`` matches top-level scalar str/int/float/bool/None values,
         e.g. ``{"thread_id": "..."}``. Keys match ``[A-Za-z0-9_-]+``; no nested paths.
@@ -916,7 +915,8 @@ class RunStore:
         )
 
     async def get_run(self, run_id: str, *, tenant_id: TenantScope = UNSCOPED) -> RunDetail | None:
-        """Fetch a single run's detail, or ``None`` if it does not exist or is out of scope."""
+        """Fetch run detail, or ``None`` if missing or out of scope.
+        A paused run's ``waiting_for`` costs one extra primary-key read on a capable store."""
         record = await self._scoped_run(run_id, tenant_id)
         if record is None:
             return None

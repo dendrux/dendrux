@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, TypedDict
 
 import pytest
 
+from dendrux._lifecycle import ACTIVE_STATUS_VALUES
 from dendrux.errors import StoreCapabilityError
 from dendrux.runtime import _capabilities
 from dendrux.runtime.state import RunRecord
@@ -105,9 +106,10 @@ async def test_waiting_filter_preserves_status_scope_and_pagination(dendrux_kit:
     assert [
         row.id for row in await reader.list_runs(status="paused", limit=1, offset=1, **options)
     ] == [rows[1].id]
-    mixed = await reader.list_runs(status=["paused", RunStatus.RUNNING.value], **options)
+    active_statuses = list(ACTIVE_STATUS_VALUES)
+    mixed = await reader.list_runs(status=active_statuses, **options)
     assert {row.id for row in mixed} == expected | {running}
-    assert await reader.count_runs(status=["paused", RunStatus.RUNNING.value], **options) == 3
+    assert await reader.count_runs(status=active_statuses, **options) == 3
     assert await reader.list_runs(status=[], **options) == []
     assert await reader.count_runs(status=[], **options) == 0
     assert await reader.get_run(running, tenant_id="u") is None

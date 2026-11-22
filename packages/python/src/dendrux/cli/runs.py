@@ -17,7 +17,8 @@ from dendrux.runtime._bounds import MAX_LIST_OFFSET, MAX_PAGE
 from dendrux.types import RunStatus
 
 if TYPE_CHECKING:
-    from sqlalchemy import ColumnElement, Select
+    from sqlalchemy import ColumnElement
+    from sqlalchemy.sql import Executable
 
 DEFAULT_RUN_LIMIT = 20
 
@@ -170,7 +171,7 @@ def _format_statement(
     offset: int,
     waiting_for: ColumnElement[str | None],
     include_waiting: bool,
-) -> Select[Any]:
+) -> Executable:
     from dendrux.db.models import AgentRun
 
     statement = (

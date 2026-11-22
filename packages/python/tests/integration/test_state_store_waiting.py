@@ -9,6 +9,7 @@ from sqlalchemy import event, null, update
 
 from dendrux.db.models import AgentRun
 from dendrux.errors import StoreCapabilityError
+from dendrux.runtime.state import StoreCapabilities
 from dendrux.store import RunStore
 from dendrux.testing.store_kit._declaration import Declaration
 from dendrux.testing.store_kit._kit import Kit
@@ -31,6 +32,62 @@ __all__ = [
 @pytest.fixture
 def dendrux_kit(store: Any) -> Kit:
     return Kit({}, store, Declaration.of(store), needs_format_2=False)
+
+
+class _ThirdPartyStore:
+    """A minimal third-party store: delegates reads, declares the waiting capability."""
+
+    capabilities = StoreCapabilities(deployment="single_process", waiting_filter=True)
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+
+    async def list_runs(self, *, include_waiting: bool = True, **kwargs: Any) -> list[Any]:
+        return await self._inner.list_runs(include_waiting=include_waiting, **kwargs)
+
+    async def count_runs(self, *, include_waiting: bool = True, **kwargs: Any) -> int:
+        return await self._inner.count_runs(include_waiting=include_waiting, **kwargs)
+
+    async def get_run(self, run_id: str, *, tenant_id: Any = None) -> Any:
+        return await self._inner.get_run(run_id, tenant_id=tenant_id)
+
+    async def get_subtree(self, run_id: str, **kwargs: Any) -> Any:
+        return await self._inner.get_subtree(run_id, **kwargs)
+
+    async def get_waiting_for(self, run_id: str, *, tenant_id: Any = None) -> str | None:
+        return await self._inner.get_waiting_for(run_id, tenant_id=tenant_id)
+
+
+@pytest.mark.parametrize("wrap", [False, True], ids=["sql", "third_party"])
+@pytest.mark.parametrize("surface", ["list", "detail", "subtree"])
+async def test_facade_reports_waiting_label_for_capable_stores(store, wrap, surface) -> None:
+    await store.create_run("root", "Test", tenant_id="t")
+    await store.create_run("kid", "Test", tenant_id="t", parent_run_id="root")
+    for run_id in ("root", "kid"):
+        await store.pause_run(
+            run_id, status="paused", pause_data={"v": 4, "pause_reason": "managed_wait"}
+        )
+    facade = RunStore(_ThirdPartyStore(store) if wrap else store)
+    if surface == "list":
+        rows = await facade.list_runs(tenant_id="t")
+    elif surface == "detail":
+        rows = [await facade.get_run(run_id, tenant_id="t") for run_id in ("root", "kid")]
+    else:
+        rows = [node.run for node in (await facade.get_subtree("root", tenant_id="t")).nodes]
+    assert len(rows) == 2 and {row.waiting_for for row in rows} == {"subagents"}
+    assert await facade.list_runs(tenant_id="t", include_waiting=False) == []
+    assert await facade.count_runs(tenant_id="t", include_waiting=False) == 0
+
+
+async def test_facade_without_capability_has_no_label_and_refuses_filter() -> None:
+    facade = RunStore(_LegacyStore())
+    assert (await facade.list_runs())[0].waiting_for is None
+    detail = await facade.get_run("legacy")
+    assert detail is not None and detail.waiting_for is None
+    with pytest.raises(StoreCapabilityError):
+        await facade.list_runs(include_waiting=False)
+    with pytest.raises(StoreCapabilityError):
+        await facade.count_runs(include_waiting=False)
 
 
 @pytest.mark.parametrize("pause", [None, null(), [], "managed_wait", 4, True])
