@@ -88,7 +88,7 @@ revert check shows a test is.
 | Config | Checks | Workers | Cancellers | Children | Crashes (worker, per canceller) | Pauses per run |
 |---|---|---|---|---|---|---|
 | `DendruxRuns.cfg` | safety | 2 (symmetric) | 1 | 2 (one ReAct, one SingleCall) | 1, 1 | 1 |
-| `DendruxRunsTwoCancels.cfg` | safety | 2 (symmetric) | 2 | 2 | 0, 0 | 1 |
+| `DendruxRunsTwoCancels.cfg` | safety | 1 | 2 | 2 | 0, 0 | 1 |
 | `DendruxRunsLive.cfg` | liveness | 1 | 1 | 2 | 1, 1 | 0 |
 | `DendruxRunsLivePauses.cfg` | liveness | 1 | 1 | 1 (ReAct) | 1, 1 | 1 |
 
@@ -102,7 +102,7 @@ split in two.
 | 1 worker (liveness) | Liveness is about recovery after a crash; the worker can reclaim its own runs, so a second worker adds states but no new recovery path |
 | 1 root, 2 children | Two children give a real fan-out (N = 2), the all-terminal fan-in, and siblings that settle in either order. One ReAct and one SingleCall child cover both recovery paths |
 | Depth 1 | Each cascade level repeats the same steps: mark a frontier, scan its children, mark them, settle deepest first. Binds under a parent serialize with that parent's mark on the parent row lock, and the root-stopped read covers every depth |
-| 2 cancellers | Concurrent cancels, and a mixed Agent and module caller. Run without crashes to keep the run time down; crashes are covered with one canceller |
+| 2 cancellers | Concurrent cancels, and a mixed Agent and module caller. Run with one worker and no crashes to keep the run time down; two workers and crashes are covered with one canceller |
 | 1 crash | One crash at any step already produces every recovery state: an unowned running row, a marked row, an unadopted wait, a half-done cancel. More crashes repeat them |
 | 1 pause per run | One pause and one claim per run exercise pause, resume, cancel of a paused run and the abandoned sweep, and keep the state space finite |
 | Reclaim limit 1 | One reclaim, then the limit path (sweep finalizes with `reclaim_limit`) |
