@@ -741,6 +741,13 @@ class LiveUpdates(ABC):
             self._degraded(ConnectionError())
 
     def _listener_failure(self, error: BaseException) -> None:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            # No loop runs this coroutine: it is being finalized by close() after
+            # its loop went away, and a failing stream cleanup replaced the
+            # GeneratorExit. End the way close() expects; there is no one to tell.
+            raise GeneratorExit from None
         if _caller_cancelled():
             raise asyncio.CancelledError from None
         self._degraded(error)
