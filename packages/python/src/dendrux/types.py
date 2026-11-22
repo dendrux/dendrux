@@ -64,7 +64,6 @@ ULID_CHARS = 26
 COST_DECIMALS = 6
 
 _PERSISTABLE_TEXT_CHUNK = 65536
-_ERROR_TEXT_CHARS = 500
 _IDENTIFIER_MAX_CHARS = 255
 _DEFAULT_MAX_RESULTS = 1000
 _DEFAULT_BUDGET_WARN_AT = (0.5, 0.75, 0.9)
@@ -2316,7 +2315,10 @@ class IdempotencyConflictError(RuntimeError):
 class StructuredOutputValidationError(RuntimeError):
     """Raised when the LLM response fails validation against the requested output_type.
 
-    Carries the raw response text and the validation error for debugging.
+    ``raw_response`` holds the rejected text for in-memory debugging only: it is
+    never part of ``str(error)``, so it cannot reach a persisted run error,
+    event or log. ``validation_error`` lists error kinds and field locations,
+    never the rejected values.
     ``usage``, ``model`` and ``stop_reason`` describe the LLM call that
     produced the invalid response (``None`` when unknown), so its tokens and
     cost are not lost: the call was made and billed even though its output was
@@ -2345,8 +2347,7 @@ class StructuredOutputValidationError(RuntimeError):
         self._response: LLMResponse | None = None
         super().__init__(
             f"Structured output validation failed for {output_type_name}. "
-            f"Validation error: {validation_error}\n"
-            f"Raw response: {raw_response[:_ERROR_TEXT_CHARS]}"
+            f"Validation error: {validation_error}"
         )
 
 

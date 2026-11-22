@@ -10,9 +10,10 @@ agents — only knows about providers and Pydantic models.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar, get_args
 
 from pydantic import BaseModel, ValidationError
+from pydantic_core.core_schema import ErrorType
 
 from dendrux.llm._calls import complete_call
 from dendrux.types import StructuredOutputValidationError
@@ -22,6 +23,30 @@ if TYPE_CHECKING:
     from dendrux.types import LLMResponse, Message
 
 T = TypeVar("T", bound=BaseModel)
+
+_MAX_SUMMARISED_KINDS = 10
+_KNOWN_ERROR_TYPES = frozenset(get_args(ErrorType))
+
+
+def _safe_error_type(error_type: str) -> str:
+    """Keep Pydantic's built-in error kinds; a custom kind may be built from model text."""
+    return error_type if error_type in _KNOWN_ERROR_TYPES else "custom_error"
+
+
+def _value_free_summary(exc: ValidationError) -> str:
+    """Describe a validation failure by error count and kinds only.
+
+    Pydantic's own text carries the rejected input and custom validator
+    messages, and error locations can hold model-chosen keys, so neither is
+    copied. Kinds are allowlisted, deduplicated in first-seen order and capped.
+    """
+    errors = exc.errors(include_input=False, include_url=False, include_context=False)
+    kinds = list(dict.fromkeys(_safe_error_type(item["type"]) for item in errors))
+    shown = ", ".join(kinds[:_MAX_SUMMARISED_KINDS])
+    more = len(kinds) - _MAX_SUMMARISED_KINDS
+    suffix = f", and {more} more" if more > 0 else ""
+    count = len(errors)
+    return f"{count} validation error{'s' if count != 1 else ''} ({shown}{suffix})"
 
 
 async def structured_complete(
@@ -78,12 +103,14 @@ async def structured_complete(
         error = StructuredOutputValidationError(
             raw_response=raw_text,
             output_type_name=output_type.__name__,
-            validation_error=str(exc),
+            validation_error=_value_free_summary(exc),
             usage=response.usage,
             model=response.model,
             stop_reason=response.stop_reason,
         )
         error._response = response
-        raise error from exc
+        # ``from None``: the Pydantic cause carries the rejected values and would
+        # be formatted by any diagnostic that logs this error's chain.
+        raise error from None
 
     return response, output
