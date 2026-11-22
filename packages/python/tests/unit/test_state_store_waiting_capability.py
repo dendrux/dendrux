@@ -17,6 +17,9 @@ from dendrux.testing.store_kit.contracts.test_waiting_label import _LegacyStore
 class _FilterStore:
     capabilities = StoreCapabilities(waiting_filter=True, deployment="single_process")
 
+    async def get_waiting_for(self, run_id: str, *, tenant_id: object = None) -> str | None:
+        return None
+
     async def list_runs(self, *, include_waiting: bool = True, **kwargs: Any) -> list[Any]:
         assert include_waiting is False
         return []
@@ -68,3 +71,19 @@ async def test_legacy_facade_keeps_default_labels_and_refuses_filter() -> None:
     for method in (reader.list_runs, reader.count_runs):
         with pytest.raises(StoreCapabilityError):
             await method(include_waiting=False)
+
+
+def test_waiting_reader_requires_declaration_and_explicit_method() -> None:
+    from dendrux.runtime import _capabilities
+
+    class UndeclaredReader:
+        async def get_waiting_for(self, run_id: str, *, tenant_id: object = None) -> str:
+            raise AssertionError("undeclared method must not be called")
+
+    assert _capabilities.waiting_filter_reader(UndeclaredReader()) is None
+
+    class MissingReader(_FilterStore):
+        get_waiting_for = None
+
+    with pytest.raises(StoreCapabilityError):
+        _capabilities.waiting_filter_reader(MissingReader())

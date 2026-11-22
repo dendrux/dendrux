@@ -126,7 +126,7 @@ async def _list_runs(
 
     table = Table(title="Agent Runs", show_lines=False)
     table.add_column("ID", style="cyan", no_wrap=True)
-    table.add_column("Agent", style="bold")
+    table.add_column("Agent", style="bold", no_wrap=True)
     table.add_column("Status", no_wrap=True)
     table.add_column("Waiting for", no_wrap=True)
     table.add_column("Iters", justify="right")

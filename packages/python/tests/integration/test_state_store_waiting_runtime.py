@@ -49,5 +49,5 @@ async def test_waiting_label_does_not_change_runtime_result_pending_or_events(
     assert await store.get_run_events(parent) == before_events
     # The same record still satisfies the raw persisted-status claim predicate.
     record = await store.get_run(parent)
-    assert record.status == "paused" and record.waiting_for == "subagents"
+    assert record.status == "paused" and record.waiting_for is None
     assert await store.claim_paused_run(parent, expected_status=record.status)

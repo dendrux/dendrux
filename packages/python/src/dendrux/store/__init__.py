@@ -71,7 +71,7 @@ from dendrux.runtime._bounds import (
     MAX_PAGE,
     SUBTREE_MAX_NODES_DEFAULT,
 )
-from dendrux.runtime._capabilities import waiting_filter_options
+from dendrux.runtime._capabilities import waiting_filter_options, waiting_filter_reader
 from dendrux.runtime._pending import _KIND_BY_STATUS as _KIND_BY_STATUS
 from dendrux.runtime._pending import PendingKind as PendingKind
 from dendrux.runtime._pending import PendingPause as PendingPause
@@ -188,10 +188,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True, slots=True)
 class RunSummary:
-    """A list row; ``waiting_for`` labels a managed subagent pause.
-
-    ``replay`` lists replayed ``runs_full`` + ``runs_text`` and reasoning kept or dropped.
-    """
+    """A list row with an optional subagent waiting label and replay details."""
 
     run_id: str
     agent_name: str
@@ -854,9 +851,8 @@ class RunStore:
         Omit ``tenant_id`` (``UNSCOPED``) for all tenants, pass a string for one
         tenant, or ``None`` for untenanted runs only (changed in 0.5.0).
         ``started_after`` / ``started_before`` must be aware; comparisons use UTC.
-        ``metadata_filter`` matches every top-level key/value in run metadata,
-        e.g. ``{"thread_id": "..."}``. Keys match ``[A-Za-z0-9_-]+``; values are
-        scalar str, int, float, bool or None. Nested paths are unsupported.
+        ``metadata_filter`` matches top-level scalar str/int/float/bool/None values,
+        e.g. ``{"thread_id": "..."}``. Keys match ``[A-Za-z0-9_-]+``; no nested paths.
         ``include_waiting=False`` requires store support and excludes subagent waits.
         It reads pause data for every candidate row; very large tables can be slower.
         """
@@ -924,7 +920,10 @@ class RunStore:
         record = await self._scoped_run(run_id, tenant_id)
         if record is None:
             return None
-        return _run_to_detail(record)
+        reader = waiting_filter_reader(self._state) if record.status == "paused" else None
+        return _run_to_detail(
+            record, waiting_for=await reader(run_id, tenant_id=tenant_id) if reader else None
+        )
 
     async def get_events(
         self,
@@ -1643,12 +1642,12 @@ def _replay_of(record: Any) -> ReplaySummary | None:
     return ReplaySummary.from_dict(data) if isinstance(data, dict) else None
 
 
-def _run_to_detail(record: Any) -> RunDetail:
+def _run_to_detail(record: Any, *, waiting_for: str | None = None) -> RunDetail:
     return RunDetail(
         run_id=record.id,
         agent_name=record.agent_name,
         status=record.status,
-        waiting_for=getattr(record, "waiting_for", None),
+        waiting_for=waiting_for,
         created_at=record.created_at,
         updated_at=record.updated_at,
         iteration_count=record.iteration_count,

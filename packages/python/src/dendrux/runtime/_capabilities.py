@@ -7,15 +7,22 @@ import logging
 import warnings
 import weakref
 from dataclasses import dataclass
-from typing import Any, NoReturn
+from typing import TYPE_CHECKING, Any, NoReturn, cast
 
 from dendrux import _codes
 from dendrux._warnings import _developer_stacklevel
 from dendrux.errors import StoreCapabilityError
 from dendrux.runtime.state import StoreCapabilities
 
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
 _REQUIREMENTS: dict[str, dict[str, tuple[str, ...]]] = {
-    "waiting_filter": {"list_runs": ("include_waiting",), "count_runs": ("include_waiting",)},
+    "waiting_filter": {
+        "list_runs": ("include_waiting",),
+        "count_runs": ("include_waiting",),
+        "get_waiting_for": ("tenant_id",),
+    },
     "fenced_writes": {
         name: ("claim_epoch",)
         for name in (
@@ -212,8 +219,16 @@ def waiting_filter_options(store: Any, *, include_waiting: bool) -> dict[str, An
         raise TypeError("include_waiting must be a bool")
     if include_waiting:
         return {}
-    validate_capabilities(store)
-    if not capabilities(store).waiting_filter:
+    if waiting_filter_reader(store) is None:
         _refuse(store, "waiting_filter", "list_runs/count_runs", ("include_waiting",))
     # Dynamic kwargs belong to this optional extension, outside the legacy StateStore protocol.
     return {"include_waiting": False}
+
+
+def waiting_filter_reader(store: Any) -> Callable[..., Awaitable[str | None]] | None:
+    """Discover the declared waiting reader; legacy stores need no extra detail read."""
+    if not capabilities(store).waiting_filter:
+        return None
+    validate_capabilities(store)
+    # Signature validation covers this optional method outside the required StateStore protocol.
+    return cast("Callable[..., Awaitable[str | None]]", store.get_waiting_for)
