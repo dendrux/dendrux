@@ -855,8 +855,6 @@ def _canonical_waiting_reads(members):
     optional = {
         "list_runs": ", include_waiting: 'bool' = True",
         "count_runs": ", include_waiting: 'bool' = True",
-        "_bfs_descendants": ", waiting_labels: 'dict[str, str | None] | None' = None",
-        "_descendant_batch": ", waiting_labels: 'dict[str, str | None] | None' = None",
     }
     for name, addition in optional.items():
         assert members[name]["signature"].count(addition) == 1, name
@@ -874,6 +872,10 @@ def _canonical_waiting_reads(members):
         "owner": "SQLStateStore",
     }
     del members["get_waiting_for"]
+    assert members["_waiting_labels_by_run"]["signature"] == (
+        "(self, session: 'AsyncSession', run_ids: 'list[str]') -> 'dict[str, str | None]'"
+    ), "_waiting_labels_by_run"
+    del members["_waiting_labels_by_run"]
 
 
 def _canonical_writes_snapshot(snapshot, cls):
@@ -1247,9 +1249,7 @@ def test_proposed_exact_write_relocation_still_refuses_unplanned_snapshot_change
             "include_waiting: 'bool' = True", "include_waiting: 'bool' = False"
         )
     elif change == "waiting-subtree-default":
-        raw["members"]["_bfs_descendants"]["signature"] = raw["members"]["_bfs_descendants"][
-            "signature"
-        ].replace("waiting_labels: 'dict[str, str | None] | None' = None", "waiting_labels=None")
+        raw["members"]["_waiting_labels_by_run"]["signature"] += " changed"
     elif change == "kind":
         raw["members"]["update_many"]["kind"] = "staticmethod"
     elif change == "missing-member":
