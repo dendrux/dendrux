@@ -583,7 +583,13 @@ async def test_pg_module_cancels_versus_live_running_owner(
 
 
 # Canceller start relative to the owner's release, in ms (negative: owner released later).
-RACE_OFFSETS_MS = (-6, -3, -2, -1, -0.5, 0, 0, 0, 0.5, 1, 2, 3, 4, 6, 9, 14, 20, 30, 45, 70, 100)
+# Two anchors make each order certain even on a slow machine: "before" finishes every cancel
+# before the owner is released; "after" cancels only once the owner has finished.
+RACE_OFFSETS_MS: tuple[float | str, ...] = (
+    "before",
+    *(-6, -3, -2, -1, -0.5, 0, 0, 0, 0.5, 1, 2, 3, 4, 6, 9, 14, 20, 30, 45, 70, 100),
+    "after",
+)
 
 
 def timed(spans: list[tuple[float, float]], method: Any) -> Any:
@@ -639,8 +645,25 @@ async def test_pg_module_cancels_race_owner_finalization(
     assert seen == {"cancel_first", "finalize_first"}, orders
 
 
+async def owner_entered(llm: Any, run_task: asyncio.Task[Any], timeout: float = 30) -> None:
+    """Wait for the owner's gated model call; if it never comes, say what the owner did."""
+    entered = asyncio.create_task(llm.entered.wait())
+    done, _ = await asyncio.wait(
+        {entered, run_task}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
+    )
+    if entered not in done:
+        entered.cancel()
+        detail = run_task.exception() if run_task.done() else "still starting"
+        raise AssertionError(f"owner never reached its model call: {detail!r}")
+
+
 async def race_once(
-    store: Any, engine: Any, owner_store: Any, cancel_stores: list[Any], offset: float, script: str
+    store: Any,
+    engine: Any,
+    owner_store: Any,
+    cancel_stores: list[Any],
+    offset: float | str,
+    script: str,
 ) -> str:
     responses = [LLMResponse(text="done")]
     if script == "tool_then_final":
@@ -652,24 +675,30 @@ async def race_once(
     run_task = asyncio.create_task(owner.run("go", tenant_id=TENANT))
     tasks: list[asyncio.Task[Any]] = []
     try:
-        await asyncio.wait_for(llm.entered.wait(), 10)
+        await owner_entered(llm, run_task)
         run_id = llm.served[-1]
         epoch = (await store.get_run(run_id)).claim_epoch
 
-        async def release() -> None:
+        async def release(cancels: list[asyncio.Task[Any]]) -> None:
             await start.wait()
-            await asyncio.sleep(max(-offset, 0) / 1000)
+            if offset == "before":
+                await asyncio.wait(cancels)
+            elif isinstance(offset, float | int) and offset < 0:
+                await asyncio.sleep(-offset / 1000)
             llm.gate.set()
 
         async def cancel(other: Any) -> Any:
             await start.wait()
-            await asyncio.sleep(max(offset, 0) / 1000)
+            if offset == "after":
+                await asyncio.wait([run_task])
+            elif isinstance(offset, float | int) and offset > 0:
+                await asyncio.sleep(offset / 1000)
             return await dendrux.cancel_run(run_id, tenant_id=TENANT, state_store=other)
 
-        tasks = [asyncio.create_task(release())]
-        tasks += [asyncio.create_task(cancel(other)) for other in cancel_stores]
+        tasks = [asyncio.create_task(cancel(other)) for other in cancel_stores]
+        tasks.append(asyncio.create_task(release(list(tasks))))
         start.set()
-        results = await asyncio.gather(*tasks[1:])
+        results = await asyncio.gather(*tasks[:-1])
     finally:
         llm.gate.set()
         *_, outcome = await settle_all(*tasks, run_task)
