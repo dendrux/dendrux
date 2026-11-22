@@ -570,6 +570,8 @@ async def test_pg_module_cancels_versus_live_running_owner(
             *_, outcome = await settle_all(*cancels, task)
     assert {(r.status, r.meta["cancel_requested"]) for r in results} == {(RunStatus.RUNNING, True)}
     assert (during.status, during.claim_epoch) == ("running", before.claim_epoch)
+    if isinstance(outcome, BaseException):
+        raise outcome  # the owner's own failure, after every task was joined
     assert outcome.status.value == expected
     final = await store.get_run(run_id)
     assert (final.status, final.claim_epoch) == (expected, before.claim_epoch)
@@ -593,7 +595,10 @@ RACE_OFFSETS_MS: tuple[float | str, ...] = (
 
 
 def timed(spans: list[tuple[float, float]], method: Any) -> Any:
-    """Wrap a store method (keeping its signature for capability checks) to time its work."""
+    """Record the interval of a store-method call (not server-side SQL execution).
+
+    The wrapper keeps the method's signature, which store capability checks inspect.
+    """
 
     @wraps(method)
     async def call(*args: Any, **kwargs: Any) -> Any:
@@ -613,11 +618,14 @@ async def test_pg_module_cancels_race_owner_finalization(
     """Owner and cancellers are released together, so cancel writes race the owner's finalize.
 
     Either the request lands first (the owner then completes, or stops at a checkpoint) or the
-    owner's finalize wins (the canceller finds a terminal row). Both orders must occur, and
-    neither may revive the run, change its epoch or write a second terminal event.
+    owner's finalize wins (the canceller finds a terminal row). The racing (timed-offset)
+    iterations alone must show both orders and at least one overlap of a canceller's write
+    interval with the owner's finalize interval; the sequential anchors are checked on their
+    own and never count. No iteration may revive the run, change its epoch or write a second
+    terminal event. Racing passes repeat, up to a bound, until that evidence is seen.
     """
-    orders: Counter[str] = Counter()
-    overlaps = 0
+    racing: Counter[str] = Counter()
+    overlaps = passes = 0
     async with AsyncExitStack() as stack:
         owner_store, *cancel_stores = await parallel_stores(engine, stack, count=3)
         finalize_spans: list[tuple[float, float]] = []
@@ -630,19 +638,35 @@ async def test_pg_module_cancels_race_owner_finalization(
         for other in cancel_stores:
             for name in ("request_cancel", "mark_cancel_requested"):
                 monkeypatch.setattr(other, name, timed(request_spans, getattr(other, name)))
-        for offset in RACE_OFFSETS_MS * 2:
-            finalize_spans.clear()
-            request_spans.clear()
-            order = await race_once(store, engine, owner_store, cancel_stores, offset, script)
-            orders[order] += 1
-            overlaps += any(
-                begun < f_end and f_begun < end
-                for begun, end in request_spans
-                for f_begun, f_end in finalize_spans
-            )
-    print(f"\nRACE {script}: orders={dict(orders)} sql_overlaps={overlaps}")
-    seen = {key.split(":")[0] for key in orders}
-    assert seen == {"cancel_first", "finalize_first"}, orders
+        while passes < MAX_RACE_PASSES and not (overlaps and both_orders(racing)):
+            passes += 1
+            for offset in RACE_OFFSETS_MS:
+                finalize_spans.clear()
+                request_spans.clear()
+                order = await race_once(store, engine, owner_store, cancel_stores, offset, script)
+                if isinstance(offset, str):
+                    expected = "cancel_first" if offset == "before" else "finalize_first"
+                    assert order.startswith(expected), (offset, order)
+                    continue
+                racing[order] += 1
+                overlaps += any(
+                    begun < f_end and f_begun < end
+                    for begun, end in request_spans
+                    for f_begun, f_end in finalize_spans
+                )
+    print(
+        f"\nRACE {script}: passes={passes} racing_orders={dict(racing)} "
+        f"store_method_interval_overlaps={overlaps}"
+    )
+    assert overlaps > 0, f"no racing iteration overlapped the owner's finalize: {dict(racing)}"
+    assert both_orders(racing), f"racing iterations missed an order: {dict(racing)}"
+
+
+MAX_RACE_PASSES = 5
+
+
+def both_orders(orders: Counter[str]) -> bool:
+    return {key.split(":")[0] for key in orders} == {"cancel_first", "finalize_first"}
 
 
 async def owner_entered(llm: Any, run_task: asyncio.Task[Any], timeout: float = 30) -> None:
@@ -702,7 +726,8 @@ async def race_once(
     finally:
         llm.gate.set()
         *_, outcome = await settle_all(*tasks, run_task)
-    assert not isinstance(outcome, BaseException), outcome
+    if isinstance(outcome, BaseException):
+        raise outcome  # the owner's own failure, after every task was joined
     outcomes = {item["outcome"] for r in results for item in r.meta["cascade"]}
     assert outcomes <= {"terminal", "cancel_requested"}, outcomes
     final = await store.get_run(run_id)
