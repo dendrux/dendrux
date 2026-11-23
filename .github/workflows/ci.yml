@@ -482,6 +482,10 @@ jobs:
       - name: Semgrep rules
         run: python tools/semgrep_ratchet.py check
 
+      # The pytest jobs skip these end-to-end tests (no semgrep there); run them where it is.
+      - name: Semgrep ratchet tests
+        run: SEMGREP="$(command -v semgrep)" python -m pytest -p no:xdist --no-cov tests/tools/test_semgrep_ratchet.py
+
   # MySQL 8.4 and MariaDB 10.11: schema, maintenance and store suites. The servers come from
   # the committed compose file (CI parity with `make test-dbs-up`); GitHub service containers
   # cannot pass the NO PAD collation flags. The job fails if the server's tests were skipped.
