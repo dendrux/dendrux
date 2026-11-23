@@ -6,11 +6,11 @@ import inspect
 import logging
 import math
 import re
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, cast
 
-from dendrux import _codes
+from dendrux import _codes, _wire
 from dendrux._lifecycle import PAUSE_STATUSES as PAUSE_STATUSES
 from dendrux._lifecycle import PENDING_KIND_BY_STATUS, StoredEventType
 from dendrux._lifecycle import PendingKind as PendingKind
@@ -31,13 +31,15 @@ from dendrux.runtime._managed_pending import (
     _bound_child_id,
     _checked_child,
     is_managed_wait,
+    needs_approval_display,
+    read_pause_summaries,
     read_workflow,
+    sql_leaf_data,
 )
 from dendrux.runtime._managed_pending import facing_status as facing_status
 from dendrux.runtime.state import (
     MANAGED_BINDING_KEY,
     MANAGED_HEADER_KEY,
-    PAUSE_SUMMARY_KEYS,
     UNSCOPED,
     ManagedHeader,
     PauseSummary,
@@ -153,6 +155,43 @@ class PendingPause:
         }
 
 
+@dataclass(frozen=True, slots=True, eq=False)
+class _ManagedPendingPause(PendingPause):
+    __hash__ = PendingPause.__hash__
+
+    _wire_display: dict[str, Any] | None = field(
+        default=None, kw_only=True, repr=False, compare=False
+    )
+    _parallel: bool = field(default=False, kw_only=True, repr=False, compare=False)
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, PendingPause):
+            return NotImplemented
+        return all(getattr(self, f.name) == getattr(other, f.name) for f in fields(PendingPause))
+
+    def addressed(
+        self,
+        root_id: str,
+        leaf: ManagedHop,
+        path: list[str],
+        *,
+        parallel: bool,
+        mapping: dict[str, str] | None,
+    ) -> _ManagedPendingPause:
+        pause = replace(
+            self,
+            run_id=root_id,
+            agent_name=leaf.agent_name,
+            agent_path=path,
+            origin_run_id=leaf.run_id,
+            _parallel=parallel,
+        )
+        if mapping and pause.kind != "client_tool":
+            # Keep the safe display, without attaching the child's audit mapping to a public read.
+            return replace(pause, _wire_display=_wire.project_pending(pause, mapping))
+        return pause
+
+
 def _pending_origin(pause: PendingPause) -> dict[str, Any]:
     if pause.origin_run_id is None:
         return {}
@@ -186,6 +225,7 @@ def _pending_from(
     kind: PendingKind,
     pause: dict[str, Any],
     last_step: dict[str, Any] | None,
+    pause_type: type[PendingPause] = PendingPause,
 ) -> PendingPause:
     targets = pause.get("pending_targets") or {}
     gates = pause.get("approval_gates") or {}
@@ -206,7 +246,7 @@ def _pending_from(
         )
     question, options = _clarification_fields(pause, last_step, kind)
     exceeded = pause.get("budget_exceeded")
-    return PendingPause(
+    return pause_type(
         run_id=run_id,
         status=status,
         kind=kind,
@@ -509,38 +549,8 @@ async def _whole_pause_summary(
     state: Any, run_id: str, tenant_id: TenantScope
 ) -> PauseSummary | None:
     """The summary from the whole ``pause_data`` document, decoded by the driver."""
-    from sqlalchemy import func, select
-
-    from dendrux.db.models import AgentRun, RunEvent
-
-    paused_seq = (
-        select(func.max(RunEvent.sequence_index))
-        .where(
-            RunEvent.agent_run_id == run_id, RunEvent.event_type == StoredEventType.RUN_PAUSED.value
-        )
-        .scalar_subquery()
-    )
-    stmt = _apply_tenant_scope(
-        select(AgentRun.status, paused_seq, AgentRun.pii_mapping, AgentRun.pause_data).where(
-            AgentRun.id == run_id
-        ),
-        tenant_id,
-    )
-    async with state._session_factory() as session:
-        row = (await session.execute(stmt)).first()
-    if row is None:
-        return None
-    status, seq, mapping, data = row
-    data = data if isinstance(data, dict) else {}
-    steps = data.get("steps")
-    last = steps[-1] if isinstance(steps, list) and steps else None
-    return PauseSummary(
-        str(status),
-        {k: data[k] for k in PAUSE_SUMMARY_KEYS if k in data and data[k] is not None},
-        last if isinstance(last, dict) else None,
-        seq,
-        dict(mapping) if isinstance(mapping, dict) else None,
-    )
+    summaries = await read_pause_summaries(state, [run_id], tenant_id, whole=True)
+    return summaries.get(run_id)
 
 
 def _accepts_tenant(method: Any) -> bool:
@@ -683,6 +693,29 @@ def _own_view(status: str, pending: PendingPause | None) -> FacingView:
     return FacingView(status, pending, pendings=(pending,) if pending is not None else ())
 
 
+def _display_pause(
+    summary: PauseSummary, params: dict[str, dict[str, Any]] | None
+) -> dict[str, Any]:
+    if not needs_approval_display(summary):
+        return summary.pause
+    calls = pause_display_calls({**summary.pause, "status": summary.status}, params)
+    return {**summary.pause, "pending_tool_calls": calls}
+
+
+def _managed_pause(
+    leaf: ManagedHop, summary: PauseSummary, params: dict[str, dict[str, Any]] | None
+) -> _ManagedPendingPause:
+    pending = _pending_from(
+        leaf.run_id,
+        summary.status,
+        _KIND_BY_STATUS[summary.status],
+        _display_pause(summary, params),
+        summary.last_step,
+        _ManagedPendingPause,
+    )
+    return cast("_ManagedPendingPause", pending)  # constructed with this type
+
+
 class _PendingReader:
     """The same read/scoping policy for Agent, runtime and RunStore."""
 
@@ -702,33 +735,37 @@ class _PendingReader:
         """
         check_run_id(run_id)
         check_read_scope(tenant_id)
-        status, pause, last_step = await self._summary(run_id, tenant_id)
-        if is_managed_wait(status, pause):
+        summary = await self._summary(run_id, tenant_id)
+        if is_managed_wait(summary.status, summary.pause):
             return await self._managed_view(run_id, tenant_id)
-        return _own_view(
-            status, await self._pending_of(run_id, tenant_id, status, pause, last_step)
-        )
+        return _own_view(summary.status, await self._pending_of(run_id, tenant_id, summary))
 
     async def _managed_view(self, run_id: str, tenant_id: TenantScope) -> FacingView:
         workflow = await read_workflow(self._state, run_id, tenant_id, read_hop=self._read_hop)
-        if workflow is None:  # moved on since the summary read: report what it is now
-            status, pause, last = await self._summary(run_id, tenant_id)
-            if is_managed_wait(status, pause):
+        if workflow is None:  # moved on since the summary read
+            summary = await self._summary(run_id, tenant_id)
+            if is_managed_wait(summary.status, summary.pause):
                 return FacingView(RunStatus.RUNNING.value, None, managed=True)
-            return _own_view(status, await self._pending_of(run_id, tenant_id, status, pause, last))
+            return _own_view(summary.status, await self._pending_of(run_id, tenant_id, summary))
+        leaves = workflow.paused()
+        projected = await self._leaf_pendings(
+            [leaf for leaf, _ in leaves], workflow.start.tenant_id
+        )
         pendings = []
-        for leaf, path in workflow.paused():
-            pending = await self._leaf_pending(leaf)
-            if pending is not None:
-                pendings.append(
-                    replace(
-                        pending,
-                        run_id=run_id,
-                        agent_name=leaf.agent_name,
-                        agent_path=workflow.agent_path(path),
-                        origin_run_id=leaf.run_id,
-                    )
+        for leaf, path in leaves:
+            own = projected.get(leaf.run_id)
+            if own is None:
+                continue
+            pending, mapping = own
+            pendings.append(
+                pending.addressed(
+                    run_id,
+                    leaf,
+                    workflow.agent_path(path),
+                    parallel=len(workflow.leaves) > 1,
+                    mapping=mapping,
                 )
+            )
         if not pendings:  # subagents run, or their outcomes await adoption
             return FacingView(RunStatus.RUNNING.value, None, managed=True)
         return FacingView(pendings[0].status, pendings[0], managed=True, pendings=tuple(pendings))
@@ -738,12 +775,34 @@ class _PendingReader:
         async with _HopReader(self._state, self._scoped_run) as reader:
             return await reader.read(run_id, tenant_id)
 
-    async def _leaf_pending(self, leaf: ManagedHop) -> PendingPause | None:
-        """A paused leaf's own pending, or None when it moved on after the walk read it."""
-        status, pause, last = await self._summary(leaf.run_id, leaf.tenant_id)
-        if status != leaf.status or is_managed_wait(status, pause):
-            return None
-        return await self._pending_of(leaf.run_id, leaf.tenant_id, status, pause, last)
+    async def _leaf_pendings(
+        self, leaves: list[ManagedHop], tenant: str | None
+    ) -> dict[str, tuple[_ManagedPendingPause, dict[str, str] | None]]:
+        if not leaves:
+            return {}
+        store = unclaimed_store(self._state)
+        if callable(getattr(store, "pause_projection", None)):
+            summaries, params = await sql_leaf_data(store, [leaf.run_id for leaf in leaves], tenant)
+        else:
+            summaries = {
+                leaf.run_id: await self._custom_leaf_summary(leaf.run_id, tenant) for leaf in leaves
+            }
+            params = {
+                run_id: await self._display_params(run_id, tenant, summary)
+                for run_id, summary in summaries.items()
+                if needs_approval_display(summary)
+            }
+        result = {}
+        for leaf in leaves:
+            summary = summaries.get(leaf.run_id)
+            if summary is None:
+                raise RunNotFoundError(leaf.run_id)
+            if summary.status == leaf.status and not is_managed_wait(summary.status, summary.pause):
+                result[leaf.run_id] = (
+                    _managed_pause(leaf, summary, params.get(leaf.run_id)),
+                    summary.pii_mapping,
+                )
+        return result
 
     async def get_pending(self, run_id: str, *, tenant_id: TenantScope) -> PendingPause | None:
         """What the run is waiting for now, or None when it is not paused.
@@ -773,51 +832,55 @@ class _PendingReader:
             return list(self.last_view.pendings)
         return [pending] if pending is not None else []
 
+    async def _display_params(
+        self, run_id: str, tenant_id: TenantScope, summary: PauseSummary
+    ) -> dict[str, dict[str, Any]]:
+        if not needs_approval_display(summary):
+            return {}
+        seq = await self._active_pause_sequence(run_id, tenant_id)
+        if summary.paused_event_sequence is not None and seq != summary.paused_event_sequence:
+            return {}
+        return await self._approval_params(run_id, seq, tenant_id)
+
     async def _pending_of(
-        self,
-        run_id: str,
-        tenant_id: TenantScope,
-        status: str,
-        pause: dict[str, Any],
-        last_step: dict[str, Any] | None,
+        self, run_id: str, tenant_id: TenantScope, summary: PauseSummary
     ) -> PendingPause | None:
-        kind = _KIND_BY_STATUS.get(status)
+        kind = _KIND_BY_STATUS.get(summary.status)
         if kind is None:
             return None
-        targets = pause.get("pending_targets") or {}
-        gates = pause.get("approval_gates") or {}
-        paused_server_calls = kind == "paused" and any(
-            isinstance(call, dict)
-            and (targets.get(call.get("id")) != "client" or call.get("id") in gates)
-            for call in pause.get("pending_tool_calls") or ()
+        params = await self._display_params(run_id, tenant_id, summary)
+        return _pending_from(
+            run_id, summary.status, kind, _display_pause(summary, params), summary.last_step
         )
-        if kind in ("approval", "input") or paused_server_calls:
-            seq = await self._active_pause_sequence(run_id, tenant_id)
-            params = await self._approval_params(run_id, seq, tenant_id)
-            pause = {
-                **pause,
-                "pending_tool_calls": pause_display_calls({**pause, "status": status}, params),
-            }
-        return _pending_from(run_id, status, kind, pause, last_step)
 
-    async def _summary(
-        self, run_id: str, tenant_id: TenantScope
-    ) -> tuple[str, dict[str, Any], dict[str, Any] | None]:
-        """Status, pause keys and last step; raises RunNotFoundError when out of scope."""
-        getter = getattr(self._state, "get_pending_pause_summary", None) or getattr(
+    async def _custom_leaf_summary(self, run_id: str, tenant: str | None) -> PauseSummary:
+        summary = await self._summary(run_id, tenant)
+        if self._summary_method() is None and callable(
+            getattr(self._state, "get_pii_mapping", None)
+        ):
+            mapping = await self.get_pii_mapping(run_id, tenant_id=tenant)
+            return replace(summary, pii_mapping=mapping)
+        return summary
+
+    def _summary_method(self) -> Any:
+        return getattr(self._state, "get_pending_pause_summary", None) or getattr(
             self._state, "get_pause_summary", None
         )
+
+    async def _summary(self, run_id: str, tenant_id: TenantScope) -> PauseSummary:
+        """Read the pause and its origin mapping in the same tenant scope."""
+        getter = self._summary_method()
         if getter is None:  # custom store: scope by lookup, then the full pause state
             record = await self._scoped_run(run_id, tenant_id)
             if record is None:
                 raise RunNotFoundError(run_id)
             full = await self._state.get_pause_state(run_id) or {}
             steps = full.get("steps") or []
-            return record.status, dict(full), steps[-1] if steps else None
+            return PauseSummary(record.status, dict(full), steps[-1] if steps else None)
         summary = await getter(run_id, tenant_id=tenant_id)
         if summary is None:
             raise RunNotFoundError(run_id)
-        return summary.status, summary.pause, summary.last_step
+        return cast("PauseSummary", summary)
 
     async def _status(self, run_id: str, tenant_id: TenantScope = UNSCOPED) -> str | None:
         check_run_id(run_id)

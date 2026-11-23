@@ -6,6 +6,7 @@ import contextlib
 import json
 import math
 import re
+from copy import deepcopy
 from typing import TYPE_CHECKING, Any
 
 from dendrux import _codes
@@ -126,6 +127,23 @@ def _structured_output(output: Any) -> Any:
 
 
 def _pending_wire(pending: Any, mapping: Any) -> Any:
+    if not hasattr(pending, "_wire_display"):
+        return project_pending(pending, mapping)
+    if pending._wire_display is None:
+        return project_pending(pending, None)
+    display = deepcopy(pending._wire_display)
+    if display["run_id"] != pending.run_id:
+        # Re-addressing adds ancestor names; preserve the redacted child path and name.
+        path = pending.agent_path or []
+        suffix = display.get("agent_path") or []
+        display.update(
+            run_id=pending.run_id, agent_path=[*path[: len(path) - len(suffix)], *suffix]
+        )
+    return display
+
+
+def project_pending(pending: Any, mapping: Any) -> Any:
+    """Render a pause using the mapping belonging to its origin."""
     data = pending.to_dict()
     if pending.kind == "paused":
         for call in data.get("pending_tool_calls", []):

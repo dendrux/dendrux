@@ -15,6 +15,7 @@ Runs on SQLite and Postgres (``DENDRUX_TEST_PG_URL``, a private ``*_test`` datab
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
@@ -538,30 +539,110 @@ def _count_statements(engine: Any) -> tuple[list[str], Any]:
     return statements, capture
 
 
-async def test_get_pendings_is_read_only_and_within_its_counted_reads(
-    store: Any, engine: Any
-) -> None:
-    """A7: no claim, no write; a fixed statement count, never per-child run reads or history."""
-    a, b, c = approver("a"), approver("b"), finisher("c")
-    root = root_agent(store, a, b, c)
+@pytest.mark.parametrize("width", [2, 4, 8, 16])
+async def test_sibling_pending_reads_have_fixed_cost(store: Any, engine: Any, width: int) -> None:
+    children = [approver(f"child{i}") for i in range(width)]
+    root = root_agent(store, *children)
     root_id = await start_root(store, root)
-    fan = await fan_out(store, root, root_id, [a, b, c])
+    fan = await fan_out(store, root, root_id, children)
     before = await snapshot(store, root_id, *fan.children)
 
-    statements, capture = _count_statements(engine)
-    try:
-        pendings = await RunStore(store).get_pendings(root_id, tenant_id=TENANT)
-    finally:
-        event.remove(engine.sync_engine, "before_cursor_execute", capture)
-
-    assert [p.origin_run_id for p in pendings] == fan.children[:2]
+    facade = RunStore(store)
+    counts = []
+    for read in (facade.get_pending, facade.get_pendings):
+        statements, capture = _count_statements(engine)
+        try:
+            result = await read(root_id, tenant_id=TENANT)
+        finally:
+            event.remove(engine.sync_engine, "before_cursor_execute", capture)
+        pauses = result if isinstance(result, list) else [result]
+        expected = fan.children if isinstance(result, list) else fan.children[:1]
+        assert [p.origin_run_id for p in pauses] == expected
+        assert [p.tool_calls[0].params for p in pauses] == [
+            {"text": child.name} for child in children[: len(expected)]
+        ]
+        assert all(s.startswith(("select", "with")) and "react_traces" not in s for s in statements)
+        counts.append(len(statements))
     assert await snapshot(store, root_id, *fan.children) == before
-    reads = [s for s in statements if s.startswith(("select", "with"))]
-    assert reads == statements, "get_pendings wrote"
-    assert not any("react_traces" in s for s in reads), "history read"
-    # Root: pause summary + hop projection (2); the v4 wait: envelope + child projection (2);
-    # each approval leaf: its summary, active pause sequence and approval params (3).
-    assert len(reads) == 2 + 2 + 3 * len(pendings)
+    assert counts == [6, 6]
+
+
+@pytest.mark.parametrize("transition", ["new_pause", "resumed", "aborted", "terminal"])
+async def test_approval_batch_checks_each_leaf_generation(store, monkeypatch, transition):
+    from dendrux.runtime import _managed_pending
+
+    children = [approver("a"), approver("b")]
+    root = root_agent(store, *children)
+    root_id = await start_root(store, root)
+    fan = await fan_out(store, root, root_id, children)
+    original = _managed_pending.leaf_approval_params
+
+    async def move_before_display(state, generations, tenant):
+        child_id = fan.child(0)
+        await store.save_run_event(child_id, event_type="run.resumed")
+        if transition == "new_pause":
+            call_id = fan.results[child_id].pending.tool_calls[0].id
+            await store.save_run_event(
+                child_id,
+                event_type="approval.requested",
+                data={"call_id": call_id, "params": {"text": "later"}},
+            )
+            await store.save_run_event(child_id, event_type="run.paused")
+        elif transition in ("aborted", "terminal"):
+            if transition == "terminal":
+                await store.save_run_event(child_id, event_type="run.cancelled")
+            await store.save_run_event(child_id, event_type="run.resume_aborted")
+        return await original(state, generations, tenant)
+
+    monkeypatch.setattr(_managed_pending, "leaf_approval_params", move_before_display)
+    first, second = await RunStore(store).get_pendings(root_id, tenant_id=TENANT)
+    assert second.tool_calls[0].params == {"text": "b"}
+    if transition == "aborted":
+        assert first.tool_calls[0].params == {"text": "a"}
+    else:
+        assert first.tool_calls[0].args_hidden and first.tool_calls[0].params is None
+
+
+async def test_batched_legacy_pause_json_keeps_client_arguments(store, engine):
+    from dendrux.runtime._managed_pending import leaf_summaries
+    from tests.integration.test_050_pending_reads import _poison_pause_data
+
+    children = [client_child("first"), client_child("second")]
+    root = root_agent(store, *children)
+    root_id = await start_root(store, root)
+    fan = await fan_out(store, root, root_id, children)
+    await _poison_pause_data(engine, fan.child(0), r"\u0000")
+    summaries = await leaf_summaries(store, fan.children, TENANT)
+    params = [summaries[i].pause["pending_tool_calls"][0]["params"] for i in fan.children]
+    assert params == [{"sheet": "S\x001"}, {"sheet": "S1"}]
+    assert await leaf_summaries(store, fan.children, OTHER_TENANT) == {}
+
+
+async def test_root_wire_uses_each_childs_own_mapping(store: Any) -> None:
+    children = [client_child("a"), client_child("b")]
+    root = root_agent(store, *children)
+    root_id = await start_root(store, root)
+    fan = await fan_out(store, root, root_id, children)
+    values = ["child-a@example.test", "child-b@example.test"]
+    placeholder = "<<EMAIL_ADDRESS_1>>"
+    for run_id, value in zip(fan.children, values, strict=True):
+        pause = await store.get_pause_state(run_id)
+        pause["pending_tool_calls"][0]["params"] = {"sheet": value}
+        await store.pause_run(
+            run_id, status="paused", pause_data=pause, pii_mapping={placeholder: value}
+        )
+    assert not await store.get_pii_mapping(root_id)
+    result = await root.get_result(root_id, tenant_id=TENANT)
+    wire = result.to_dict()
+    assert all(value not in json.dumps(wire) for value in values)
+    assert wire["pending"] == wire["pendings"][0]
+    assert [p["origin_run_id"] for p in wire["pendings"]] == fan.children
+    assert [p["pending_tool_calls"][0]["params"] for p in wire["pendings"]] == [
+        {"sheet": placeholder},
+        {"sheet": placeholder},
+    ]
+    execution = await RunStore(store).get_pendings(root_id, tenant_id=TENANT)
+    assert [p.tool_calls[0].params for p in execution] == [{"sheet": value} for value in values]
 
 
 # ---------------------------------------------------------------------------
