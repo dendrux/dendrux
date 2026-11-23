@@ -106,9 +106,7 @@ async def _stream_resume_images(
     raw = await store.get_pause_state(run_id)
     if raw is None:
         raise ValueError("Run has no pause state")
-    _submit.require_pause_id(
-        agent, expected_pause_id, pause_id=raw.get("pause_id"), store=store, run_id=run_id
-    )
+    _run_resume_prep.check_continuation_pause(agent, store, run_id, raw, expected_pause_id)
     media_pause = PauseState.from_dict(raw)
     if media_pause.agent_name and media_pause.agent_name != agent.name:
         raise ValueError("Agent name mismatch on resume")

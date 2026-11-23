@@ -16,17 +16,22 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, TypeVar
 
 from dendrux import _codes
-from dendrux._lifecycle import PAUSE_STATUSES, TERMINAL_STATUS_VALUES
+from dendrux._lifecycle import PAUSE_STATUSES
+from dendrux._meta_keys import GOVERNANCE_KEY
+from dendrux._sentinel import _UnsetType
 from dendrux.errors import (
+    GovernanceMismatchError,
     ManagedChildControlError,
     ManagedStateError,
     PauseStatusMismatchError,
     RunNotFoundError,
     RunNotPausedError,
+    RunNotReclaimableError,
 )
 from dendrux.runtime import _managed_budget, _managed_cancel, _managed_definitions
 from dendrux.runtime._bounds import MAX_PAGE
 from dendrux.runtime._entry_checks import entry_checks
+from dendrux.runtime._managed_fanout_store import _UNPROJECTED
 from dendrux.runtime._managed_limits import _saved_walk_limit
 from dendrux.runtime._managed_pending import (
     fanout_children,
@@ -41,13 +46,12 @@ from dendrux.runtime.state import (
     MANAGED_HEADER_KEY,
     UNSCOPED,
     ManagedHeader,
-    unclaimed_store,
 )
-from dendrux.runtime.submit import _pause_id_required
+from dendrux.runtime.submit import _pause_id_required, check_governance
 from dendrux.types import PauseState, RunResult, RunStatus, ToolCall, UsageStats
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Coroutine
+    from collections.abc import Awaitable, Callable, Coroutine, Iterable
 
     from dendrux.agent import Agent
     from dendrux.runtime._entry_checks import EntryPoint
@@ -177,7 +181,7 @@ async def walk(root_agent: Agent, store: Any, root_run_id: str) -> tuple[list[_W
     path: tuple[str, ...] = ()
     limit = await _saved_walk_limit(store, record)
     for index in range(limit):
-        wait = await _outgoing(store, record)
+        wait = await _outgoing(store, record, agent=agent)
         if wait is not None and wait.managed_fanout is not None:
             require_fanout(store, record.id)  # a fan-out ends this branch walk (0.8)
         if wait is None or wait.managed_wait is None:
@@ -193,7 +197,9 @@ async def walk(root_agent: Agent, store: Any, root_run_id: str) -> tuple[list[_W
     raise ManagedStateError(reason="binding_conflict", run_id=root_run_id)
 
 
-async def _outgoing(store: Any, record: RunRecord) -> PauseState | None:
+async def _outgoing(
+    store: Any, record: RunRecord, *, agent: Agent | None = None
+) -> PauseState | None:
     """The v3 managed wait of a parked parent, else None.
 
     A pause carrying either managed-wait mark is decoded strictly, so a corrupt
@@ -206,6 +212,7 @@ async def _outgoing(store: Any, record: RunRecord) -> PauseState | None:
         raw.get("schema_version") != 3 and raw.get("pause_reason") != MANAGED_WAIT_REASON
     ):
         return None
+    check_governance(agent, record.id, record.meta)
     return PauseState.from_managed_dict(raw, run_id=record.id)
 
 
@@ -315,6 +322,7 @@ class _Seen:
     record: RunRecord | None = None
     row_pause: tuple[str | None, str | None] = (None, None)
     row_waiting: bool = False
+    governance: dict[str, Any] | None | _UnsetType = None
 
     @classmethod
     def of_record(cls, record: RunRecord, state: dict[str, Any]) -> _Seen:
@@ -325,6 +333,7 @@ class _Seen:
             state.get("loop"),
             state.get(MANAGED_BINDING_KEY),
             record=record,
+            governance=_record_governance(record),
         )
 
     @classmethod
@@ -338,6 +347,7 @@ class _Seen:
             row.binding,
             row_pause=(row.pause_id, row.pause_reason),
             row_waiting=waiting,
+            governance=getattr(row, "governance", _UNPROJECTED),
         )
 
 
@@ -384,6 +394,9 @@ class _TreeWalk:
             agent=agent,
             agent_path=path,
             pause_id=str(wait.pause_id),
+            governance=await _projected_governance(
+                self.store, self.root.tenant_id, seen.run_id, seen.governance
+            ),
             version=4 if wait.managed_fanout is not None else 3,
             iteration=wait.iteration,
             children=children,
@@ -414,6 +427,7 @@ class _TreeWalk:
             agent_path=path,
             status=seen.status,
             loop=seen.loop,
+            governance=seen.governance,
             pause_id=pause.get("pause_id"),
             pause_reason=pause.get("pause_reason"),
             call=call,
@@ -551,10 +565,30 @@ def find_leaf(tree: WorkflowTree, pause_id: str) -> LeafNode:
     )
 
 
+def _record_governance(record: RunRecord) -> dict[str, Any] | None:
+    return (getattr(record, "meta", None) or {}).get(GOVERNANCE_KEY)
+
+
+async def _projected_governance(
+    store: StateStore, tenant_id: str | None, run_id: str, saved: dict[str, Any] | None | _UnsetType
+) -> dict[str, Any] | None:
+    if isinstance(saved, _UnsetType):
+        # A custom fan-out store may project only status and binding.
+        return _record_governance(await _scoped_root(store, run_id, tenant_id))
+    return saved
+
+
+def _check_wait_governance(waits: Iterable[WaitNode]) -> None:
+    for wait in waits:
+        check_governance(wait.agent, wait.run_id, {GOVERNANCE_KEY: wait.governance})
+
+
 def _required_leaf(tree: WorkflowTree, pause_id: str | None) -> LeafNode:
     """A fan-out continuation names its leaf by token; with none it is refused."""
     if pause_id is not None:
-        return find_leaf(tree, pause_id)
+        leaf = find_leaf(tree, pause_id)
+        _check_wait_governance(tree.ancestors(leaf.run_id))
+        return leaf
     if not tree.paused_leaves():
         raise RunNotPausedError(tree.root_run_id, RunStatus.RUNNING)
     _codes.log_code(logger, _codes.MANAGED_PAUSE_ID_REQUIRED, run_id=tree.root_run_id)
@@ -580,12 +614,11 @@ async def submit_routed(
     """
     tree = await route_tree(root_agent, store, found.root_run_id, tenant_id=found.tenant_id)
     return await _submit_or_reconnect(
-        root_agent, store, tree, operation, expected_pause_id, submit, notifier, fields
+        store, tree, operation, expected_pause_id, submit, notifier, fields
     )
 
 
 async def _submit_or_reconnect(
-    root_agent: Agent,
     store: Any,
     tree: WorkflowTree,
     operation: EntryPoint,
@@ -594,6 +627,9 @@ async def _submit_or_reconnect(
     notifier: Any,
     fields: dict[str, Any],
 ) -> RunResult:
+    # Cycle: the driver imports routing to resolve bound children.
+    from dendrux.runtime import _managed_fanout
+
     # Legacy external pauses still block reconnect when their generation is missing.
     if (
         operation == "resume"
@@ -601,9 +637,8 @@ async def _submit_or_reconnect(
         and all(value is None for value in fields.values())
         and not any(leaf.status in PAUSE_STATUSES for leaf in tree.leaves())
     ):
-        return await root_agent.reclaim(
-            tree.root_run_id, tenant_id=tree.tenant_id, notifier=notifier
-        )
+        await _check_recovery_governance(store, tree)
+        return await _managed_fanout.drive_tree(store, tree, notifier=notifier)
     leaf = _required_leaf(tree, expected_pause_id)
     parent = tree.ancestors(leaf.run_id)[0]
     _managed_definitions._require_supported_loop(parent.agent, leaf.agent, paused=True)
@@ -611,7 +646,20 @@ async def _submit_or_reconnect(
         leaf.agent, operation, tree.tenant_id, default_tenant=UNSCOPED, run_id=leaf.run_id, **fields
     )
     result = await submit(leaf.agent, leaf.run_id, _InlineTasks())
-    return await unwind_tree(tree, leaf, store, result, notifier=notifier)
+    return await _managed_fanout.unwind_tree(tree, leaf, store, result, notifier=notifier)
+
+
+async def _check_recovery_governance(store: StateStore, tree: WorkflowTree) -> None:
+    """Validate every definition recovery may drive before it can claim the first sibling."""
+    _check_wait_governance(tree.waits())
+    for leaf in tree.leaves():
+        if leaf.status == RunStatus.RUNNING.value and leaf.loop == "react":
+            saved = await _projected_governance(store, tree.tenant_id, leaf.run_id, leaf.governance)
+            try:
+                check_governance(leaf.agent, leaf.run_id, {GOVERNANCE_KEY: saved})
+            except GovernanceMismatchError as exc:
+                # Stale-running recovery reports the store's typed refusal.
+                raise RunNotReclaimableError(leaf.run_id, "governance_changed") from exc
 
 
 class _InlineTasks:
@@ -626,44 +674,6 @@ class _InlineTasks:
     def spawn(self, run_id: str, continuation: Coroutine[Any, Any, T]) -> Coroutine[Any, Any, T]:
         del run_id
         return continuation
-
-
-async def unwind_tree(
-    tree: WorkflowTree, leaf: LeafNode, store: Any, result: RunResult, *, notifier: Any
-) -> RunResult:
-    """Unwind from a continued leaf toward the root, its immediate parent first.
-
-    While the run just driven is terminal, settle the wait above it: a v3 wait by the
-    0.7 adoption, a v4 wait by the fan-in (``settle_parent``: a fresh read of every
-    child, then one claim and the completions in call order). A parent that adopts continues in
-    this task, delegating again if its model does. Stops at the first wait that is not
-    adoptable, is claimed by another caller, or whose run ends paused, and then returns
-    a fresh root view (the root's own result when the root itself was continued).
-    """
-    # cycle: _managed imports this module at load; removed when dispatch is extracted.
-    from dendrux.runtime import _managed, _managed_fanout, _reclaim
-
-    shared: Any = unclaimed_store(store)
-    result = await _managed.drive(result, notifier=notifier)
-    current = leaf.run_id
-    for wait in tree.ancestors(leaf.run_id):
-        record = await shared.get_run(current)
-        if record is None or record.status not in TERMINAL_STATUS_VALUES:
-            break
-        if wait.version == 3:
-            claim = await _managed.claim_adoption(_waiting_of(wait), shared)
-        else:
-            claim = await _managed_fanout.settle_parent(shared, wait)
-        if claim is None:
-            break
-        resumed = await _reclaim.continue_claimed(
-            wait.agent, shared, wait.run_id, claim, notifier=notifier
-        )
-        result = await _managed.drive(resumed, notifier=notifier)
-        current = wait.run_id
-    if current == tree.root_run_id:
-        return result
-    return await root_view(shared, tree.root_run_id)
 
 
 def _waiting_of(wait: WaitNode) -> _Waiting:

@@ -9,7 +9,7 @@ from sqlalchemy import select
 
 from dendrux._lifecycle import STORAGE_FORMAT_CHECKPOINTED
 from dendrux._managed_wait import _compact_json_bytes
-from dendrux._meta_keys import STORE_SESSION_KEY
+from dendrux._meta_keys import GOVERNANCE_KEY, STORE_SESSION_KEY
 from dendrux.db.models import AgentRun, ToolCallRecord
 from dendrux.errors import ManagedStateError
 from dendrux.runtime._capabilities import require_managed_fanout
@@ -395,6 +395,7 @@ class _SqlFanout(_SqlManaged):
                 self.json_get(AgentRun.loop_state, ("loop",), "str"),
                 self.json_get(AgentRun.pause_data, ("pause_id",), "str"),
                 self.json_get(AgentRun.pause_data, ("pause_reason",), "str"),
+                self.json_get(AgentRun.meta, (GOVERNANCE_KEY,), "json"),
             ).where(AgentRun.id.in_(ids), AgentRun.parent_run_id == parent_run_id),
             tenant_id,
         )

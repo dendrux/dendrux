@@ -343,8 +343,8 @@ def done(text: str) -> LLMResponse:
     return LLMResponse(text=text)
 
 
-def build(store: Any, case: str, **child_kwargs: Any) -> Agent:
-    """lead -> reviewer, where the reviewer pauses with ``case`` and then finishes."""
+def pausing_reviewer(store: Any, case: str, **child_kwargs: Any) -> Agent:
+    """A reviewer that pauses for this submission, then finishes."""
     first = {
         "approval": call("publish", {"text": "d"}, "c1"),
         "client_tool": call("read_sheet", {"sheet": "S1"}, "c1"),
@@ -366,13 +366,17 @@ def build(store: Any, case: str, **child_kwargs: Any) -> Agent:
     }[case]
     if case == "approval":
         child_kwargs.setdefault("require_approval", ["publish"])
-    child = reviewer(
+    return reviewer(
         ContextLLM([first, done(CHILD_TEXT)], on_call=on_call), tools=tools, **child_kwargs
     )
+
+
+def build(store: Any, case: str, **child_kwargs: Any) -> Agent:
+    """lead -> reviewer, where the reviewer pauses with ``case`` and then finishes."""
     return lead(
         store,
         ContextLLM([call("reviewer", {"task": BRIEF}, "r1"), done("root done")]),
-        child,
+        pausing_reviewer(store, case, **child_kwargs),
     )
 
 

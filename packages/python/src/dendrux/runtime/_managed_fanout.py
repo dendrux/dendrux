@@ -54,6 +54,7 @@ from dendrux.runtime.state import (
     ManagedHeader,
     StoreCapabilities,
     claimed_store,
+    unclaimed_store,
 )
 from dendrux.runtime.tasks import _drain_cleanup
 from dendrux.types import (
@@ -74,6 +75,7 @@ if TYPE_CHECKING:
     from dendrux.agent import Agent
     from dendrux.loops.base import LoopRecorder
     from dendrux.runtime._managed_fanout_store import BindManagedChildrenResult
+    from dendrux.runtime._managed_tree import WorkflowTree
     from dendrux.runtime.state import StateStore, TenantScope
     from dendrux.types import ToolCall, ToolResult
 
@@ -766,10 +768,52 @@ async def reconnect_tree(
 ) -> RunResult:
     """Validate and reconnect a fan-out workflow, then read its root-facing pending view."""
     tree = await _managed_route.route_tree(root_agent, store, root_run_id, tenant_id=tenant_id)
+    return await drive_tree(store, tree, notifier=notifier)
+
+
+async def unwind_tree(
+    tree: WorkflowTree, leaf: LeafNode, store: Any, result: RunResult, *, notifier: Any
+) -> RunResult:
+    """Unwind from a continued leaf toward the root, its immediate parent first.
+
+    While the run just driven is terminal, settle the wait above it: a v3 wait by the
+    0.7 adoption, a v4 wait by the fan-in (``settle_parent``: a fresh read of every
+    child, then one claim and the completions in call order). A parent that adopts continues in
+    this task, delegating again if its model does. Stops at the first wait that is not
+    adoptable, is claimed by another caller, or whose run ends paused, and then returns
+    a fresh root view (the root's own result when the root itself was continued).
+    """
+    shared: Any = unclaimed_store(store)
+    result = await _managed.drive(result, notifier=notifier)
+    current = leaf.run_id
+    for wait in tree.ancestors(leaf.run_id):
+        record = await shared.get_run(current)
+        if record is None or record.status not in _TERMINAL:
+            break
+        if wait.version == 3:
+            claim = await _managed.claim_adoption(_managed_route._waiting_of(wait), shared)
+        else:
+            claim = await settle_parent(shared, wait)
+        if claim is None:
+            break
+        resumed = await _reclaim.continue_claimed(
+            wait.agent, shared, wait.run_id, claim, notifier=notifier
+        )
+        result = await _managed.drive(resumed, notifier=notifier)
+        current = wait.run_id
+    if current == tree.root_run_id:
+        return result
+    return await _managed_route.root_view(shared, tree.root_run_id)
+
+
+async def drive_tree(
+    store: StateStore, tree: WorkflowTree, *, notifier: LoopNotifier | None
+) -> RunResult:
+    """Drive the already resolved branches and rebuild the root's pending view."""
     result = await drive_node(
         store, tree.root, tenant_id=tree.tenant_id, fanout_tree=True, notifier=notifier
     )
-    await attach_facing(result, _PendingReader(store), root_run_id, tree.tenant_id)
+    await attach_facing(result, _PendingReader(store), tree.root_run_id, tree.tenant_id)
     return result
 
 
