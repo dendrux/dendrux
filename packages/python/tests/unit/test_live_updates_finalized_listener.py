@@ -73,3 +73,85 @@ def test_postgres_wait_finalized_after_its_loop_closed_raises_nothing_unraisable
     bus._loop = None
     gc.collect()
     assert unraisable == []
+
+
+class _CleanupReplacesCancelBus(live.LiveUpdates):
+    """Its transport turns a cancel into a RuntimeError, as a failing cleanup does."""
+
+    async def send(self, messages):
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError as error:
+            raise RuntimeError("cleanup failed") from error
+
+    async def receive(self):
+        yield None
+        await asyncio.Future()
+
+    async def aclose_sender(self):
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError as error:
+            raise RuntimeError("cleanup failed") from error
+
+
+async def _cancel_after_it_starts(operation) -> None:
+    task = asyncio.create_task(operation)
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+async def test_cancelled_flush_stays_cancelled_when_cleanup_replaces_the_error():
+    bus = _CleanupReplacesCancelBus(send_timeout_s=5, flush_deadline_s=5)
+    bus.enqueue(["r"])
+    await _cancel_after_it_starts(bus.flush())
+    await bus.close()
+
+
+async def test_cancelled_close_stays_cancelled_when_cleanup_replaces_the_error():
+    bus = _CleanupReplacesCancelBus(close_timeout_s=5)
+    await _cancel_after_it_starts(bus.close())
+
+
+async def test_send_timeout_with_replaced_error_is_still_an_ordinary_failure():
+    bus = _CleanupReplacesCancelBus(send_timeout_s=0.1, flush_deadline_s=5)
+    bus.enqueue(["r"])
+    await bus.flush()  # the timeout is not the caller's cancellation
+    assert bus.stats().dropped_failed == 1
+
+
+class _CleanupReplacesExitBus(_CleanupReplacesCancelBus):
+    """A closing coroutine's GeneratorExit is replaced by a CancelledError."""
+
+    async def send(self, messages):
+        try:
+            await asyncio.Future()
+        except BaseException as error:
+            raise asyncio.CancelledError from error
+
+    async def aclose_sender(self):
+        await self.send([])
+
+
+@pytest.mark.parametrize("boundary", ["send", "close"])
+def test_send_and_close_finalized_without_a_loop_raise_nothing_unraisable(monkeypatch, boundary):
+    unraisable: list[object] = []
+    monkeypatch.setattr(sys, "unraisablehook", lambda args: unraisable.append(args))
+    bus = _CleanupReplacesExitBus(send_timeout_s=30, flush_deadline_s=30, close_timeout_s=30)
+    loop = asyncio.new_event_loop()
+
+    async def run() -> None:
+        bus.enqueue(["r"])
+        operation = bus.flush() if boundary == "send" else bus.close()
+        task = asyncio.create_task(operation)
+        await asyncio.sleep(0.05)
+        bus._abandoned = task
+
+    loop.run_until_complete(run())
+    loop.close()
+    del loop
+    bus.__dict__.pop("_abandoned", None)
+    gc.collect()
+    assert unraisable == []

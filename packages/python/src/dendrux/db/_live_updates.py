@@ -105,9 +105,21 @@ def _shutdown_socket(transport: Any) -> None:
         transport.get_extra_info("socket").shutdown(socket.SHUT_RDWR)
 
 
-def _caller_cancelled() -> bool:
-    task = asyncio.current_task()
-    return task is not None and task.cancelling() > 0
+def _restore_caller_exit() -> None:
+    """Call first in a handler that would treat a failure as ordinary.
+
+    A cleanup that fails while a cancel or a close() unwinds replaces the
+    ``CancelledError`` / ``GeneratorExit`` with its own error. Without a running
+    loop the coroutine is being finalized, so end it as close() expects; on a
+    loop, a task its caller is cancelling stays cancelled. A timeout this
+    module started has already uncancelled the task, so it is not restored.
+    """
+    try:
+        task = asyncio.current_task()
+    except RuntimeError:
+        raise GeneratorExit from None
+    if task is not None and task.cancelling() > 0:
+        raise asyncio.CancelledError from None
 
 
 def _quoted(run_id: str) -> str:
@@ -480,14 +492,9 @@ class LiveUpdates(ABC):
         try:
             async with asyncio.timeout(min(self.send_timeout_s, remaining)):
                 await self.send(messages)
-        except asyncio.CancelledError as error:
+        except (Exception, asyncio.CancelledError) as error:
             self._drop_batch(count)
-            if _caller_cancelled():
-                raise
-            self._send_failure(error, count)
-            return False
-        except Exception as error:
-            self._drop_batch(count)
+            _restore_caller_exit()
             self._send_failure(error, count)
             return False
         self._counts["sent"] += count
@@ -741,15 +748,7 @@ class LiveUpdates(ABC):
             self._degraded(ConnectionError())
 
     def _listener_failure(self, error: BaseException) -> None:
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            # No loop runs this coroutine: it is being finalized by close() after
-            # its loop went away, and a failing stream cleanup replaced the
-            # GeneratorExit. End the way close() expects; there is no one to tell.
-            raise GeneratorExit from None
-        if _caller_cancelled():
-            raise asyncio.CancelledError from None
+        _restore_caller_exit()
         self._degraded(error)
 
     async def _receive_messages(self) -> None:
@@ -859,16 +858,15 @@ class LiveUpdates(ABC):
         try:
             async with asyncio.timeout(self.close_timeout_s):
                 await self._close_resources(deadline)
-        except asyncio.CancelledError:
-            self._abort_all()
-            if _caller_cancelled():
-                raise
         except TimeoutError:
             self._abort_all()
             self._close_timeout()
-        except Exception as error:
-            self._last_error_type = _error_type(error)
+        except (Exception, asyncio.CancelledError) as error:
             self._abort_all()
+            _restore_caller_exit()
+            if isinstance(error, asyncio.CancelledError):
+                return
+            self._last_error_type = _error_type(error)
             _codes.log_code(
                 logger,
                 _codes.LIVE_UPDATES_UNAVAILABLE,
