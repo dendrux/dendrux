@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from contextvars import ContextVar
+from dataclasses import asdict, replace
 from typing import Any
 
 import pytest
@@ -69,7 +70,7 @@ async def note(text: str) -> str:
 
 
 @tool(target="client")
-async def read() -> str:
+async def read(text: str = "") -> str:
     """Read something in the browser."""
     return ""
 
@@ -621,7 +622,7 @@ async def test_a5_subagent_paused_while_a_sibling_runs_then_resume_stream(store,
         asker_id, sibling_id = await child_ids(store, root_id, ["asker", "sibling"])
         paused_events = [e for e in events if e.type == RunEventType.SUBAGENT_PAUSED]
         assert len(paused_events) == 1 and paused_events[0].run_id == asker_id
-        signal = paused_events[0].pending
+        signal = paused_events[0]
         view = events[-1]
         assert view.type == RunEventType.RUN_PAUSED
         result = view.run_result
@@ -630,7 +631,7 @@ async def test_a5_subagent_paused_while_a_sibling_runs_then_resume_stream(store,
         assert result.pause_id == result.pending.pause_id == signal.pause_id
         assert result.pending.origin_run_id == asker_id
         assert (await store.get_run(sibling_id)).status == "success"
-        assert [c.id for c in signal.tool_calls] == [c.id for c in result.pending.tool_calls]
+        assert signal.call_ids == tuple(c.id for c in result.pending.tool_calls)
 
         reply = [ToolResult("read", result.pending.tool_calls[0].id, '"answer"')]
         resumed = await collect(
@@ -647,6 +648,76 @@ async def test_a5_subagent_paused_while_a_sibling_runs_then_resume_stream(store,
     finally:
         slow.gate.set()
         await close_all(root, *children)
+
+
+@pytest.mark.parametrize("entry", ["stream", "resume_stream"])
+async def test_parallel_pause_events_only_carry_identities(store, entry, monkeypatch):
+    from dendrux.store import RunStore
+
+    sentinel = "stream-sentinel@example.test"
+    mapping_only = "mapping-only@example.test"
+    bind = store.bind_managed_children
+
+    async def bind_with_mapping(request):
+        # Streaming declines guardrails on child definitions. Seed the durable mapping
+        # at bind, as on a workflow created by an earlier non-streaming entry.
+        first, other = request.children
+        first = replace(
+            first, child_pii_mapping={"<<EMAIL_1>>": sentinel, "<<EMAIL_2>>": mapping_only}
+        )
+        return await bind(replace(request, children=(first, other)))
+
+    monkeypatch.setattr(store, "bind_managed_children", bind_with_mapping)
+    asker = worker(
+        "asker",
+        ScriptedLLM([LLMResponse(tool_calls=[ToolCall("read", {"text": sentinel})])]),
+        tools=[read],
+    )
+    sibling = worker("sibling", ScriptedLLM([LLMResponse(text="done")]))
+    fanout = LLMResponse(
+        tool_calls=[ToolCall("asker", {"task": sentinel}), ToolCall("sibling", {"task": "go"})]
+    )
+    turns = (
+        [LLMResponse(tool_calls=[ToolCall("read", {})]), fanout]
+        if entry == "resume_stream"
+        else [fanout]
+    )
+    root = lead(store, ScriptedLLM(turns), [asker, sibling], tools=[read])
+    try:
+        if entry == "resume_stream":
+            initial = await root.run("go", tenant_id=TENANT)
+            stream = root.resume_stream(
+                initial.run_id,
+                expected_pause_id=initial.pause_id,
+                tenant_id=TENANT,
+                tool_results=[ToolResult("read", initial.pending.tool_calls[0].id, '"ok"')],
+            )
+        else:
+            stream = root.stream("go", tenant_id=TENANT)
+        events = await collect(stream)
+        pending = await RunStore(store).get_pending(events[0].run_id, tenant_id=TENANT)
+        assert pending.tool_calls[0].params == {"text": sentinel}
+        assert set((await store.get_pii_mapping(pending.origin_run_id)).values()) == {
+            sentinel,
+            mapping_only,
+        }
+        for event in events:
+            payload = repr(asdict(event))
+            assert sentinel not in payload and mapping_only not in payload
+        (signal,) = [e for e in events if e.type == RunEventType.SUBAGENT_PAUSED]
+        assert (signal.run_id, signal.pause_id, signal.call_ids) == (
+            pending.origin_run_id,
+            pending.pause_id,
+            (pending.tool_calls[0].id,),
+        )
+        assert {key for key, value in asdict(signal).items() if value is not None} == {
+            "type",
+            "run_id",
+            "pause_id",
+            "call_ids",
+        }
+    finally:
+        await close_all(root, asker, sibling)
 
 
 async def test_resume_stream_on_a_fanout_root_refuses_a_stale_token(store, live_adoption):

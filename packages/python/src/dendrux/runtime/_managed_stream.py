@@ -12,10 +12,10 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import aclosing
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
-from dendrux._lifecycle import PAUSE_STATUSES, TERMINAL_STATUSES, CancelReason
+from dendrux._lifecycle import PAUSE_STATUSES, TERMINAL_STATUSES, CancelReason, PauseReason
 from dendrux.errors import RunCancelledError, RunFencedError
 from dendrux.loops import _helpers as _hooks
 from dendrux.loops.base import BaseNotifier
@@ -23,6 +23,7 @@ from dendrux.runtime import _managed_definitions, _managed_route
 from dendrux.runtime._entry_checks import entry_checks
 from dendrux.runtime._managed_route import _Waiting
 from dendrux.runtime._managed_tree import FanoutInvocation
+from dendrux.runtime._pending import PendingPause, PendingToolCall
 from dendrux.runtime._subagents import _tighten
 from dendrux.runtime.state import UNSCOPED, claimed_store
 from dendrux.runtime.tasks import _drain_cleanup
@@ -154,6 +155,30 @@ def _waiting_continuation(parent: _Waiting, store: Any, claim: Any, notifier: An
     return _continuation_stream(parent.parent_agent, parent.parent_run_id, store, claim, notifier)
 
 
+def _stream_result(result: RunResult) -> RunResult:
+    """Keep parallel child execution and display data on the scoped read path."""
+    if not any(getattr(p, "_parallel", False) for p in result.pendings):
+        return result
+    pauses = tuple(
+        PendingPause(
+            run_id=p.run_id,
+            status=p.status,
+            kind=p.kind,
+            pause_id=p.pause_id,
+            origin_run_id=p.origin_run_id,
+            reason=p.reason if p.reason in (PauseReason.REQUESTED, PauseReason.BUDGET) else None,
+            agent_name=p.agent_name,
+            agent_path=p.agent_path,
+            tool_calls=[
+                PendingToolCall(c.id, "", None, None, args_hidden=True) for c in p.tool_calls
+            ],
+        )
+        for p in result.pendings
+    )
+    meta = {k: v for k, v in result.meta.items() if k != "pii_mapping"}
+    return replace(result, pending=pauses[0], pendings=pauses, meta=meta)
+
+
 def _event(result: RunResult) -> Any:
     """The workflow stream's terminal event for a root-facing result."""
     kind = {
@@ -162,7 +187,9 @@ def _event(result: RunResult) -> Any:
         RunStatus.ERROR: RunEventType.RUN_ERROR,
         RunStatus.CANCELLED: RunEventType.RUN_CANCELLED,
     }.get(result.status, RunEventType.RUN_PAUSED)
-    return RunEvent(type=kind, run_result=result, run_id=result.run_id, error=result.error)
+    return RunEvent(
+        type=kind, run_result=_stream_result(result), run_id=result.run_id, error=result.error
+    )
 
 
 @dataclass(frozen=True)
@@ -214,7 +241,10 @@ async def _stream_failure(state: _StreamState, exc: Exception, run_id: str) -> A
     result.meta["error_type"] = type(exc).__name__
     state.root_active = True  # nothing to cancel: the failure is reported, not abandoned
     return RunEvent(
-        type=RunEventType.RUN_ERROR, run_result=result, run_id=result.run_id, error=error
+        type=RunEventType.RUN_ERROR,
+        run_result=_stream_result(result),
+        run_id=result.run_id,
+        error=error,
     )
 
 
@@ -287,7 +317,10 @@ async def _cancel_unstarted(state: _StreamState) -> None:
 
 def _event_with_error(result: RunResult, error: str | None) -> Any:
     return RunEvent(
-        type=RunEventType.RUN_ERROR, run_result=result, run_id=result.run_id, error=error
+        type=RunEventType.RUN_ERROR,
+        run_result=_stream_result(result),
+        run_id=result.run_id,
+        error=error,
     )
 
 
@@ -546,6 +579,14 @@ async def _exit_retaining(run: FanoutRun | None) -> asyncio.CancelledError | Non
     return None
 
 
+@dataclass(frozen=True, kw_only=True)
+class SubagentPausedEvent(RunEvent):
+    """A parallel child's pause signal. Execution arguments are read through RunStore."""
+
+    pause_id: str | None
+    call_ids: tuple[str, ...]
+
+
 class _RunEvents:
     """Forwards every hook; a run that stops at an external pause also tells the stream.
 
@@ -562,8 +603,14 @@ class _RunEvents:
     async def on_run_finished(self, run_id: str, result: RunResult) -> None:
         await _hooks.notify_run_finished(self.inner, run_id, result)
         if result.status in PAUSE_STATUSES:
+            pending = result.pending
             await self._sink(
-                RunEvent(type=RunEventType.SUBAGENT_PAUSED, run_id=run_id, pending=result.pending)
+                SubagentPausedEvent(
+                    type=RunEventType.SUBAGENT_PAUSED,
+                    run_id=(pending.origin_run_id if pending else None) or run_id,
+                    pause_id=result.pause_id,
+                    call_ids=tuple(c.id for c in pending.tool_calls) if pending else (),
+                )
             )
 
 
