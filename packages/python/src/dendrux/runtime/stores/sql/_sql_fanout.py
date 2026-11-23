@@ -9,7 +9,7 @@ from sqlalchemy import select
 
 from dendrux._lifecycle import STORAGE_FORMAT_CHECKPOINTED
 from dendrux._managed_wait import _compact_json_bytes
-from dendrux._meta_keys import STORE_SESSION_KEY
+from dendrux._meta_keys import GOVERNANCE_KEY, STORE_SESSION_KEY
 from dendrux.db.models import AgentRun, ToolCallRecord
 from dendrux.errors import ManagedStateError
 from dendrux.runtime._capabilities import require_managed_fanout
@@ -30,6 +30,7 @@ from dendrux.runtime._managed_fanout_store import (
     ManagedChildRow,
     ManagedChildSpec,
     checkpoint_binding,
+    checkpoint_skill_pins,
 )
 from dendrux.runtime.durability import retry_transient_db
 from dendrux.runtime.state import (
@@ -85,6 +86,13 @@ def _refuse_oversized_wait(plan: BindManagedChildrenRequest) -> None:
     wait = plan.encoded_wait
     if wait is None or _compact_json_bytes(wait) > MANAGED_WAIT_MAX_BYTES:
         raise ManagedStateError(reason="wait_invalid", run_id=plan.parent_run_id)
+
+
+def _projected_child(row: Sequence[Any]) -> ManagedChildRow:
+    *columns, skills = row
+    # Extract from the section so an explicit JSON null pin set differs from a missing key.
+    columns.append(checkpoint_skill_pins(skills))
+    return ManagedChildRow(*columns)
 
 
 def _row_bindings(rows: Sequence[Any], request: BindManagedChildrenRequest) -> _Bindings:
@@ -395,6 +403,9 @@ class _SqlFanout(_SqlManaged):
                 self.json_get(AgentRun.loop_state, ("loop",), "str"),
                 self.json_get(AgentRun.pause_data, ("pause_id",), "str"),
                 self.json_get(AgentRun.pause_data, ("pause_reason",), "str"),
+                self.json_get(AgentRun.meta, (GOVERNANCE_KEY,), "json"),
+                AgentRun.agent_name,
+                self.json_get(AgentRun.loop_state, ("skills",), "json"),
             ).where(AgentRun.id.in_(ids), AgentRun.parent_run_id == parent_run_id),
             tenant_id,
         )
@@ -412,5 +423,5 @@ class _SqlFanout(_SqlManaged):
             classify=self.classify_db_error,
             _raw_driver_errors=True,
         )
-        found = {row[0]: ManagedChildRow(*row) for row in rows}
+        found = {row[0]: _projected_child(row) for row in rows}
         return [found[run_id] for run_id in ids if run_id in found]

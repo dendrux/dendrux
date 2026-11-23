@@ -14,15 +14,17 @@ references that must not be mutated through them.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Final, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Final, Literal, Protocol
 
 from dendrux._lifecycle import TERMINAL_STATUSES
+from dendrux._sentinel import _UNPROJECTED
 from dendrux.errors import ManagedStateError
 from dendrux.runtime._fanout_adoption_state import MAX_FANOUT, MIN_FANOUT, FanoutBinding
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
 
+    from dendrux._sentinel import _UnsetType
     from dendrux.agent import Agent
     from dendrux.runtime._pending import PendingPause
     from dendrux.runtime.state import ClaimResult, StateStore, TenantScope
@@ -54,6 +56,9 @@ class LeafNode:
     pause_id: str | None = None
     pause_reason: str | None = None
     call: ToolCall | None = None
+    governance: dict[str, Any] | None | _UnsetType = _UNPROJECTED
+    skill_pins: dict[str, str] | None | _UnsetType = _UNPROJECTED
+    agent_name: str | _UnsetType = _UNPROJECTED
 
     @property
     def is_terminal(self) -> bool:
@@ -95,6 +100,9 @@ class WaitNode:
     iteration: int
     children: tuple[WaitNode | LeafNode, ...]
     call: ToolCall | None = None
+    governance: dict[str, Any] | None | _UnsetType = _UNPROJECTED
+    skill_pins: dict[str, str] | None | _UnsetType = _UNPROJECTED
+    agent_name: str | _UnsetType = _UNPROJECTED
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "children", tuple(self.children))
@@ -149,6 +157,10 @@ class WorkflowTree:
     def leaves(self) -> tuple[LeafNode, ...]:
         """Every leaf, depth-first, with siblings in their parent's call order."""
         return tuple(node for node, _ in _descend(self.root) if isinstance(node, LeafNode))
+
+    def waits(self) -> Iterable[WaitNode]:
+        """All parents a payload-free reconnect may settle."""
+        return (node for node, _ in _descend(self.root) if isinstance(node, WaitNode))
 
     def paused_leaves(self) -> tuple[LeafNode, ...]:
         """The externally paused leaves, in :meth:`leaves` order."""

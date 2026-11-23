@@ -483,6 +483,22 @@ def test_runtime_imports_stay_below_the_driver() -> None:
         "dataclasses",
         "typing",
         "dendrux._lifecycle",
+        "dendrux._sentinel",
         "dendrux.errors",
         "dendrux.runtime._fanout_adoption_state",
     }
+
+
+def test_unsupplied_tree_policy_fails_closed():
+    from dendrux.runtime import _managed_route
+    from dendrux.runtime._managed_fanout_store import _UNPROJECTED
+
+    for cls in (WaitNode, LeafNode, _managed_route._Seen):
+        assert (
+            next(f for f in dataclasses.fields(cls) if f.name == "governance").default
+            is _UNPROJECTED
+        )
+    wait = _wait(ROOT, _leaf(W), version=3, root=True)
+    with pytest.raises(ManagedStateError) as refused:
+        _managed_route._check_wait_governance([wait])
+    assert refused.value.reason == "wait_invalid"

@@ -49,6 +49,7 @@ from dendrux.runtime._limit_checks import (
 )
 from dendrux.runtime._managed_pending import read_workflow
 from dendrux.runtime._pending import _PendingReader
+from dendrux.runtime._run_resume_prep import check_continuation_pause
 from dendrux.runtime._tenant_checks import _tenant_scope_chosen
 from dendrux.runtime.context import DEFAULT_LEASE_INTERVAL_S, MIN_LEASE_INTERVAL_S
 from dendrux.runtime.state import UNSCOPED, ReclaimableRun, TenantScope, require_store_method
@@ -1985,7 +1986,7 @@ class Agent:
         provider = self._require_provider()
         skill_session = await continuation(self, store, run_id)
         with skill_session.bind(), await _continuation_projection(self, store, run_id):
-            pause = await results_for_generation(store, run_id, results, expected_pause_id)
+            pause = await results_for_generation(self, store, run_id, results, expected_pause_id)
             require_pause_id(self, expected_pause_id, pause_id=pause.pause_id, run_id=run_id)
             results = await prepare_client_results(self, run_id, pause, results)
             claim_kwargs: dict[str, Any] = {}
@@ -2121,17 +2122,9 @@ class Agent:
         projection, items = split_user_content(text, owner="text")
         skill_session = await continuation(self, store, run_id)
         with skill_session.bind(), await _continuation_projection(self, store, run_id):
-            from dendrux.runtime.submit import require_pause_id
-
             raw = await store.get_pause_state(run_id)
             if raw is not None:
-                require_pause_id(
-                    self,
-                    expected_pause_id,
-                    pause_id=raw.get("pause_id"),
-                    store=store,
-                    run_id=run_id,
-                )
+                check_continuation_pause(self, store, run_id, raw, expected_pause_id)
             submitted: dict[str, Any] = {"submitted_user_input": projection}
             claim_kwargs: dict[str, Any] = {}
             if items:

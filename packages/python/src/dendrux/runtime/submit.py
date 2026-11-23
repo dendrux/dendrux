@@ -13,6 +13,7 @@ not need to interpret store return values.
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 import weakref
 from collections import Counter
@@ -29,6 +30,7 @@ from dendrux._meta_keys import (
     GOVERNANCE_KEY as GOVERNANCE_KEY,
 )
 from dendrux.errors import (
+    GovernanceMismatchError,
     InvalidToolResultError,
     PauseStatusMismatchError,
     RunAlreadyClaimedError,
@@ -37,24 +39,16 @@ from dendrux.errors import (
     RunNotFoundError,
     RunNotPausedError,
 )
-from dendrux.runtime._managed_claim import (
-    _admit_managed_parent as _admit_managed_parent,
-)
+from dendrux.runtime._managed_claim import _admit_managed_parent as _admit_managed_parent
 from dendrux.runtime._managed_claim import (
     _managed_adoption_validator as _managed_adoption_validator,
 )
-from dendrux.runtime._managed_claim import (
-    _refuse_tokenless_managed,
-)
-from dendrux.runtime._managed_claim import (
-    claim_managed_adoption as claim_managed_adoption,
-)
+from dendrux.runtime._managed_claim import _refuse_tokenless_managed
+from dendrux.runtime._managed_claim import claim_managed_adoption as claim_managed_adoption
 from dendrux.runtime._managed_claim import (
     managed_submission_descriptor as managed_submission_descriptor,
 )
-from dendrux.runtime._managed_claim import (
-    refuse_managed_results as refuse_managed_results,
-)
+from dendrux.runtime._managed_claim import refuse_managed_results as refuse_managed_results
 from dendrux.runtime._tenant_checks import _strict_tenancy_applies
 from dendrux.types import (
     ULID_CHARS,
@@ -136,14 +130,12 @@ async def raise_for_non_paused_status(store: StateStore, run_id: str) -> NoRetur
 
 
 def _invalid_tool_result(run_id: str, reason: str) -> InvalidToolResultError:
-    import logging
-
     _codes.log_code(logging.getLogger(__name__), _codes.INVALID_TOOL_RESULT, run_id=run_id)
     return InvalidToolResultError(run_id, reason)
 
 
 async def validate_tool_results(
-    store: StateStore, run_id: str, results: list[ToolResult]
+    store: StateStore, run_id: str, results: list[ToolResult], *, agent: Agent | None = None
 ) -> PauseState:
     """Verify ``results`` align with the pending tool calls on ``run_id``.
 
@@ -155,6 +147,7 @@ async def validate_tool_results(
     if raw_pause is None:
         await raise_for_non_paused_status(store, run_id)
 
+    check_governance(agent, run_id, raw_pause)
     pause_state = PauseState.from_dict(raw_pause)
     _check_result_identities(run_id, results)
     pending_ids = {tc.id for tc in pause_state.pending_tool_calls}
@@ -1380,6 +1373,16 @@ def _governance_change(agent: Agent, raw: dict[str, Any]) -> dict[str, Any] | No
     }
 
 
+def check_governance(agent: Agent | None, run_id: str, raw: dict[str, Any] | None) -> None:
+    """Refuse a changed policy before continuation work or a locked claim."""
+    if agent is None or agent._on_governance_change != "raise":
+        return
+    change = _governance_change(agent, raw or {})
+    if change is not None:
+        _codes.log_code(logging.getLogger(__name__), _codes.GOVERNANCE_MISMATCH, run_id=run_id)
+        raise GovernanceMismatchError(run_id, **change)
+
+
 def submission_validator(
     run_id: str,
     raw: dict[str, Any],
@@ -1391,8 +1394,6 @@ def submission_validator(
     client_results: bool = False,
 ) -> Callable[[dict[str, Any]], None]:
     """Validate before claiming, then repeat under the claim transaction's lock."""
-    from dendrux.errors import GovernanceMismatchError
-
     # Even an optional-token client is bound to the generation we observed.
     generation = _pause_generation(raw, expected_pause_id)
     base = pause_validator(
@@ -1409,15 +1410,7 @@ def submission_validator(
         if current.get("schema_version") == 2:
             _validate_provider_kwargs(current.get("provider_kwargs") or {}, run_id=run_id)
         base(current)
-        if agent is not None and agent._on_governance_change == "raise":
-            change = _governance_change(agent, current)
-            if change is not None:
-                import logging
-
-                _codes.log_code(
-                    logging.getLogger(__name__), _codes.GOVERNANCE_MISMATCH, run_id=run_id
-                )
-                raise GovernanceMismatchError(run_id, **change)
+        check_governance(agent, run_id, current)
         if extra is not None:
             extra(current)
 
@@ -1431,8 +1424,6 @@ async def report_governance_change(
     run_id: str,
     raw: dict[str, Any],
 ) -> None:
-    import logging
-
     log = logging.getLogger(__name__)
     if GOVERNANCE_KEY not in raw:
         _codes.log_code(log, _codes.GOVERNANCE_LEGACY, run_id=run_id)
@@ -1563,7 +1554,14 @@ def legacy_approval_denial(
 async def prepare_resume_results(
     agent: Agent, store: StateStore, run_id: str, pause: PauseState, results: list[ToolResult]
 ) -> list[ToolResult]:
-    if await _resume_status(store, run_id) == RunStatus.WAITING_APPROVAL.value:
+    status = await _resume_status(store, run_id)
+    return await prepare_results_for_status(agent, run_id, pause, results, status)
+
+
+async def prepare_results_for_status(
+    agent: Agent, run_id: str, pause: PauseState, results: list[ToolResult], status: str | None
+) -> list[ToolResult]:
+    if status == RunStatus.WAITING_APPROVAL.value:
         results = legacy_approval_denial(
             run_id, pause, await _validate_client_results(agent, run_id, results)
         )

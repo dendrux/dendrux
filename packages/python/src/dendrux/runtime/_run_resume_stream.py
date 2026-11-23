@@ -27,6 +27,7 @@ from dendrux.loops._helpers import (
     record_run_started,
 )
 from dendrux.runtime import (
+    _continuation_refusals,
     _reclaim,
     _run_contracts,
     _run_errors,
@@ -106,18 +107,21 @@ async def _stream_resume_images(
     raw = await store.get_pause_state(run_id)
     if raw is None:
         raise ValueError("Run has no pause state")
-    _submit.require_pause_id(
-        agent, expected_pause_id, pause_id=raw.get("pause_id"), store=store, run_id=run_id
-    )
+    _run_resume_prep.check_continuation_pause(agent, store, run_id, raw, expected_pause_id)
     media_pause = PauseState.from_dict(raw)
     if media_pause.agent_name and media_pause.agent_name != agent.name:
         raise ValueError("Agent name mismatch on resume")
+    record = await _continuation_refusals.image_run(agent, store, run_id)
     if stream_results is not None:
         _submit.validate_result_names(run_id, media_pause, stream_results)
-        stream_results = await _submit.prepare_resume_results(
-            agent, store, run_id, media_pause, stream_results
+        stream_results = await _submit.prepare_results_for_status(
+            agent, run_id, media_pause, stream_results, record.status
         )
+        # A result transform can change the run. Recheck its status before ingest.
+        ingest_record = None
         results_prepared = True
+    else:
+        ingest_record = record
     stream_results, user_parts = await _run_images._ingest_resume_images(
         agent,
         provider,
@@ -127,6 +131,7 @@ async def _stream_resume_images(
         tool_results=stream_results,
         input_items=input_items,
         loop_method="run_stream",
+        record=ingest_record,
     )
     return store, stream_results, user_parts, results_prepared
 
@@ -474,10 +479,15 @@ async def _initial_stream_images(
     expected_pause_id: str | None,
     results: list[ToolResult] | None,
     items: tuple[Any, ...],
-) -> tuple[StateStore | None, list[ToolResult] | None, tuple[ContentPart, ...] | None, bool]:
+) -> (
+    tuple[StateStore | None, list[ToolResult] | None, tuple[ContentPart, ...] | None, bool]
+    | _continuation_refusals.DefinitionRefusal
+):
     if items or any(result.images for result in results or ()):
-        return await _stream_resume_images(
-            agent, provider, store, resolver, run_id, expected_pause_id, results, items
+        return await _continuation_refusals.image_setup(
+            _stream_resume_images(
+                agent, provider, store, resolver, run_id, expected_pause_id, results, items
+            )
         )
     return store, results, None, False
 
@@ -529,19 +539,20 @@ def resume_stream(
 
     async def _generate() -> AsyncGenerator[RunEvent, None]:
         store = state_store
-        stream_results = tool_results
-        user_parts: tuple[ContentPart, ...] | None = None
-        store, stream_results, user_parts, results_prepared = await _initial_stream_images(
+        images = await _initial_stream_images(
             agent,
             provider,
             store,
             state_store_resolver,
             run_id,
             expected_pause_id,
-            stream_results,
+            tool_results,
             input_items,
         )
         try:
+            store, stream_results, user_parts, results_prepared = (
+                _continuation_refusals.checked_images(images)
+            )
             store = await _run_resume_prep._resolve_resume_stream_store(store, state_store_resolver)
             _shared["state_store"] = store
 

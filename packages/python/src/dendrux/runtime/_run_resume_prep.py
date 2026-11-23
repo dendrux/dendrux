@@ -576,6 +576,16 @@ async def _resume_session(
     return session, user_input, items
 
 
+def check_continuation_pause(
+    agent: Agent, store: StateStore, run_id: str, raw: dict[str, Any], expected_pause_id: str | None
+) -> None:
+    """Check the token and policy before preparing a continuation payload."""
+    _submit.require_pause_id(
+        agent, expected_pause_id, pause_id=raw.get("pause_id"), store=store, run_id=run_id
+    )
+    _submit.check_governance(agent, run_id, raw)
+
+
 async def _read_resume_pause(
     store: StateStore,
     agent: Agent,
@@ -591,9 +601,7 @@ async def _read_resume_pause(
     if raw is None:
         raise ValueError(f"Run '{run_id}' has no pause state — cannot resume.")
     if not skip_claim:
-        _submit.require_pause_id(
-            agent, expected_pause_id, pause_id=raw.get("pause_id"), store=store, run_id=run_id
-        )
+        check_continuation_pause(agent, store, run_id, raw, expected_pause_id)
     return await _load_resume_pause(
         store, agent, provider, run_id, raw, reads, read_record=read_record
     )
@@ -721,7 +729,11 @@ async def _resume_submission(
 
 
 async def results_for_generation(
-    store: StateStore, run_id: str, results: list[ToolResult], expected_pause_id: str | None
+    agent: Agent,
+    store: StateStore,
+    run_id: str,
+    results: list[ToolResult],
+    expected_pause_id: str | None,
 ) -> PauseState:
     """The pause ``results`` answer, validated; a stale token is reported before the results.
 
@@ -731,7 +743,7 @@ async def results_for_generation(
     naming the current one. The claim's locked comparison still follows on success.
     """
     try:
-        return await validate_tool_results(store, run_id, results)
+        return await validate_tool_results(store, run_id, results, agent=agent)
     except InvalidToolResultError:
         if expected_pause_id is not None:
             record = await store.get_run(run_id)
