@@ -15,6 +15,7 @@ docs/
 ├── upgrading-to-0.6.0.mdx  → /docs/upgrading-to-0.6.0
 ├── upgrading-to-0.6.1.mdx  → /docs/upgrading-to-0.6.1
 ├── upgrading-to-0.7.0.mdx  → /docs/upgrading-to-0.7.0
+├── upgrading-to-0.8.0.mdx  → /docs/upgrading-to-0.8.0
 ├── guides/                 → /docs/guides/*
 │   ├── scaling.mdx         (pools, live updates, migrations, leases, bounds, load testing)
 │   ├── mysql.mdx           (MySQL and MariaDB: driver, URL, schema, collations, packet size)
@@ -31,7 +32,7 @@ docs/
 │   ├── loops.mdx, models.mdx, reasoning.mdx, prompt-cache.mdx
 │   ├── mcp.mdx, skills.mdx
 │   └── notifier.mdx, recorder.mdx
-├── recipes/                → /docs/recipes/*
+├── recipes/                → /docs/recipes/* (includes testing-with-fake-model.mdx)
 └── reference/              → /docs/reference/*
     ├── state-store.mdx     (capabilities and format requirements)
     └── cli.mdx             (database checks, activation and status)

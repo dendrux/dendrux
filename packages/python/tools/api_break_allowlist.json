@@ -15,7 +15,8 @@
     "0.6:sql-store-removal",
     "0.6:migration-table",
     "0.7:bounded-reads",
-    "0.7:sweep-reclaim"
+    "0.7:sweep-reclaim",
+    "0.8:cli-exclude-waiting"
   ],
   "entries": [
     {
@@ -100,6 +101,15 @@
       "b_item": "0.7:sweep-reclaim",
       "note": "Omitted or None on_stale means reclaim; on_stale='error' keeps finalising.",
       "param": "on_stale"
+    },
+    {
+      "kind": "parameter-moved",
+      "paths": [
+        "dendrux.cli.runs.list_runs"
+      ],
+      "param": "storage_format",
+      "b_item": "0.8:cli-exclude-waiting",
+      "note": "dendrux runs gains --exclude-waiting before --format; it is a command-line option, not a Python call."
     }
   ],
   "documentary": [

@@ -192,6 +192,8 @@ On the browser envelope, `RunResult.to_dict()` and the wire view carry a `pendin
 
 A parent that is only waiting for its running subagents is stored as `paused`, so `list_runs(status="paused")` includes it next to runs that need a person. Since 0.8, `RunSummary`, `RunDetail` and the nodes of `get_subtree` carry `waiting_for: str | None`. It is `"subagents"` when the stored status is `paused` and the stored pause reason is exactly `managed_wait`, and `None` otherwise. A missing, null or malformed reason stays a plain pause, so a person looks at it. The label describes the parent only; a child can still wait for an approval, a client tool or input, which `get_pendings` reports.
 
+[//]: # "docs-test: skip - fragment: relies on `runs`, defined by setup shown elsewhere"
+
 ```python
 needs_attention = await runs.list_runs(status="paused", tenant_id="acme", include_waiting=False)
 how_many = await runs.count_runs(status="paused", tenant_id="acme", include_waiting=False)

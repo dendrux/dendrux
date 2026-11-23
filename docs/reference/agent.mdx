@@ -198,6 +198,8 @@ clarification question.
 
 `on_started=` (also on `retry`) receives the new root run id as soon as the run is saved and claimed, before the first model or tool call. Use it to hand the id to a client or a job table while `run()` is still working, so a cancel or a crash has an id to act on. It can be a plain function or `async def`.
 
+[//]: # "docs-test: skip - fragment: relies on `agent` and `jobs`, defined by setup shown elsewhere"
+
 ```python
 await agent.run("Review the draft", tenant_id="acme", on_started=lambda run_id: jobs.save(run_id))
 ```
