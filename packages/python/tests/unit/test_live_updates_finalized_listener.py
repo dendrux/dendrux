@@ -143,7 +143,8 @@ def test_send_and_close_finalized_without_a_loop_raise_nothing_unraisable(monkey
     loop = asyncio.new_event_loop()
 
     async def run() -> None:
-        bus.enqueue(["r"])
+        if boundary == "send":
+            bus.enqueue(["r"])  # close needs nothing pending, so it reaches aclose_sender
         operation = bus.flush() if boundary == "send" else bus.close()
         task = asyncio.create_task(operation)
         await asyncio.sleep(0.05)
@@ -155,3 +156,44 @@ def test_send_and_close_finalized_without_a_loop_raise_nothing_unraisable(monkey
     bus.__dict__.pop("_abandoned", None)
     gc.collect()
     assert unraisable == []
+
+
+class _CleanupTimesOutBus(_CleanupReplacesCancelBus):
+    async def aclose_sender(self):
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError as error:
+            raise TimeoutError("cleanup timed out") from error
+
+
+async def test_cancelled_close_stays_cancelled_when_cleanup_raises_timeout():
+    await _cancel_after_it_starts(_CleanupTimesOutBus(close_timeout_s=5).close())
+
+
+class _HangingConnection:
+    def is_closed(self):
+        return False
+
+    async def close(self, timeout=None):
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError as error:
+            raise TimeoutError("cleanup timed out") from error
+
+    def terminate(self):
+        return None
+
+
+async def test_cancelled_postgres_close_stays_cancelled_when_cleanup_raises_timeout():
+    pytest.importorskip("asyncpg")
+    from dendrux.db._postgres_updates import PostgresUpdates
+
+    bus = PostgresUpdates(url="postgresql://u@localhost/db", close_timeout_s=5)
+    bus._sender = _HangingConnection()
+    await _cancel_after_it_starts(bus.close())
+
+
+async def test_close_budget_expiry_with_timeout_cleanup_is_an_ordinary_close_timeout():
+    bus = _CleanupTimesOutBus(close_timeout_s=0.1)
+    await bus.close()
+    assert bus._state == "closed"

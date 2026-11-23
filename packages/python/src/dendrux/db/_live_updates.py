@@ -858,14 +858,15 @@ class LiveUpdates(ABC):
         try:
             async with asyncio.timeout(self.close_timeout_s):
                 await self._close_resources(deadline)
-        except TimeoutError:
-            self._abort_all()
-            self._close_timeout()
         except (Exception, asyncio.CancelledError) as error:
             self._abort_all()
             _restore_caller_exit()
-            if isinstance(error, asyncio.CancelledError):
-                return
+            self._close_failed(error)
+
+    def _close_failed(self, error: BaseException) -> None:
+        if isinstance(error, TimeoutError):
+            self._close_timeout()
+        elif isinstance(error, Exception):
             self._last_error_type = _error_type(error)
             _codes.log_code(
                 logger,
