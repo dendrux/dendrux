@@ -3662,10 +3662,15 @@
   "digest": "d88a23efdc42"
  },
  "src/dendrux/errors.py::TenantScopeRequiredError.__init__": {
-  "complexity": 1,
+  "complexity": 2,
   "coverage": 1.0,
-  "crap": 1.0,
-  "digest": "5e7a83b50d67"
+  "crap": 2.0,
+  "digest": "24fc20c3d554",
+  "waived": {
+   "date": "2026-11-23",
+   "reason": "owner 2026-11-23: approved 1->2 for the optional message branch used by dendrux.cancel_run (fully covered)",
+   "rule": "worse"
+  }
  },
  "src/dendrux/errors.py::UnsupportedModalityError.__init__": {
   "complexity": 1,
