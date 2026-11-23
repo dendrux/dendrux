@@ -32,7 +32,7 @@ docs/
 │   ├── loops.mdx, models.mdx, reasoning.mdx, prompt-cache.mdx
 │   ├── mcp.mdx, skills.mdx
 │   └── notifier.mdx, recorder.mdx
-├── recipes/                → /docs/recipes/* (includes testing-with-fake-model.mdx)
+├── recipes/                → /docs/recipes/* (includes testing-with-fake-model.mdx: scripted models for tests)
 └── reference/              → /docs/reference/*
     ├── state-store.mdx     (capabilities and format requirements)
     └── cli.mdx             (database checks, activation and status)
