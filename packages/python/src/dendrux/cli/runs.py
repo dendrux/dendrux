@@ -49,9 +49,9 @@ def list_runs(
     storage_format: Annotated[
         StorageFormat | None, typer.Option("--format", help="Filter by storage format.")
     ] = None,
-    exclude_waiting: bool = typer.Option(
-        False, "--exclude-waiting", help="Leave out runs waiting on subagents."
-    ),
+    exclude_waiting: Annotated[
+        bool, typer.Option("--exclude-waiting", help="Leave out runs waiting on subagents.")
+    ] = False,
 ) -> None:
     """List recent agent runs."""
     asyncio.run(
