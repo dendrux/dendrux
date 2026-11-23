@@ -89,6 +89,7 @@ custom-store authors and code that reads error text must take. No schema migrati
 
 ### Fixed
 
+- A continuation with changed governance settings or skills is refused before anything is written, so the pending approval or input can be retried.
 - A cancelled write on a file SQLite database could leave the file locked for every later writer
   (`lock_timeout`). Dendrux now closes a `sqlite+aiosqlite` connection's cursors and rolls back
   before the connection is closed, invalidated or garbage-collected, without waiting on the database
