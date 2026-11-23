@@ -159,25 +159,29 @@ async def _adapter_failure(
 ) -> BaseException | None:
     """Run in the owning task. Return transport failures and propagate caller cancellation."""
     limit = asyncio.timeout(timeout)
-    succeeded = False
+    abort_on_exit = True
     try:
         # Deliver requests pending at entry before transport cleanup can replace them.
         await asyncio.sleep(0)
         baseline = _cancel_count()
-        failure = None
+        failure: BaseException | None = None
         try:
             async with limit:
                 await operation()
+            if limit.expired():
+                failure = TimeoutError()
         except (Exception, asyncio.CancelledError) as error:
             failure = error
         # The timeout has now withdrawn its own cancellation, even if cleanup swallowed it.
         await _restore_adapter_exit(failure, baseline)
-        if failure is None and limit.expired():
-            return TimeoutError()
-        succeeded = failure is None
+        abort_on_exit = failure is not None
         return failure
+    except GeneratorExit:
+        # Coroutine finalization can run after the adapter's event loop has closed.
+        abort_on_exit = False
+        raise
     finally:
-        if not succeeded:
+        if abort_on_exit:
             abort()
 
 
