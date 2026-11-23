@@ -1,11 +1,12 @@
 """A requested pause during approval execution keeps pending server arguments private."""
 
+import asyncio
 import json
 
 from dendrux import Agent, tool
 from dendrux.guardrails import PII
 from dendrux.runtime.context import get_delegation_context
-from dendrux.store import RunStore
+from dendrux.store import RunStore, StoredEvent
 from dendrux.types import LLMResponse
 from tests._helpers.scripted_provider import ScriptedLLM, tool_calls
 
@@ -58,11 +59,14 @@ async def test_paused_approval_batch_hides_remaining_arguments(store):
             tenant_id="A",
             after_sequence_index=active.sequence_index - 1,
             until_terminal=False,
-            max_duration_s=2,
+            max_duration_s=60,
         ) as feed:
-            async for item in feed:
-                assert secret not in json.dumps(item.data)
-                break
+            async with asyncio.timeout(30):
+                item = await anext(feed)
+            assert isinstance(item, StoredEvent), item
+            assert item.event_type == "run.paused"
+            assert item.sequence_index == active.sequence_index
+            assert secret not in json.dumps(item.data)
     finally:
         await reader.close()
         await agent.close()

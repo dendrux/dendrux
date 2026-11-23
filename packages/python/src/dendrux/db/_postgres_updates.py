@@ -658,7 +658,9 @@ class PostgresUpdates(LiveUpdates):
                 {getter, waiter}, timeout=self.health_check_s, return_when=asyncio.FIRST_COMPLETED
             )
         finally:
-            waiter.cancel()
-            if not getter.done():
-                getter.cancel()
+            for pending in (waiter, getter):
+                # A wait finalized after its loop closed cannot schedule a cancel; the
+                # futures die with that loop, so only that RuntimeError is dropped.
+                with suppress(RuntimeError):
+                    pending.cancel()
         return getter.result() if getter.done() and not getter.cancelled() else None
