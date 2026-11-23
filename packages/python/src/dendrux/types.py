@@ -2114,8 +2114,8 @@ class RunEvent:
         TOOL_RESULT:     tool_call, tool_result, iteration, phase="commentary"
         RUN_COMPLETED:   run_result, phase="final_answer" on success;
                          ``stop_reason`` / ``truncated`` mirror run_result
-        SUBAGENT_PAUSED: run_id of the child and its safe pending projection
-        RUN_PAUSED:      run_result (pause state in run_result.meta)
+        SUBAGENT_PAUSED: origin child run_id, pause_id, and ordered call_ids
+        RUN_PAUSED:      run_result with its full pending pause
         RUN_ERROR:       run_result, error
 
     ``iteration`` is the loop step (one LLM call) an LLM-output or tool event
@@ -2140,7 +2140,8 @@ class RunEvent:
     error: str | None = None
     iteration: int | None = None
     phase: str | None = None
-    pending: PendingPause | None = None
+    pause_id: str | None = None
+    call_ids: tuple[str, ...] = ()
 
     @property
     def stop_reason(self) -> StopReason | None:

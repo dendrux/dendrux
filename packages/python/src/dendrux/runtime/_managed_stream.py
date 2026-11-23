@@ -214,7 +214,10 @@ async def _stream_failure(state: _StreamState, exc: Exception, run_id: str) -> A
     result.meta["error_type"] = type(exc).__name__
     state.root_active = True  # nothing to cancel: the failure is reported, not abandoned
     return RunEvent(
-        type=RunEventType.RUN_ERROR, run_result=result, run_id=result.run_id, error=error
+        type=RunEventType.RUN_ERROR,
+        run_result=result,
+        run_id=result.run_id,
+        error=error,
     )
 
 
@@ -287,7 +290,10 @@ async def _cancel_unstarted(state: _StreamState) -> None:
 
 def _event_with_error(result: RunResult, error: str | None) -> Any:
     return RunEvent(
-        type=RunEventType.RUN_ERROR, run_result=result, run_id=result.run_id, error=error
+        type=RunEventType.RUN_ERROR,
+        run_result=result,
+        run_id=result.run_id,
+        error=error,
     )
 
 
@@ -562,8 +568,14 @@ class _RunEvents:
     async def on_run_finished(self, run_id: str, result: RunResult) -> None:
         await _hooks.notify_run_finished(self.inner, run_id, result)
         if result.status in PAUSE_STATUSES:
+            pending = result.pending
             await self._sink(
-                RunEvent(type=RunEventType.SUBAGENT_PAUSED, run_id=run_id, pending=result.pending)
+                RunEvent(
+                    type=RunEventType.SUBAGENT_PAUSED,
+                    run_id=(pending.origin_run_id if pending else None) or run_id,
+                    pause_id=result.pause_id,
+                    call_ids=tuple(c.id for c in pending.tool_calls) if pending else (),
+                )
             )
 
 

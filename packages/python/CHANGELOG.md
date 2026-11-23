@@ -20,8 +20,12 @@ custom-store authors and code that reads error text must take. No schema migrati
     token raises `PauseStatusMismatchError(reason="pause_id")` with `current_pause_id`. A budget
     pause makes one pause per leaf that observes the breach.
   - **Streaming.** `stream()` and `resume_stream()` run parallel children, with child tool
-    progress live and a non-terminal `RunEventType.SUBAGENT_PAUSED` (`RunEvent.pending`) when a
-    child pauses. Events pass through one bounded queue. A held approval batch can be resumed on a
+    progress live. The non-terminal `SUBAGENT_PAUSED` event carries the child `run_id`,
+    `pause_id`, and ordered `call_ids` on `RunEvent`. These replace the pre-release
+    `RunEvent.pending` field. Read arguments during progress through tenant-scoped
+    `store.get_pending()` or `store.get_pendings()`. Terminal events carry the full
+    `run_result`. This change affects no 0.7 users.
+    Events pass through one bounded queue. A held approval batch can be resumed on a
     stream, and `resume_stream(root, expected_pause_id=)` answers any paused child.
   - **Recovery.** `reclaim(root)` reconnects every branch without rerunning finished children.
     `sweep(adoptable_after=timedelta(...))` lists, in `SweepResult.adoptable`, the roots of old

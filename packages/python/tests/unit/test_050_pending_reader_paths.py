@@ -16,6 +16,7 @@ import pytest
 from sqlalchemy.exc import DBAPIError
 
 from dendrux.errors import PersistenceError
+from dendrux.runtime._managed_pending import leaf_summaries
 from dendrux.runtime._pending import _PendingReader
 from dendrux.runtime.stores.sql.postgres import PostgresStateStore
 
@@ -74,7 +75,8 @@ def test_only_json_conversion_errors_fall_back(code: str | None, expected: bool)
     )
 
 
-async def test_other_database_errors_propagate() -> None:
+@pytest.mark.parametrize("batched", [False, True], ids=["single", "batch"])
+async def test_other_database_errors_propagate(batched, caplog) -> None:
     class _Session:
         async def __aenter__(self) -> Any:
             return self
@@ -88,4 +90,8 @@ async def test_other_database_errors_propagate() -> None:
     state = object.__new__(PostgresStateStore)
     state._session_factory = _Session
     with pytest.raises(PersistenceError):
-        await state.get_pause_summary("r", tenant_id=None)
+        if batched:
+            await leaf_summaries(state, ["r", "s"], None)
+        else:
+            await state.get_pause_summary("r", tenant_id=None)
+    assert all(getattr(record, "code", None) != "pause_data_not_jsonb" for record in caplog.records)

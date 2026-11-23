@@ -15,16 +15,33 @@ is read, and the walk is bounded. The per-leaf pending projection belongs to the
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
-from dendrux._lifecycle import PAUSE_STATUSES
+from sqlalchemy import Integer, String, bindparam, column, func, literal, select, true, union_all
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB
+from sqlalchemy.exc import DBAPIError
+
+from dendrux import _codes
+from dendrux._lifecycle import (
+    PAUSE_STATUSES,
+    PENDING_KIND_BY_STATUS,
+    GovernanceEventType,
+    StoredEventType,
+)
 from dendrux._managed_wait import ManagedFanout, decode_managed_binding
+from dendrux.db.models import AgentRun, RunEvent
 from dendrux.errors import ManagedStateError, RunNotFoundError
+from dendrux.runtime._bounds import MAX_PAGE
 from dendrux.runtime._capabilities import fanout_support
+from dendrux.runtime.durability import _safe_database_call
 from dendrux.runtime.state import (
+    PAUSE_SUMMARY_KEYS,
     UNSCOPED,
     ManagedHeader,
+    PauseSummary,
+    _apply_tenant_scope,
     unclaimed_store,
 )
 from dendrux.types import _ULID_PATTERN, RunStatus
@@ -322,3 +339,243 @@ async def _children(
         )
         for row, child_path in rows
     ]
+
+
+def needs_approval_display(summary: PauseSummary) -> bool:
+    kind = PENDING_KIND_BY_STATUS.get(summary.status)
+    if kind != "paused":
+        return kind in ("approval", "input")
+    targets = summary.pause.get("pending_targets") or {}
+    gates = summary.pause.get("approval_gates") or {}
+    return any(
+        isinstance(call, dict)
+        and (targets.get(call.get("id")) != "client" or call.get("id") in gates)
+        for call in summary.pause.get("pending_tool_calls") or ()
+    )
+
+
+def _latest_event(*kinds: str, before: Any = None, inputs: tuple[Any, ...] = ()) -> Any:
+    statement = select(func.max(RunEvent.sequence_index)).where(
+        RunEvent.agent_run_id == AgentRun.id, RunEvent.event_type.in_(kinds)
+    )
+    if before is not None:
+        statement = statement.where(RunEvent.sequence_index < before)
+    return statement.correlate(AgentRun, *inputs).scalar_subquery()
+
+
+def _summary_batch_query(store: Any, ids: list[str], tenant: TenantScope, *, whole: bool) -> Any:
+    seq = _latest_event(StoredEventType.RUN_PAUSED.value).label("seq")
+    statement = _apply_tenant_scope(
+        select(AgentRun.id, AgentRun.status, seq, AgentRun.pii_mapping).where(
+            store.id_in(AgentRun.id, ids)
+        ),
+        tenant,
+    )
+    if whole:
+        return statement.add_columns(AgentRun.pause_data)
+    if "postgresql" in store.dialect_names:
+        # As in the single-run adapter, parse plain JSON once before extracting its keys.
+        source = (
+            statement.add_columns(AgentRun.pause_data.cast(JSONB).label("doc")).offset(0).subquery()
+        )
+        doc = source.c.doc
+        return select(
+            source.c.id,
+            source.c.status,
+            source.c.seq,
+            source.c.pii_mapping,
+            *(doc[key] for key in PAUSE_SUMMARY_KEYS),
+            doc["steps"][-1],
+        )
+    return statement.add_columns(*store.pause_projection(AgentRun.pause_data))
+
+
+def _decode_summary(row: Any, *, whole: bool) -> PauseSummary:
+    _, status, seq, mapping, *parts = row
+    if whole:
+        doc = parts[0] if isinstance(parts[0], dict) else {}
+        steps = doc.get("steps")
+        last = steps[-1] if isinstance(steps, list) and steps else None
+        parts = [doc.get(key) for key in PAUSE_SUMMARY_KEYS] + [last]
+    last = parts.pop()
+    pause = {k: v for k, v in zip(PAUSE_SUMMARY_KEYS, parts, strict=True) if v is not None}
+    return PauseSummary(
+        status,
+        pause,
+        last if isinstance(last, dict) else None,
+        seq,
+        mapping if isinstance(mapping, dict) else None,
+    )
+
+
+async def read_pause_summaries(
+    store: Any, ids: list[str], tenant: TenantScope, *, whole: bool
+) -> dict[str, PauseSummary]:
+    statement = _summary_batch_query(store, ids, tenant, whole=whole)
+    async with store._session_factory() as session:
+        rows = (await session.execute(statement)).all()
+    return {row.id: _decode_summary(row, whole=whole) for row in rows}
+
+
+@_safe_database_call
+async def leaf_summaries(store: Any, ids: list[str], tenant: str | None) -> dict[str, PauseSummary]:
+    """Read bounded pause columns, falling back to legacy plain JSON on conversion errors."""
+    try:
+        return await read_pause_summaries(store, ids, tenant, whole=False)
+    except DBAPIError as exc:
+        if not store.json_conversion_error(exc):
+            raise
+    return await _recover_leaf_summaries(store, ids, tenant)
+
+
+async def _recover_leaf_summaries(
+    store: Any, ids: list[str], tenant: str | None
+) -> dict[str, PauseSummary]:
+    """Isolate the rows PostgreSQL rejected so the diagnostic names each affected run."""
+    if len(ids) == 1:
+        _codes.log_code(logging.getLogger(__name__), _codes.PAUSE_DATA_NOT_JSONB, run_id=ids[0])
+        return await read_pause_summaries(store, ids, tenant, whole=True)
+    # Healthy groups still use the bounded projection. Only failed groups split again.
+    middle = len(ids) // 2
+    summaries: dict[str, PauseSummary] = await leaf_summaries(store, ids[:middle], tenant)
+    summaries.update(await leaf_summaries(store, ids[middle:], tenant))
+    return summaries
+
+
+def _active_generation(seq: Any, *inputs: Any) -> Any:
+    event = RunEvent.__table__.c
+    tail = RunEvent.__table__.alias("later")
+    abort = RunEvent.__table__.alias("abort")
+    paused = StoredEventType.RUN_PAUSED.value
+    # The summary pins an exact pause. Only events after it can invalidate it.
+    at_pause = (
+        select(1)
+        .where(
+            event.agent_run_id == AgentRun.id,
+            event.sequence_index == seq,
+            event.event_type == paused,
+        )
+        .correlate(AgentRun, *inputs)
+        .exists()
+    )
+    undone = (
+        select(1)
+        .where(
+            abort.c.agent_run_id == tail.c.agent_run_id,
+            abort.c.sequence_index > tail.c.sequence_index,
+            abort.c.event_type == StoredEventType.RUN_RESUME_ABORTED.value,
+        )
+        .correlate(tail)
+        .exists()
+    )
+    invalid = (
+        paused,
+        StoredEventType.RUN_COMPLETED.value,
+        StoredEventType.RUN_ERROR.value,
+        StoredEventType.RUN_CANCELLED.value,
+    )
+    moved = (
+        select(1)
+        .where(
+            tail.c.agent_run_id == AgentRun.id,
+            tail.c.sequence_index > seq,
+            tail.c.event_type.in_(invalid)
+            | ((tail.c.event_type == StoredEventType.RUN_RESUMED.value) & ~undone),
+        )
+        .correlate(AgentRun, *inputs)
+        .exists()
+    )
+    return at_pause & ~moved
+
+
+def _approval_window(seq: Any, *inputs: Any) -> Any:
+    boundary = _latest_event(
+        StoredEventType.RUN_PAUSED.value,
+        StoredEventType.RUN_RESUMED.value,
+        before=seq,
+        inputs=inputs,
+    )
+    return (
+        select(RunEvent.agent_run_id, RunEvent.sequence_index, RunEvent.data)
+        .where(
+            RunEvent.agent_run_id == AgentRun.id,
+            RunEvent.event_type == GovernanceEventType.APPROVAL_REQUESTED.value,
+            RunEvent.sequence_index.between(func.coalesce(boundary, -1) + 1, seq - 1),
+        )
+        .correlate(AgentRun, *inputs)
+        .order_by(RunEvent.sequence_index.desc())
+        .limit(MAX_PAGE)
+    )
+
+
+def _approval_batch_query(store: Any, generations: dict[str, int], tenant: str | None) -> Any:
+    # Recheck the generation and scope in the statement that releases display arguments.
+    # A bounded index walk for each run avoids ranking the workflow's entire history.
+    if "postgresql" in store.dialect_names:
+        inputs = (
+            func.unnest(
+                bindparam("ids", list(generations), type_=ARRAY(String)),
+                bindparam("generations", list(generations.values()), type_=ARRAY(Integer)),
+            )
+            .table_valued(column("run_id", String), column("seq", Integer))
+            .render_derived(name="pauses")
+        )
+        events = _approval_window(inputs.c.seq, inputs).lateral()
+        return _apply_tenant_scope(
+            select(events)
+            .select_from(inputs)
+            .join(AgentRun, AgentRun.id == inputs.c.run_id)
+            .join(events, true())
+            .where(
+                store.id_in(AgentRun.id, list(generations)),
+                AgentRun.status.in_(PAUSE_STATUSES),
+                _active_generation(inputs.c.seq, inputs),
+            ),
+            tenant,
+        )
+    queries = []
+    for run_id, generation in generations.items():
+        seq = literal(generation)
+        events = (
+            _approval_window(seq)
+            .select_from(AgentRun)
+            .where(
+                AgentRun.id == run_id, AgentRun.status.in_(PAUSE_STATUSES), _active_generation(seq)
+            )
+        )
+        queries.append(select(_apply_tenant_scope(events, tenant).subquery()))
+    return union_all(*queries)
+
+
+@_safe_database_call
+async def leaf_approval_params(
+    store: Any, generations: dict[str, int], tenant: str | None
+) -> dict[str, dict[str, dict[str, Any]]]:
+    """Latest recorded arguments per call within each active pause's own interval."""
+    if not generations:
+        return {}
+    async with store._session_factory() as session:
+        rows = (await session.execute(_approval_batch_query(store, generations, tenant))).all()
+    # Neither a UNION nor a lateral join promises output order.
+    by_run: dict[str, dict[str, dict[str, Any]]] = {}
+    for run_id, _, data in sorted(rows, key=lambda row: row.sequence_index):
+        if isinstance(data, dict) and isinstance(call_id := data.get("call_id"), str):
+            calls = by_run.setdefault(run_id, {})
+            if isinstance(params := data.get("params"), dict):
+                calls[call_id] = params
+            else:
+                calls.pop(call_id, None)
+    return by_run
+
+
+async def sql_leaf_data(
+    store: Any, ids: list[str], tenant: str | None
+) -> tuple[dict[str, PauseSummary], dict[str, dict[str, dict[str, Any]]]]:
+    """Read summaries and the arguments evidenced for those exact pause generations."""
+    summaries = await leaf_summaries(store, ids, tenant)
+    generations = {
+        run_id: summary.paused_event_sequence
+        for run_id, summary in summaries.items()
+        if summary.paused_event_sequence is not None and needs_approval_display(summary)
+    }
+    return summaries, await leaf_approval_params(store, generations, tenant)

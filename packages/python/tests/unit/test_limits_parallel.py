@@ -46,7 +46,10 @@ def test_pending_types_are_additive_and_pause_event_is_nonterminal():
     assert getattr(result, "pendings", None) == ()
     assert getattr(RunEventType, "SUBAGENT_PAUSED", None) == "subagent_paused"
     event = RunEvent(type=RunEventType.SUBAGENT_PAUSED)
-    assert event.pending is None
+    assert "pending" not in inspect.signature(RunEvent).parameters
+    assert event.pause_id is None and event.call_ids == ()
+    signal = RunEvent(type=event.type, run_id="child", pause_id="pause", call_ids=("a", "b"))
+    assert (signal.pause_id, signal.call_ids) == ("pause", ("a", "b"))
     assert event.type not in types._TERMINAL_RUN_EVENTS
 
 
