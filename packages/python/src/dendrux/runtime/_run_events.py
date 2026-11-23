@@ -63,15 +63,6 @@ async def _finalize_running_event(
 ) -> tuple[bool, bool]:
     atomic = getattr(store, "finalize_with_event", None)
     if optional_failure_reason is not None:
-        if (
-            atomic is None
-            and (cas := getattr(store, "finalize_run_if_status_in", None)) is not None
-        ):
-            _add_failure_reason(store, "finalize_run_if_status_in", optional_failure_reason, kwargs)
-            won = await cas(
-                run_id, status=status, allowed_current_statuses=[RunStatus.RUNNING.value], **kwargs
-            )
-            return bool(won), bool(won and emit_event)
         writer = "finalize_with_event" if atomic is not None and emit_event else "finalize_run"
         _add_failure_reason(store, writer, optional_failure_reason, kwargs)
     if atomic is not None and emit_event:

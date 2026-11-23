@@ -347,13 +347,11 @@ async def test_failure_logs_registered_callback_code(store, caplog):
     )
 
 
-@pytest.mark.parametrize(
-    "writer", ["finalize_with_event", "finalize_run_if_status_in", "finalize_run"]
-)
-async def test_callback_failure_on_older_store(store, monkeypatch, writer):
+@pytest.mark.parametrize("writers", ["atomic", "both_legacy_writers", "finalize_run_only"])
+async def test_callback_failure_on_older_store(store, monkeypatch, writers):
     agent, provider = make_agent(store)
     writes = []
-    final = getattr(store, writer)
+    final = store.finalize_with_event if writers == "atomic" else store.finalize_run
 
     async def legacy_atomic(
         run_id, *, status, allowed_current_statuses, error, claim_epoch, event_type, event_data
@@ -369,16 +367,6 @@ async def test_callback_failure_on_older_store(store, monkeypatch, writer):
             event_data=event_data,
         )
 
-    async def legacy_cas(run_id, *, status, allowed_current_statuses, error, claim_epoch):
-        writes.append((run_id, status, allowed_current_statuses, claim_epoch))
-        return await final(
-            run_id,
-            status=status,
-            allowed_current_statuses=allowed_current_statuses,
-            error=error,
-            claim_epoch=claim_epoch,
-        )
-
     async def legacy_finalize(run_id, *, status, expected_current_status, error, claim_epoch):
         writes.append((run_id, status, [expected_current_status], claim_epoch))
         return await final(
@@ -390,13 +378,12 @@ async def test_callback_failure_on_older_store(store, monkeypatch, writer):
         )
 
     monkeypatch.setattr(
-        store, "finalize_with_event", legacy_atomic if writer == "finalize_with_event" else None
+        store, "finalize_with_event", legacy_atomic if writers == "atomic" else None
     )
-    if writer == "finalize_run_if_status_in":
-        monkeypatch.setattr(store, "finalize_run_if_status_in", legacy_cas)
-    elif writer == "finalize_run":
-        monkeypatch.setattr(store, "finalize_run_if_status_in", None)
+    if writers != "atomic":
         monkeypatch.setattr(store, "finalize_run", legacy_finalize)
+    if writers == "finalize_run_only":
+        monkeypatch.setattr(store, "finalize_run_if_status_in", None)
     original = ValueError("private")
 
     def fail(run_id):
