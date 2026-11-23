@@ -105,20 +105,28 @@ def _shutdown_socket(transport: Any) -> None:
         transport.get_extra_info("socket").shutdown(socket.SHUT_RDWR)
 
 
-def _restore_caller_exit() -> None:
+def _cancel_count() -> int:
+    """The running task's cancellation count; the baseline an operation records at its start."""
+    task = asyncio.current_task()
+    return task.cancelling() if task is not None else 0
+
+
+def _restore_caller_exit(baseline: int = 0) -> None:
     """Call first in a handler that would treat a failure as ordinary.
 
     A cleanup that fails while a cancel or a close() unwinds replaces the
     ``CancelledError`` / ``GeneratorExit`` with its own error. Without a running
-    loop the coroutine is being finalized, so end it as close() expects; on a
-    loop, a task its caller is cancelling stays cancelled. A timeout this
-    module started has already uncancelled the task, so it is not restored.
+    loop the coroutine is being finalized, so end it as close() expects. On a
+    loop, a cancel that arrived during this operation (the count rose above
+    ``baseline``, taken when it started) stays a cancel. A count left by an
+    earlier cancel the task already handled does not, and a timeout this module
+    started has already uncancelled the task, so neither is restored.
     """
     try:
         task = asyncio.current_task()
     except RuntimeError:
         raise GeneratorExit from None
-    if task is not None and task.cancelling() > 0:
+    if task is not None and task.cancelling() > baseline:
         raise asyncio.CancelledError from None
 
 
@@ -489,12 +497,13 @@ class LiveUpdates(ABC):
                 return
 
     async def _send_batch(self, messages: Sequence[str], count: int, remaining: float) -> bool:
+        baseline = _cancel_count()
         try:
             async with asyncio.timeout(min(self.send_timeout_s, remaining)):
                 await self.send(messages)
         except (Exception, asyncio.CancelledError) as error:
             self._drop_batch(count)
-            _restore_caller_exit()
+            _restore_caller_exit(baseline)
             self._send_failure(error, count)
             return False
         self._counts["sent"] += count
@@ -855,12 +864,13 @@ class LiveUpdates(ABC):
     async def _close_owned(self) -> None:
         self._close_timeout_logged = False
         deadline = monotonic() + self.close_timeout_s
+        baseline = _cancel_count()
         try:
             async with asyncio.timeout(self.close_timeout_s):
                 await self._close_resources(deadline)
         except (Exception, asyncio.CancelledError) as error:
             self._abort_all()
-            _restore_caller_exit()
+            _restore_caller_exit(baseline)
             self._close_failed(error)
 
     def _close_failed(self, error: BaseException) -> None:
