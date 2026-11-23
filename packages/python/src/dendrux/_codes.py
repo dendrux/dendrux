@@ -519,6 +519,14 @@ METADATA_TOO_LARGE = Code(
     "Metadata exceeds its byte bound.",
     "Reduce metadata or raise the bound.",
 )
+ON_STARTED_FAILED = Code(
+    "on_started_failed",
+    logging.ERROR,
+    "runtime",
+    _BASE_FIELDS,
+    "The root run's on_started callback raises and the owner finalizes the run as an error.",
+    "Inspect the callback exception on OnStartedError.__cause__ in the caller.",
+)
 RUN_FAILED = Code(
     "run_failed",
     logging.ERROR,
@@ -2189,6 +2197,7 @@ REGISTRY = MappingProxyType(
             TENANT_SCOPE_REQUIRED,
             RESERVED_METADATA_KEY,
             METADATA_TOO_LARGE,
+            ON_STARTED_FAILED,
             RUN_FAILED,
             READ_ARGUMENT_INVALID,
             PAUSE_DATA_NOT_JSONB,

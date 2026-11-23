@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import asyncio
 from inspect import isawaitable
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, cast
 
 from dendrux import _codes
-from dendrux._lifecycle import CancelReason
-from dendrux.errors import RunFencedError
+from dendrux._lifecycle import CancelReason, StoredEventType
+from dendrux.errors import RunControlError, RunFencedError, _KwargsReduceMixin
 from dendrux.runtime._run_errors import logger
 from dendrux.runtime._run_outcome import _finalize_loop_cancelled
 from dendrux.runtime.context import DelegationContext, get_store_identity, set_delegation_context
@@ -21,6 +21,18 @@ if TYPE_CHECKING:
     from dendrux.loops.base import LoopNotifier
     from dendrux.runtime._run_start import _RunLifecycle
     from dendrux.runtime.state import StateStore, _ClaimedStateStore
+
+
+class OnStartedError(_KwargsReduceMixin, RunControlError):
+    """The persisted root's start callback failed before model or tool work."""
+
+    _init_fields = ("run_id",)
+    code = _codes.ON_STARTED_FAILED.name
+    safe_message = "The on_started callback failed."
+
+    def __init__(self, run_id: str) -> None:
+        self.run_id = run_id
+        super().__init__(self.safe_message)
 
 
 async def _cancel_requested(store: StateStore, run_id: str) -> bool:
@@ -38,7 +50,7 @@ async def _cancel_requested(store: StateStore, run_id: str) -> bool:
     return control.cancel_requested or row.cancel_requested
 
 
-async def bind_context_and_notify(
+async def notify_then_bind_context(
     lifecycle: _RunLifecycle,
     agent: Agent,
     callback: Callable[[str], Awaitable[None] | None] | None,
@@ -50,8 +62,14 @@ async def bind_context_and_notify(
     tenant_id: str | None,
     tenant_explicit: bool,
 ) -> RunResult | None:
-    """Bind the fresh run context through lifecycle cleanup, then deliver its root id."""
+    """Deliver the root id in the caller context before binding the new run."""
     store = lifecycle.store
+    delivered = False
+    if callback is not None and store is not None and delegation_level == 0:
+        result = await _notify_started(lifecycle, store, callback, notifier)
+        if result is not None:
+            return result
+        delivered = True
     ctx = DelegationContext(
         run_id=lifecycle.run_id,
         trace_link=trace_link,
@@ -62,32 +80,66 @@ async def bind_context_and_notify(
         tenant_id=tenant_id,
         tenant_explicit=tenant_explicit,
         state_store=store,
+        start_callback_delivered=delivered,
         lease_interval_s=agent.lease_interval.total_seconds(),
         loop=asyncio.get_running_loop(),
     )
     lifecycle.context_token = set_delegation_context(ctx)
-    return await notify_started(lifecycle, callback, delegation_level, notifier)
+    return None
 
 
-async def notify_started(
+async def _notify_started(
     lifecycle: _RunLifecycle,
-    callback: Callable[[str], Awaitable[None] | None] | None,
-    delegation_level: int,
+    store: StateStore,
+    callback: Callable[[str], Awaitable[None] | None],
     notifier: LoopNotifier | None,
 ) -> RunResult | None:
     """Return a settled cancellation if the callback boundary stops this run."""
-    store, run_id = lifecycle.store, lifecycle.run_id
-    if callback is None or store is None or delegation_level != 0:
-        return None
-    if not await _cancel_requested(store, run_id):
+    run_id = lifecycle.run_id
+    failure = None
+    try:
         pending = callback(run_id)
         if isawaitable(pending):
             await pending
-        if not await _cancel_requested(store, run_id):
-            # Only runs that delivered the callback need the extra SingleCall dispatch read.
-            recorder: Any = lifecycle.recorder  # Fresh, persisted runs own this recorder.
-            recorder._start_callback_delivered = True
-            return None
+    except Exception as exc:  # noqa: BLE001, RUF100 - user callback isolation; only fixed diagnostics.
+        failure = exc
+    if not await _cancel_requested(store, run_id):
+        if failure is not None:
+            return await _fail_started(lifecycle, store, notifier, failure)
+        return None
+    return await _cancel_started(lifecycle, store, notifier)
+
+
+async def _fail_started(
+    lifecycle: _RunLifecycle, store: StateStore, notifier: LoopNotifier | None, failure: Exception
+) -> RunResult:
+    run_id = lifecycle.run_id
+    safe = OnStartedError(run_id)
+    # The outer error handler must not replace or repeat this atomic transition.
+    lifecycle.failure_write_started = True
+    seq = await store.finalize_with_event(
+        run_id,
+        status=RunStatus.ERROR.value,
+        allowed_current_statuses=[RunStatus.RUNNING.value],
+        error=safe.safe_message,
+        failure_reason=safe.code,
+        event_type=StoredEventType.RUN_ERROR.value,
+        event_data={"error": safe.safe_message, "code": safe.code},
+    )
+    if seq is None:
+        if await _cancel_requested(store, run_id):
+            return await _cancel_started(lifecycle, store, notifier)
+        return await lifecycle._fenced(lifecycle.recorder, notifier)
+    _codes.log_code(logger, _codes.ON_STARTED_FAILED, run_id=run_id)
+    await lifecycle._fail_sinks(safe, lifecycle.recorder, notifier)
+    # Observers can retain their error, so attach the private cause only to the caller's copy.
+    raise OnStartedError(run_id) from failure
+
+
+async def _cancel_started(
+    lifecycle: _RunLifecycle, store: StateStore, notifier: LoopNotifier | None
+) -> RunResult:
+    run_id = lifecycle.run_id
     result = await _finalize_loop_cancelled(
         store,
         run_id,
@@ -99,3 +151,6 @@ async def notify_started(
     )
     await lifecycle._finish(lifecycle.recorder, notifier, result)
     return result
+
+
+OnStartedError.__module__ = "dendrux.runtime.runner"

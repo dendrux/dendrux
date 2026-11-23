@@ -448,7 +448,7 @@ async def _run_once(
                 )
 
                 _configure_fanout(lifecycle.recorder, state_store)
-                result = await _run_started.bind_context_and_notify(
+                result = await _run_started.notify_then_bind_context(
                     lifecycle,
                     agent,
                     on_started,

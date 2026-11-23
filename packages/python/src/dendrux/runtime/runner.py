@@ -479,6 +479,7 @@ from dendrux.runtime._run_start import _RunLifecycle as _RunLifecycle
 from dendrux.runtime._run_start import _runtime_recorder as _runtime_recorder
 from dendrux.runtime._run_start import _start_new_run as _start_new_run
 from dendrux.runtime._run_start import _stream_run_failure as _stream_run_failure
+from dendrux.runtime._run_started import OnStartedError as OnStartedError
 from dendrux.runtime._run_stream import _cached_stream_event as _cached_stream_event
 from dendrux.runtime._run_stream import _resolve_stream_store as _resolve_stream_store
 from dendrux.runtime._run_stream import _stream_claim as _stream_claim

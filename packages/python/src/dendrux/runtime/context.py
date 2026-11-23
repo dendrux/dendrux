@@ -34,6 +34,7 @@ from dendrux._lifecycle import (
     FailureReason,
 )
 from dendrux.errors import safe_exception_info as safe_exception_info
+from dendrux.loops._run_context import current_delegation as _current_delegation
 
 DEFAULT_LEASE_INTERVAL_S = 30.0
 MIN_LEASE_INTERVAL_S = 5.0
@@ -129,6 +130,7 @@ class DelegationContext:
     trace_link: str | None = None
     tool_span_link: str | None = None
     tenant_explicit: bool = False
+    start_callback_delivered: bool = field(default=False, kw_only=True, compare=False, repr=False)
 
     def __hash__(self) -> int:
         return hash(self.run_id)
@@ -137,10 +139,6 @@ class DelegationContext:
 # ---------------------------------------------------------------------------
 # ContextVar — the propagation mechanism
 # ---------------------------------------------------------------------------
-
-_current_delegation: ContextVar[DelegationContext | None] = ContextVar(
-    "dendrux_delegation", default=None
-)
 
 
 def get_delegation_context() -> DelegationContext | None:

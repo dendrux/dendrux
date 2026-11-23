@@ -43,6 +43,7 @@ from dendrux.loops._helpers import (
 )
 from dendrux.loops._images import ImageCallSite, release_wire
 from dendrux.loops._llm_call import EventRelay, ProviderCallSite, StreamCall, stream_call_events
+from dendrux.loops._run_context import start_callback_delivered
 from dendrux.loops.base import Loop
 from dendrux.loops.react import (
     ReActLoop,
@@ -382,8 +383,9 @@ async def _single_attempt(
 ) -> _Attempt | None:
     """Admit one provider call and record its outcome. None means cancelled before dispatch."""
     calls = pre.calls
+    if start_callback_delivered(pre.run_id) and await control_reader() is not None:
+        return None
     await calls.started(prepared, None, 1)
-    check_claim = getattr(calls.recorder, "_start_callback_delivered", False) is True
     started_at = None
     try:
         with telemetry_context(
@@ -392,8 +394,6 @@ async def _single_attempt(
             sinks=governance_sinks(calls.recorder, calls.notifier, pre.run_id),
         ):
             async with lease_scope(calls.recorder):
-                if check_claim and await control_reader() is not None:
-                    return None
                 started_at = time.monotonic()
                 response, validated_output = await _single_complete(pre, prepared, output_type)
     except Exception as exc:

@@ -191,6 +191,7 @@ class _RunLifecycle(ManagedStopLifecycle):
     recorder_started: bool = False
     notifier_started: bool = False
     context_token: Token[DelegationContext | None] | None = None
+    failure_write_started: bool = False
 
     def _mark_notifier_started(self) -> None:
         self.notifier_started = True
@@ -230,7 +231,7 @@ class _RunLifecycle(ManagedStopLifecycle):
         if not self.started and isinstance(exc, (RunAlreadyActiveError, IdempotencyConflictError)):
             return
         _run_observers._attach_run_error_meta(exc, self.run_id, meta)
-        if self.owned and self.store is not None:
+        if self.owned and self.store is not None and not self.failure_write_started:
             await _persist_run_failure(self.store, self.run_id, exc)
         if self.started:
             await self._fail_sinks(exc, recorder, notifier)

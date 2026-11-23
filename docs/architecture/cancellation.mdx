@@ -23,6 +23,9 @@ There is one method on `Agent` for cancellation, and its behavior depends on wha
 | Streaming (`running`) via `stream()` / `resume_stream()` on **this** `Agent` instance | Additionally sets an in-process interrupt. The loop abandons the in-flight model stream immediately and yields `RUN_CANCELLED` with the current turn’s partial text as `answer`. |
 | Terminal (`success`, `error`, `cancelled`, `max_iterations`) | No-op. Returns the current persisted state. Does not raise. |
 
+If `on_started` raises, the owner finalizes the run as `cancelled` when its control read sees a pending request, or as `error` when the request commits after that read.
+The terminal write clears `cancel_requested` in both cases.
+
 The caller does not have to know which branch applies. `cancel_run` sets the cooperative flag, attempts the paused-state CAS, and fires the in-process interrupt in the same call. Exactly one path produces the terminal `run.cancelled` event.
 
 Before 0.3.0 a batch `run()` was not interruptible by `cancel_run`: a model call in the air always completed first. If your code relied on that, see [Interrupting `run()`](#interrupting-run).

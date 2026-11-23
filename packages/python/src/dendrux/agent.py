@@ -1491,8 +1491,8 @@ class Agent:
                 is provided without persistence, or if the replay knobs are
                 invalid (``ReplayRunError`` for a bad run id).
             RunAlreadyActiveError: If idempotency_key matches an active run.
-            IdempotencyConflictError: If idempotency_key is reused with
-                different request parameters.
+            IdempotencyConflictError: If an idempotency key is reused with different parameters.
+            dendrux.runtime.runner.OnStartedError: If the start callback fails the new run.
             DelegationDepthExceededError: If this run would exceed the inherited
                 max_delegation_depth from a parent run.
         """
@@ -1595,9 +1595,9 @@ class Agent:
             RunResult from the retry run.
 
         Raises:
-            ValueError: If no provider/persistence configured, if the
-                source run is not terminal, or if the source run was
-                SingleCall.
+            ValueError: If provider or persistence is missing, the source is still active,
+                or the source used SingleCall.
+            dendrux.runtime.runner.OnStartedError: If the start callback fails the retry run.
         """
         requested_tenant_id = tenant_id
         tenant_id = entry_checks(
@@ -3070,8 +3070,9 @@ class Agent:
         Raises:
             ValueError: If no provider is configured, or if ``history`` is invalid.
         """
-        requested_tenant_id = tenant_id
-        tenant_id = entry_checks(
+        if "on_started" in kwargs:
+            raise ValueError("on_started is only supported on run()/retry().")
+        entry_checks(
             self,
             "stream",
             tenant_id,
@@ -3088,10 +3089,9 @@ class Agent:
 
         from dendrux.runtime.runner import run_stream as runner_run_stream
 
-        stream_kwargs: dict[str, Any] = {}
         resolved_depth = self._resolve_run_max_delegation_depth(max_delegation_depth)
         if not isinstance(resolved_depth, _UnsetType):
-            stream_kwargs["max_delegation_depth"] = resolved_depth
+            kwargs["max_delegation_depth"] = resolved_depth
 
         stream = runner_run_stream(
             self,
@@ -3104,11 +3104,10 @@ class Agent:
             replay_last=replay_last,
             replay_reasoning=replay_reasoning,
             state_store_resolver=self._resolve_state_store,
-            tenant_id=requested_tenant_id,
+            tenant_id=tenant_id,
             metadata=metadata,
             extra_notifier=notifier,
             idempotency_key=idempotency_key,
-            **stream_kwargs,
             **kwargs,
         )
         if self._subagents:

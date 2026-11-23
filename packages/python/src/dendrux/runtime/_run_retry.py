@@ -522,7 +522,7 @@ async def retry(
                         "retry_of": original_run_id,
                     },
                 )
-                result = await _run_started.bind_context_and_notify(
+                result = await _run_started.notify_then_bind_context(
                     lifecycle,
                     agent,
                     on_started,

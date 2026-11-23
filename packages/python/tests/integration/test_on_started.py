@@ -206,7 +206,9 @@ async def test_cancellation_at_callback_boundary(
     finally:
         release.set()
         await asyncio.gather(task, return_exceptions=True)
-    assert seen == ([] if when == "before" else [run_id])
+    # A local task interrupt can unwind startup before the callback boundary.
+    interrupted_before_entry = when == "before" and cancel in {"agent", "task"}
+    assert seen == ([] if interrupted_before_entry else [run_id])
     assert (await store.get_run(run_id)).status == "cancelled"
     events = await store.get_run_events(run_id)
     (event,) = [event for event in events if event.event_type == "run.cancelled"]
@@ -286,20 +288,56 @@ async def test_sync_callback_return_value_is_ignored(store, entry):
 @pytest.mark.parametrize("engine", ["sqlite_file"], indirect=True)
 @pytest.mark.parametrize("entry", ["run", "retry"])
 @pytest.mark.parametrize("change", ["cancel", "reclaim"])
-async def test_single_call_reads_claim_at_provider_boundary(store, engine, entry, change):
+@pytest.mark.parametrize("wrap_recorder", [False, True], ids=["native", "wrapped"])
+async def test_single_call_reads_claim_at_provider_boundary(
+    store, engine, entry, change, monkeypatch, wrap_recorder
+):
+    from functools import wraps
+
     from sqlalchemy import update
 
     from dendrux.db.models import AgentRun
+    from dendrux.loops import _llm_call, single
 
     source = await retry_source(store, entry)
     agent, provider = make_agent(store, loop=SingleCall())
-    started = []
+    started, announced = [], []
     ready, release = asyncio.Event(), asyncio.Event()
+    prelude = single._single_prelude
+
+    class PublicRecorder:
+        def __init__(self, recorder):
+            self.recorder = recorder
+
+        def __getattr__(self, name):
+            if name.startswith("_"):
+                raise AttributeError(name)
+            return getattr(self.recorder, name)
+
+    @wraps(prelude)
+    async def wrap_loop_recorder(*args, **kwargs):
+        pre = await prelude(*args, **kwargs)
+        pre.calls.recorder = PublicRecorder(pre.calls.recorder)
+        return pre
+
+    if wrap_recorder:
+        monkeypatch.setattr(single, "_single_prelude", wrap_loop_recorder)
+    prepare = single.ImageCallSite.prepare
+
+    @wraps(prepare)
+    async def before_admission(*args, **kwargs):
+        request = await prepare(*args, **kwargs)
+        ready.set()
+        await release.wait()
+        return request
+
+    monkeypatch.setattr(single.ImageCallSite, "prepare", before_admission)
+    record_start = AsyncMock(wraps=_llm_call.record_llm_started)
+    monkeypatch.setattr(_llm_call, "record_llm_started", record_start)
 
     class Notifier(BaseNotifier):
         async def on_llm_call_started(self, run_id, iteration, **kwargs):
-            ready.set()
-            await release.wait()
+            announced.append(run_id)
 
     options = dict(tenant_id=None, on_started=started.append, notifier=Notifier())
     task = asyncio.create_task(
@@ -324,3 +362,6 @@ async def test_single_call_reads_claim_at_provider_boundary(store, engine, entry
     row = await store.get_run(run_id)
     assert result.status == expected and row.status == expected.value
     assert row.claim_epoch == int(change == "reclaim")
+    record_start.assert_not_awaited()
+    assert announced == []
+    assert all(e.event_type != "llm.started" for e in await store.get_run_events(run_id))
