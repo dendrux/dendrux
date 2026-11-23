@@ -23,7 +23,7 @@ description: What changes when you move from 0.7.x to 0.8.0 (parallel subagents,
 
 | Area | 0.7.x | 0.8.0 | What to do |
 | --- | --- | --- | --- |
-| Subagent calls per response | One. Two were refused with `managed_batch_unsupported` | Up to `Limits.max_parallel_subagents` (default 4, 1 to 32) run in parallel | Raise or lower the limit on the root Agent. `1` keeps the 0.7 rule |
+| Subagent calls per response | One. Two were refused with `managed_batch_unsupported` | Up to `Limits.max_parallel_subagents` (default 4, 1 to 32) run in parallel | Set the limit on the root Agent for new workflows; `1` keeps the 0.7 rule. Do not change it on Agents with runs in flight (see [Rolling upgrade](#rolling-upgrade)) |
 | An oversized subagent batch | Code `managed_batch_unsupported` | Code `managed_fanout_limit`, with the requested count and the limit in the tool result, events and logs. The whole batch is still refused | Change any filter on the old code. A subagent beside a client tool, and an `exclusive_subagents` conflict, keep `managed_batch_unsupported` |
 | Several paused subagents | Not possible | `result.pendings` lists every pause; each continuation through the root names its leaf with `expected_pause_id` | Loop `while result.pendings:`; see the [guide](/docs/guides/subagents#several-paused-subagents) |
 | A paused root that only waits for subagents | Looked like any paused run | `RunSummary.waiting_for == "subagents"` | See [waiting_for](#waiting_for) |
@@ -40,7 +40,7 @@ description: What changes when you move from 0.7.x to 0.8.0 (parallel subagents,
 
 ## waiting_for
 
-A parent that is only waiting for its running subagents is stored as `paused`, as in 0.7. Since 0.8, `RunSummary`, `RunDetail` and `get_subtree` nodes carry `waiting_for`, which is `"subagents"` when the stored status is `paused` with a managed wait, and `None` otherwise. It describes the parent only: a child can still need an approval, a client tool or input, so use `get_pendings(root)` to decide whether a person must act. `RunStore.list_runs()` and `count_runs()` take `include_waiting=False` to leave those runs out, and `dendrux runs --exclude-waiting` does the same on the command line. Stored statuses, `RunStatus` and the existing `status=` filter are unchanged, and there is no migration. The exclusion filter is a store capability (`waiting_filter`) that reads pause data for every candidate row, so it can be slow on very large tables; a custom store without it raises `StoreCapabilityError` when you pass `include_waiting=False`. See [RunStore](/docs/reference/run-store#telling-a-persons-turn-from-a-subagent-wait).
+A parent that is only waiting for its running subagents is stored as `paused`, as in 0.7. Since 0.8, `RunSummary` and `RunDetail` carry `waiting_for`, and so does each `get_subtree` node's summary (`node.run.waiting_for`), which is `"subagents"` when the stored status is `paused` with a managed wait, and `None` otherwise. It describes the parent only: a child can still need an approval, a client tool or input, so use `get_pendings(root)` to decide whether a person must act. `RunStore.list_runs()` and `count_runs()` take `include_waiting=False` to leave those runs out, and `dendrux runs --exclude-waiting` does the same on the command line. Stored statuses, `RunStatus` and the existing `status=` filter are unchanged, and there is no migration. The exclusion filter is a store capability (`waiting_filter`) that reads pause data for every candidate row, so it can be slow on very large tables; a custom store without it raises `StoreCapabilityError` when you pass `include_waiting=False`. See [RunStore](/docs/reference/run-store#telling-a-persons-turn-from-a-subagent-wait).
 
 ## dendrux.cancel_run
 
@@ -65,7 +65,7 @@ An oversized batch now reports `managed_fanout_limit` instead of `managed_batch_
 - `TenantScopeRequiredError(operation, *, message=None)`: a non-empty `message` replaces the default text. Existing messages are byte-identical. `dendrux.cancel_run` uses it, because it has no Agent and no `strict_tenancy`.
 - `ManagedStateError(reason="binding_conflict")` is raised when a saved fan-out wait does not match its children. In 0.7 the equivalent refusal for a format a 0.7 worker could not read was `RunNotReclaimableError(reason="pause_format_unsupported")`. `ManagedStateError` is a `PersistenceError` (a `RuntimeError`), not a `RunControlError`. It is importable from `dendrux.errors` but not listed in its `__all__`.
 - `sweep(adoptable_after=...)`: `result.adoptable` may repeat a root across cursor pages. `reclaim` is idempotent, so call it for each id you see.
-- A fan-out child that is blocked persists `{"task": ...}`, a safe projection of its call parameters. The 0.7 single-child path still persists the raw parameters; this difference is accepted for now.
+- A fan-out child that is blocked persists `{"task": ...}`, a safe projection of its call parameters. The 0.7 single-child path still persists the raw parameters.
 - `OnStartedError` is new; see above. Its mapping in the suggested HTTP table is 500.
 
 ## SingleCall and a fence
@@ -84,11 +84,16 @@ Cancelled live-update `flush()` and `close()` calls now stay cancelled: a caller
 
 ## Rolling upgrade
 
-A 0.7 process cannot continue a workflow written for several children. `reclaim`, resume and submit refuse it with `RunNotReclaimableError(reason="pause_format_unsupported")` before changing any state; the stale-running `sweep()` is not covered by that guard. Workflows with one child at a time keep the older format. While any process that controls workflows is still on 0.7:
+A 0.7 process cannot continue a workflow written for several children. `reclaim`, resume and submit refuse it with `RunNotReclaimableError(reason="pause_format_unsupported")` before changing any state; the stale-running `sweep()` is not covered by that guard. Workflows with one child at a time keep the older format.
 
-1. Set `Limits(max_parallel_subagents=1)` on every Agent that has subagents.
-2. Run `sweep()` only from processes on 0.8.
-3. Raise the limit once every controller is on 0.8.
+**Why the Agent settings must not change under a paused run.** An Agent's governance settings, including a non-default `Limits`, are fingerprinted when a run pauses. A later resume, submit or reclaim compares the fingerprint of the Agent that continues it with the saved one. With the default `on_governance_change="raise"`, a difference raises `GovernanceMismatchError` (`changed=("limits",)`) and the run stays paused. The default `max_parallel_subagents=4` is left out of the fingerprint, so a 0.7 run continues on 0.8 with unchanged settings; setting it to 1 changes the fingerprint and strands every run that paused before the change. So do not edit the limit on existing Agents.
+
+While any process that controls workflows is still on 0.7:
+
+1. Upgrade controllers to 0.8 **without changing any Agent's settings**. Runs already in flight, including paused approvals written by 0.7, keep being continued by Agents configured exactly as before, until they drain.
+2. Create **new** workflows only through an Agent configured with `Limits(max_parallel_subagents=1)`, so a 0.7 process is never asked to continue a fan-out. Runs created this way are fingerprinted with limit 1 and must be continued by Agents that keep limit 1 until they finish.
+3. Run `sweep()` only from processes on 0.8.
+4. When every controller is on 0.8, start new workflows with the default (or a higher) limit. Keep the limit-1 Agent configuration alive until its in-flight runs have drained.
 
 Never route a workflow that has written a fan-out wait back to 0.7: lowering the limit does not convert data already written. Finish or cancel such a workflow on 0.8 first. Nesting multiplies concurrency; `Limits.max_managed_runs` (default 128) stays the overall bound.
 
