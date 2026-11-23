@@ -1,0 +1,107 @@
+---
+title: Testing agents with FakeModel
+description: Script the model's answers per agent and turn with dendrux.testing.FakeModel, run subagent fan-outs and resumes without an API key, and assert what each agent was asked.
+---
+
+# Testing agents with FakeModel
+
+`dendrux.testing.FakeModel` is a scripted model for tests. You write what each agent says on each turn; Dendrux runs the real loop, tools, store and subagents around it. No key and no network are needed.
+
+The answer depends only on the agent's name and the **turn**: the number of assistant messages already in that call's history. The model keeps no position counter, so a second `FakeModel` built from the same script, in another process or after a resume, answers the same way. That makes it safe for tests that pause, resume, crash and recover.
+
+## A fan-out with no key
+
+A lead calls two subagents in one response with `calls(...)`. Each child answers from its own list.
+
+```python
+import asyncio
+
+from dendrux import Agent
+from dendrux.store import RunStore
+from dendrux.testing import FakeModel, call, calls, say
+
+fake = FakeModel(
+    {
+        "lead": [
+            calls(call("billing", task="Check invoice 42"), call("kb", task="Find the refund policy")),
+            say("Both checked."),
+        ],
+        "billing": [say("Invoice 42 is paid.")],
+        "kb": [say("Refunds are accepted within 30 days.")],
+    }
+)
+
+
+async def main() -> None:
+    billing = Agent(
+        name="billing", description="Checks invoices.", provider=fake.provider("billing"),
+        prompt="Check invoices.",
+    )
+    kb = Agent(
+        name="kb", description="Looks up policy.", provider=fake.provider("kb"),
+        prompt="Look up policy.",
+    )
+    async with Agent(
+        name="lead", provider=fake.provider("lead"), prompt="Ask both.",
+        subagents=[billing, kb], database_url="sqlite+aiosqlite:///fake-model.db",
+    ) as lead:
+        result = await lead.run("Ticket 7", tenant_id="acme")
+        assert result.answer == "Both checked."
+        async with RunStore.from_database_url("sqlite+aiosqlite:///fake-model.db") as runs:
+            tree = await runs.get_subtree(result.run_id, tenant_id="acme", max_nodes=100)
+        assert len(tree.nodes) == 3  # the lead and its two children
+    fake.assert_all_used()
+
+
+asyncio.run(main())
+```
+
+The script maps an agent name to a list of entries, one per turn. `fake.provider(name)` returns the provider for that agent and fails at bind time for a name with no script. Every example passes `tenant_id=`: agents enforce tenant scope by default.
+
+## Script entries
+
+| Entry | The model's answer |
+| --- | --- |
+| `say("text")` | A text answer. |
+| `call("tool", **args)` | One tool call. A subagent is called as `call("name", task="...")`. |
+| `calls(call(...), call(...))` | Several tool calls in one response: a parallel fan-out, or several tools in one turn. |
+| `structured(value)` | JSON text for an agent with `output_type`, from a model or a dict. It is checked when it is used. |
+| `when(predicate, entry)` | Answer only when `predicate(messages)` is true. |
+
+A run of `when` entries plus the one plain entry right after it make a single turn: the first `when` whose predicate is true answers, otherwise the plain entry does, and with neither the call raises `FakeModelScriptError`. Define predicates at module level and keep them pure, because a script rebuilt in another process must use the same functions. A raw `LLMResponse` is also accepted as an entry.
+
+## Structured output
+
+Bind the agent's `output_type` so every `structured(...)` answer is validated by the real Pydantic type, as `SingleCall` will:
+
+[//]: # "docs-test: skip - fragment: relies on `FakeModel` and `Verdict`, defined by setup shown elsewhere"
+
+```python
+severity = Agent(
+    name="severity", description="Rates severity.", loop=SingleCall(),
+    provider=fake.provider("severity", output_type=Verdict), prompt="Rate it.",
+    output_type=Verdict,
+)
+```
+
+Without `output_type=`, the answer is checked against the schema the call carries, by a small checker that supports the subset Pydantic emits. A schema keyword outside that subset, such as `pattern` or `format`, is refused with code `unsupported_schema` naming the keyword, instead of being skipped.
+
+## Errors and assertions
+
+A script that cannot answer raises `FakeModelScriptError`, a `LookupError`. Its `code` is one of `exhausted`, `no_when_match`, `invalid_json`, `schema_mismatch`, `unsupported_schema` or `unknown_agent`. The message names the agent, the turn and counts, never message text or arguments.
+
+A fan-out child whose script fails is isolated by the runtime: the parent sees a failed tool result (`managed_child_failed`) and can still succeed. So end a test with an assertion:
+
+- `fake.assert_no_script_errors()` fails if any call, here or in the instances you pass, could not be answered.
+- `fake.assert_all_used()` also fails on a turn that never answered. After a simulated second process, pass the first instance: `second.assert_all_used(first)`. Every instance must be built from the same script, otherwise the check is refused.
+- `fake.script_errors()` lists `(agent, turn, code)` for every failed attempt.
+- `fake.calls("billing")` returns what that agent was asked, oldest first: each `FakeCall` has `turn`, `messages`, `tools`, `output_schema`, `run_id` and `model`. Each read returns copies, so changing one never changes the script.
+
+## FakeModel or MockLLM
+
+`dendrux.llm.mock.MockLLM` returns a fixed list in order and keeps its position in memory. That breaks when a run continues in another process or after a resume, and it refuses `output_type`. `FakeModel` keys by agent and turn, so it survives both. Use `MockLLM` for a single-agent test that never resumes; use `FakeModel` for subagents, pauses and recovery.
+
+## Where this fits
+
+- Guide: [Managed subagents](/docs/guides/subagents).
+- Reference: [Agent](/docs/reference/agent), [Errors](/docs/reference/errors).
