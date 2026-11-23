@@ -3,6 +3,7 @@
 import asyncio
 import gc
 import sys
+from typing import Any
 
 import pytest
 
@@ -23,7 +24,8 @@ class _FailingCleanupBus(live.LiveUpdates):
             raise RuntimeError("transport cleanup failed") from error
 
 
-def _abandon_listener(bus: _FailingCleanupBus) -> None:
+def _abandon_listener(bus: _FailingCleanupBus) -> Any:
+    """Strand the listener on a closed loop; returns its outermost coroutine."""
     loop = asyncio.new_event_loop()
 
     async def start() -> None:
@@ -34,14 +36,19 @@ def _abandon_listener(bus: _FailingCleanupBus) -> None:
 
     loop.run_until_complete(start())
     loop.close()  # the listener task is still pending, its loop gone
+    return bus._listener_task.get_coro()
 
 
 def test_listener_finalized_without_a_loop_raises_nothing_unraisable(monkeypatch):
     unraisable: list[object] = []
     monkeypatch.setattr(sys, "unraisablehook", lambda args: unraisable.append(args))
     bus = _FailingCleanupBus()
-    _abandon_listener(bus)
+    coroutine = _abandon_listener(bus)
     bus._listener_task = None
+    # Outermost first, as close() on a task's coroutine does; GC order of the inner
+    # frames differs between interpreters (see the send/close test below).
+    coroutine.close()
+    del coroutine
     gc.collect()
     assert unraisable == []
 
@@ -141,19 +148,25 @@ def test_send_and_close_finalized_without_a_loop_raise_nothing_unraisable(monkey
     monkeypatch.setattr(sys, "unraisablehook", lambda args: unraisable.append(args))
     bus = _CleanupReplacesExitBus(send_timeout_s=30, flush_deadline_s=30, close_timeout_s=30)
     loop = asyncio.new_event_loop()
+    coroutines: list[Any] = []
 
     async def run() -> None:
         if boundary == "send":
             bus.enqueue(["r"])  # close needs nothing pending, so it reaches aclose_sender
         operation = bus.flush() if boundary == "send" else bus.close()
         task = asyncio.create_task(operation)
+        coroutines.append(task.get_coro())
         await asyncio.sleep(0.05)
-        bus._abandoned = task
 
     loop.run_until_complete(run())
     loop.close()
     del loop
-    bus.__dict__.pop("_abandoned", None)
+    # Finalize the outermost coroutine first, as close() on a task's coroutine does.
+    # GC may instead close an inner frame (here _close_resources) on its own, and
+    # this double replaces GeneratorExit with CancelledError there on any Python;
+    # which frame goes first depends on the interpreter's collection order.
+    coroutines[0].close()
+    coroutines.clear()
     gc.collect()
     assert unraisable == []
 
