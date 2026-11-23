@@ -7,8 +7,10 @@ import inspect
 from unittest.mock import AsyncMock
 
 import pytest
+from sqlalchemy import select
 
 from dendrux import Agent, cancel_run
+from dendrux.db.models import AgentRun, RunEvent
 from dendrux.llm.mock import MockLLM
 from dendrux.loops.base import BaseNotifier
 from dendrux.loops.react import ReActLoop
@@ -34,6 +36,37 @@ def test_explicit_keyword_only(entry):
     param = inspect.signature(entry).parameters.get("on_started")
     assert param is not None and param.kind == inspect.Parameter.KEYWORD_ONLY
     assert param.default is None
+
+
+@pytest.mark.parametrize("entry", ["run", "retry"])
+@pytest.mark.parametrize("direct", [False, True], ids=["agent", "runner"])
+async def test_noncallable_on_started_leaves_no_run_or_event(
+    store, engine, entry, direct, monkeypatch
+):
+    agent, provider = make_agent(store)
+    source = await agent.run("source", tenant_id=None) if entry == "retry" else None
+
+    async def persisted_ids():
+        async with engine.connect() as conn:
+            runs = set(await conn.scalars(select(AgentRun.id)))
+            events = set(await conn.scalars(select(RunEvent.id)))
+        return runs, events
+
+    before = await persisted_ids()
+    resolve_store = AsyncMock(wraps=agent._resolve_state_store)
+    monkeypatch.setattr(agent, "_resolve_state_store", resolve_store)
+    options = dict(tenant_id=None, on_started="not callable")
+    if direct:
+        options.update(agent=agent, provider=provider, state_store=store)
+    entry_point = runner if direct else agent
+    with pytest.raises(ValueError, match="on_started"):
+        if source:
+            await entry_point.retry(source.run_id, **options)
+        else:
+            await entry_point.run(user_input="go", **options)
+    assert await persisted_ids() == before
+    resolve_store.assert_not_awaited()
+    assert provider.calls_made == int(source is not None)
 
 
 @pytest.mark.parametrize("entry", ["run", "retry"])

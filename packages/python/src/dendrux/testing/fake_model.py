@@ -6,17 +6,30 @@ import copy
 import dataclasses
 import hashlib
 import json
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel
 
+from dendrux import _codes
 from dendrux.llm.base import LLMProvider
 from dendrux.testing._schema_check import SchemaUnsupportedError, TypeCheck, first_mismatch
-from dendrux.types import LLMResponse, Message, ProviderCapabilities, Role, ToolCall, UsageStats
+from dendrux.types import (
+    _ULID_PATTERN,
+    LLMResponse,
+    Message,
+    ProviderCapabilities,
+    Role,
+    ToolCall,
+    UsageStats,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
+
+
+logger = logging.getLogger(__name__)
 
 
 class FakeModelScriptError(LookupError):
@@ -24,7 +37,7 @@ class FakeModelScriptError(LookupError):
 
     The message names the agent, the turn, counts and known agent names only:
     never message text, tool arguments or payloads. ``code`` is a stable reason:
-    ``exhausted``, ``no_when_match``, ``invalid_json``, ``schema_mismatch``,
+    ``exhausted``, ``no_when_match``, ``predicate_error``, ``invalid_json``, ``schema_mismatch``,
     ``unsupported_schema`` or ``unknown_agent`` (``script`` when none is given).
     """
 
@@ -44,6 +57,17 @@ class _Step:
 class _When:
     predicate: Callable[[list[Message]], bool]
     response: _Step | LLMResponse
+
+    def matches(self, messages: list[Message], run_id: str | None) -> bool:
+        try:
+            return bool(self.predicate(messages))
+        except Exception:  # noqa: BLE001, RUF100 - isolate the user predicate and its diagnostics.
+            safe_id = (
+                run_id if isinstance(run_id, str) and _ULID_PATTERN.fullmatch(run_id) else None
+            )
+            _codes.log_code(logger, _codes.UNKNOWN, run_id=safe_id, retryable=False)
+        # Raise outside the handler so callback text is absent even from __context__.
+        raise FakeModelScriptError("FakeModel when() predicate raised", code="predicate_error")
 
 
 Entry = _Step | _When | LLMResponse
@@ -281,7 +305,7 @@ class FakeModel:
             )
         )
         try:
-            response = self._respond(name, turn, messages, output_schema, model, check)
+            response = self._respond(name, turn, messages, output_schema, model, check, run_id)
         except FakeModelScriptError as exc:
             self._failures.append((name, turn, exc.code))
             raise
@@ -296,6 +320,7 @@ class FakeModel:
         output_schema: dict[str, Any] | None,
         model: str,
         check: TypeCheck | None,
+        run_id: str | None,
     ) -> LLMResponse:
         slots = self._slots[name]
         if turn >= len(slots):
@@ -304,17 +329,17 @@ class FakeModel:
                 f"({len(slots)} entries)",
                 code="exhausted",
             )
-        entry = self._pick(name, turn, slots[turn], messages)
+        entry = self._pick(name, turn, slots[turn], messages, run_id)
         return self._build(name, turn, entry, messages, output_schema, model, check)
 
     @staticmethod
     def _pick(
-        name: str, turn: int, slot: tuple[Entry, ...], messages: list[Message]
+        name: str, turn: int, slot: tuple[Entry, ...], messages: list[Message], run_id: str | None
     ) -> _Step | LLMResponse:
         for entry in slot:
             if not isinstance(entry, _When):
                 return entry
-            if entry.predicate(messages):
+            if entry.matches(messages, run_id):
                 return entry.response
         raise FakeModelScriptError(
             f"FakeModel script for agent {name!r} at turn {turn}: no when() entry matched "

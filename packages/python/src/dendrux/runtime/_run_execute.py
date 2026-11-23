@@ -27,7 +27,11 @@ from dendrux.runtime import (
     _run_tools,
 )
 from dendrux.runtime._capabilities import fanout_support
-from dendrux.runtime._entry_checks import resolve_runner_tenant, runner_entry_checks
+from dendrux.runtime._entry_checks import (
+    check_on_started,
+    resolve_runner_tenant,
+    runner_entry_checks,
+)
 from dendrux.runtime._managed_cancel import (
     ManagedRootStoppedError,
 )
@@ -194,6 +198,7 @@ async def run(
         result = await run(agent, provider=provider, user_input="What is 15 + 27?")
         print(result.answer)
     """
+    check_on_started(on_started)
     result = await _run_once(
         agent,
         provider=provider,
@@ -216,8 +221,7 @@ async def run(
         output_type=output_type,
         **kwargs,
     )
-    # A managed parent exits at its handoff; the driver runs N=1 inline and
-    # joins fan-out owners before unwinding terminal outcomes to the root.
+    # The driver runs a single child inline and joins fan-out owners before returning to the root.
     return await _managed.drive(result, notifier=extra_notifier)
 
 

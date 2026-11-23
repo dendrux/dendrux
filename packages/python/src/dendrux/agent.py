@@ -41,7 +41,7 @@ from dendrux.media._store import DEFAULT_GC_AGE, DEFAULT_GC_LIMIT
 from dendrux.runtime import _cancel, _managed, _managed_budget, _managed_cancel, _managed_route
 from dendrux.runtime._blob_catalog import MIN_GC_AGE
 from dendrux.runtime._continuation_guardrails import _continuation_projection
-from dendrux.runtime._entry_checks import entry_checks, require_boolean
+from dendrux.runtime._entry_checks import check_on_started, entry_checks, require_boolean
 from dendrux.runtime._limit_checks import (
     MAX_NOTE_METADATA_BYTES,
     MAX_NOTE_TEXT_BYTES,
@@ -1496,6 +1496,7 @@ class Agent:
             DelegationDepthExceededError: If this run would exceed the inherited
                 max_delegation_depth from a parent run.
         """
+        check_on_started(on_started)
         entry_checks(
             self,
             "run",
@@ -1511,12 +1512,10 @@ class Agent:
         _validate_max_delegation_depth(max_delegation_depth)
         provider = self._require_provider()
 
-        # Resolve output_type: run-level overrides agent default
         resolved_output_type = (
             self._output_type if isinstance(output_type, _UnsetType) else output_type
         )
 
-        # Validate output_type + loop compatibility at call time
         if resolved_output_type is not None:
             from dendrux.loops.single import SingleCall
 
@@ -1599,6 +1598,7 @@ class Agent:
                 or the source used SingleCall.
             dendrux.errors.OnStartedError: If the start callback fails the retry run.
         """
+        check_on_started(on_started)
         requested_tenant_id = tenant_id
         tenant_id = entry_checks(
             self,

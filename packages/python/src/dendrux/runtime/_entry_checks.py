@@ -91,6 +91,12 @@ def runner_entry_checks(
     check_runner_budget(agent, fields.get("provider"), fields.get("provider_kwargs"))
 
 
+def check_on_started(value: object) -> None:
+    """Validate the start callback before run or retry performs any I/O."""
+    if value is not None and not callable(value):
+        raise ValueError("on_started must be callable or None")
+
+
 def require_boolean(value: Any, field: str, *, optional: bool = False) -> None:
     """Do not interpret truthy client data as a control-plane decision."""
     if optional and value is None:
