@@ -851,9 +851,7 @@ class _PendingReader:
 
     async def _custom_leaf_summary(self, run_id: str, tenant: str | None) -> PauseSummary:
         summary = await self._summary(run_id, tenant)
-        if self._summary_method() is None and callable(
-            getattr(self._state, "get_pii_mapping", None)
-        ):
+        if summary.pii_mapping is None and callable(getattr(self._state, "get_pii_mapping", None)):
             mapping = await self.get_pii_mapping(run_id, tenant_id=tenant)
             return replace(summary, pii_mapping=mapping)
         return summary

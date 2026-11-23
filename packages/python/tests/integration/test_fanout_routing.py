@@ -719,6 +719,54 @@ async def test_root_wire_uses_each_childs_own_mapping(store: Any) -> None:
     assert [p.tool_calls[0].params for p in execution] == [{"sheet": value} for value in values]
 
 
+@pytest.mark.parametrize("separate", [True, False], ids=["separate-mapping", "inline-mapping"])
+async def test_custom_summary_uses_scoped_child_mapping_for_root_wire(store, separate):
+    child = finisher("reviewer")
+    value = "reviewer@example.test"
+    placeholder = "<<EMAIL_1>>"
+    mapping_reads = []
+
+    class CustomPauseStore:
+        """A 0.7 adapter with public reads and no SQL projection capability."""
+
+        def __init__(self):
+            self.get_run = store.get_run
+            self.get_loop_state = store.get_loop_state
+            self.get_active_pause_sequence = store.get_active_pause_sequence
+
+        async def get_pause_summary(self, run_id, *, tenant_id):
+            summary = await store.get_pause_summary(run_id, tenant_id=tenant_id)
+            return replace(summary, pii_mapping=None) if separate and summary else summary
+
+        async def get_pii_mapping(self, run_id, *, tenant_id):
+            mapping_reads.append((run_id, tenant_id))
+            return await store.get_pii_mapping(run_id, tenant_id=tenant_id)
+
+    root = root_agent(CustomPauseStore(), child)
+    root_id = await start_root(store, root)
+    child_id, _ = await bind_one(store, root, root_id, child)
+    await store.pause_run(
+        child_id,
+        status=RunStatus.WAITING_HUMAN_INPUT.value,
+        pause_data={"pause_id": generate_ulid(), "clarification": {"question": f"Ask {value}?"}},
+        pii_mapping={placeholder: value},
+    )
+    assert not await store.get_pii_mapping(root_id, tenant_id=TENANT)
+    with pytest.raises(RunNotFoundError):
+        await root.get_result(root_id, tenant_id=OTHER_TENANT)
+    assert mapping_reads == []
+
+    wire = (await root.get_result(root_id, tenant_id=TENANT)).to_dict()
+    assert value not in json.dumps(wire)
+    assert wire["pendings"] == [wire["pending"]]
+    assert wire["pending"]["origin_run_id"] == child_id
+    assert wire["pending"]["question"] == f"Ask {placeholder}?"
+    expected = [(root_id, TENANT)]
+    if separate:
+        expected.append((child_id, TENANT))
+    assert mapping_reads == expected
+
+
 # ---------------------------------------------------------------------------
 # A8 (read part): tenant scope before disclosure
 # ---------------------------------------------------------------------------
