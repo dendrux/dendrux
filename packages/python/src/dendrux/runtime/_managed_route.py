@@ -16,7 +16,7 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, TypeVar
 
 from dendrux import _codes
-from dendrux._lifecycle import PAUSE_STATUSES
+from dendrux._lifecycle import PAUSE_STATUSES, TERMINAL_STATUSES
 from dendrux._meta_keys import GOVERNANCE_KEY
 from dendrux._sentinel import _UnsetType
 from dendrux.errors import (
@@ -41,8 +41,7 @@ from dendrux.runtime._managed_pending import (
     require_fanout,
 )
 from dendrux.runtime._managed_tree import LeafNode, WaitNode, WorkflowTree
-from dendrux.runtime._refusal_view import root_reader
-from dendrux.runtime._run_pending import attach_pendings
+from dendrux.runtime._run_pending import _build_cached_result, attach_pendings
 from dendrux.runtime.state import (
     MANAGED_BINDING_KEY,
     MANAGED_HEADER_KEY,
@@ -94,7 +93,7 @@ async def root_view(store: Any, root_run_id: str) -> RunResult:
     A root waiting on a subagent reports its active branch: the leaf's external
     pause, or RUNNING while a subagent runs or awaits adoption.
     """
-    return await root_reader.get()(store, root_run_id)
+    return await _build_cached_result(store, root_run_id)
 
 
 def _root_result(record: RunRecord, *, status: RunStatus, **fields: Any) -> RunResult:
@@ -167,6 +166,14 @@ class Route:
     def routed(self) -> bool:
         """The leaf is a subagent, not the root itself."""
         return bool(self.waiting)
+
+    def adoptable(self, tool_results: Any, user_input: Any) -> bool:
+        return (
+            self.routed
+            and self.leaf.status in TERMINAL_STATUSES
+            and tool_results is None
+            and user_input is None
+        )
 
 
 async def walk(
@@ -732,6 +739,19 @@ class _InlineTasks:
     def spawn(self, run_id: str, continuation: Coroutine[Any, Any, T]) -> Coroutine[Any, Any, T]:
         del run_id
         return continuation
+
+
+async def fanout_target(
+    root_agent: Agent, store: Any, found: Route, pause_id: str | None
+) -> tuple[Agent, str, list[_Waiting | WaitNode]] | None:
+    if not await reaches_fanout(store, found):
+        return None
+    tree = await route_tree(root_agent, store, found.root_run_id, tenant_id=found.tenant_id)
+    leaf = _required_leaf(tree, pause_id)
+    ancestors = tree.ancestors(leaf.run_id)
+    _managed_definitions._require_supported_loop(ancestors[0].agent, leaf.agent, paused=True)
+    waiting = [wait if wait.version == 4 else _waiting_of(wait) for wait in reversed(ancestors)]
+    return leaf.agent, leaf.run_id, waiting
 
 
 def _waiting_of(wait: WaitNode) -> _Waiting:

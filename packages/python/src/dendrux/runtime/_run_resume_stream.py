@@ -20,7 +20,9 @@ from dendrux._meta_keys import (
 )
 from dendrux._sentinel import _OMITTED, _OmittedType
 from dendrux.errors import (
+    GovernanceMismatchError,
     RunFencedError,
+    SkillContinuityError,
     safe_exception_info,
 )
 from dendrux.loops._helpers import (
@@ -66,6 +68,7 @@ from dendrux.types import (
 if TYPE_CHECKING:
     from collections.abc import (
         AsyncGenerator,
+        Awaitable,
         Callable,
     )
 
@@ -493,6 +496,36 @@ async def _initial_stream_images(
     return store, results, None, False
 
 
+async def _resume_error_event(
+    run_id: str,
+    exc: Exception,
+    status: RunStatus,
+    shared: dict[str, Any],
+    mcp_meta: dict[str, Any],
+    on_definition_refusal: Callable[[Exception], Awaitable[RunEvent]] | None,
+    images: Any,
+) -> RunEvent:
+    from dendrux.types import RunEvent, RunResult
+
+    if (
+        on_definition_refusal is not None
+        and not shared.get("claimed")
+        and (isinstance(exc, (GovernanceMismatchError, SkillContinuityError)) or exc is images)
+    ):
+        return await on_definition_refusal(exc)
+    error = _run_errors._safe_error(exc)
+    result = RunResult(
+        run_id=run_id,
+        status=status,
+        error=error,
+        error_info=_run_errors._provider_error_info(exc),
+        meta=_run_resume_loop._resume_warning_meta(
+            shared.get("ctx"), _run_outcome._stream_error_meta(mcp_meta, exc)
+        ),
+    )
+    return RunEvent(type=RunEventType.RUN_ERROR, run_result=result, error=error)
+
+
 @reject_stream_on_started
 def resume_stream(
     run_id: str,
@@ -506,6 +539,7 @@ def resume_stream(
     extra_notifier: LoopNotifier | None = None,
     expected_pause_id: str | None = None,
     _tenant_explicit: bool | None = None,
+    _on_definition_refusal: Callable[[Exception], Awaitable[RunEvent]] | None = None,
     _claimed: ClaimResult | None = None,
 ) -> RunStream:
     """Stream a resumed run as RunEvents, returning a RunStream.
@@ -527,7 +561,7 @@ def resume_stream(
     are ingested before the claim; an image error is raised from the first
     ``__anext__`` and leaves the run waiting.
     """
-    from dendrux.types import RunEvent, RunResult
+    from dendrux.types import RunEvent
 
     input_items: tuple[Any, ...] = ()
     if user_input is not None:
@@ -725,19 +759,8 @@ def resume_stream(
 
         except Exception as exc:
             failure_status = await _stream_resume_failure(_shared, extra_notifier, run_id, exc)
-
-            yield RunEvent(
-                type=RunEventType.RUN_ERROR,
-                run_result=RunResult(
-                    run_id=run_id,
-                    status=failure_status,
-                    error=_run_errors._safe_error(exc),
-                    error_info=_run_errors._provider_error_info(exc),
-                    meta=_run_resume_loop._resume_warning_meta(
-                        _shared.get("ctx"), _run_outcome._stream_error_meta(mcp_meta, exc)
-                    ),
-                ),
-                error=_run_errors._safe_error(exc),
+            yield await _resume_error_event(
+                run_id, exc, failure_status, _shared, mcp_meta, _on_definition_refusal, images
             )
 
         finally:
