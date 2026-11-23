@@ -8403,10 +8403,15 @@
   "digest": "7c500aa8f3b5"
  },
  "src/dendrux/loops/single.py::_single_batch_call": {
-  "complexity": 7,
+  "complexity": 8,
   "coverage": 1.0,
-  "crap": 7.0,
-  "digest": "3068852bb18f"
+  "crap": 8.0,
+  "digest": "2d37388bc0ef",
+  "waived": {
+   "date": "2026-11-23",
+   "reason": "owner 2026-11-23: approved +1 for one new fully tested on_started branch (F7)",
+   "rule": "worse"
+  }
  },
  "src/dendrux/loops/single.py::_single_call_budget": {
   "complexity": 2,
@@ -14684,10 +14689,15 @@
   "digest": "34d94a32e8cc"
  },
  "src/dendrux/runtime/_run_start.py::_RunLifecycle._cancelled": {
-  "complexity": 8,
+  "complexity": 9,
   "coverage": 1.0,
-  "crap": 8.0,
-  "digest": "0713228f36eb"
+  "crap": 9.0,
+  "digest": "6b37b5ecb289",
+  "waived": {
+   "date": "2026-11-23",
+   "reason": "owner 2026-11-23: approved +1 for one new fully tested on_started branch (F7)",
+   "rule": "worse"
+  }
  },
  "src/dendrux/runtime/_run_start.py::_RunLifecycle._claim": {
   "complexity": 3,
@@ -14702,10 +14712,15 @@
   "digest": "0b2389296432"
  },
  "src/dendrux/runtime/_run_start.py::_RunLifecycle._failed": {
-  "complexity": 6,
+  "complexity": 7,
   "coverage": 1.0,
-  "crap": 6.0,
-  "digest": "4a87c6f79a3d"
+  "crap": 7.0,
+  "digest": "403bf08a9ea1",
+  "waived": {
+   "date": "2026-11-23",
+   "reason": "owner 2026-11-23: approved +1 for one new fully tested on_started branch (F7)",
+   "rule": "worse"
+  }
  },
  "src/dendrux/runtime/_run_start.py::_RunLifecycle._fenced": {
   "complexity": 5,
@@ -14720,10 +14735,15 @@
   "digest": "7a9ad5e2ae2f"
  },
  "src/dendrux/runtime/_run_start.py::_RunLifecycle._release": {
-  "complexity": 3,
+  "complexity": 4,
   "coverage": 1.0,
-  "crap": 3.0,
-  "digest": "66b86010082a"
+  "crap": 4.0,
+  "digest": "2f500f8d14eb",
+  "waived": {
+   "date": "2026-11-23",
+   "reason": "owner 2026-11-23: approved +1 for one new fully tested on_started branch (F7)",
+   "rule": "worse"
+  }
  },
  "src/dendrux/runtime/_run_start.py::_persist_run_failure": {
   "complexity": 5,
