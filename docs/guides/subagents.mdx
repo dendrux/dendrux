@@ -196,7 +196,7 @@ Direct child control is refused with `managed_root_required`. Child reads are al
 
 ## Several paused subagents
 
-With parallel children, more than one can need an answer at once. The root's result keeps the root's `run_id`, and `result.pending` is the first pause. `result.pendings` lists all of them, depth first, siblings in the order of the model's calls (empty when nothing waits, on every result path). Each continuation names its pause with `expected_pause_id=`: submit to the **root id** with the token of the leaf you are answering. A token that is not currently held raises `PauseStatusMismatchError(reason="pause_id")` and carries `current_pause_id`, the first pending pause; nothing is claimed.
+With parallel children, more than one can need an answer at once. The root's result keeps the root's `run_id`, and `result.pending` is the first pause. `result.pendings` lists all of them, depth first, siblings in the order of the model's calls (empty when nothing waits, on every result path), for a workflow with up to 257 active runs (see [The pending read bound](#the-pending-read-bound)). Each continuation names its pause with `expected_pause_id=`: submit to the **root id** with the token of the leaf you are answering. A token that is not currently held raises `PauseStatusMismatchError(reason="pause_id")` and carries `current_pause_id`, the first pending pause; nothing is claimed.
 
 Answer the pauses in a loop until none is left. This runs on a scripted model, with two children that each need an approval:
 
@@ -258,6 +258,43 @@ assert asyncio.run(refund_both()) == "Both refunds are done."
 - **Token-less `resume(root)`** reconnects a workflow whose children have all finished, the same way `reclaim(root)` does. It is refused while any leaf is externally paused, even if other children are terminal: answer the pauses first, or call `reclaim` to read the workflow without answering.
 - **Telling "working" from "paused".** While children are running and nothing needs a person, the root's stored status is `paused`, `get_pending` returns `None`, and `get_result` reports the run as running. Use `RunSummary.waiting_for == "subagents"` or `list_runs(include_waiting=False)` to keep those runs out of a "needs attention" list; see [RunStore](/docs/reference/run-store#telling-a-persons-turn-from-a-subagent-wait).
 - **Replayed approvals.** After a crash, a tool call that was not marked `idempotent` and may have run is not run again silently: it comes back as a root approval pause with `source=recovery`. Its arguments can be hidden (`args_hidden`); resolve it on the server rather than approving an empty object.
+
+### Finding runs that need a person
+
+A parent that waits on its subagents stays `waiting_for="subagents"` even when one of its children needs an approval, so `list_runs(status="paused", include_waiting=False)` can leave out a workflow that needs a person. A run that is paused directly has its own status instead. To build an inbox, page through every status that can need a person, keep the roots, and ask each root for its pauses:
+
+[//]: # "docs-test: skip - fragment: relies on `runs` and `tenant_id`, defined by setup shown elsewhere"
+
+```python
+NEEDS_ATTENTION = ["paused", "waiting_approval", "waiting_human_input", "waiting_client_tool"]
+
+
+async def inbox(runs, tenant_id):
+    offset = 0
+    while True:
+        page = await runs.list_runs(
+            status=NEEDS_ATTENTION, tenant_id=tenant_id, limit=50, offset=offset
+        )
+        for root in (r for r in page if r.parent_run_id is None):
+            for pending in await runs.get_pendings(root.run_id, tenant_id=tenant_id):
+                yield root.run_id, pending
+        if len(page) < 50:
+            return
+        offset += 50  # the list offset is capped at 10,000: narrow by time for larger inboxes
+
+
+async for root_id, pending in inbox(runs, tenant_id):
+    if pending.kind in ("approval", "input", "paused"):
+        ...  # route to a person; answer through root_id with pending.pause_id
+    elif pending.kind == "client_tool":
+        ...  # route to the client that runs the tool
+```
+
+A root that is a plain pause gives one item; a root that only waits on running children gives an empty list. Answer each item through the root id with its `pause_id`, as above.
+
+#### The pending read bound
+
+`get_pendings`, `get_pending` and the paths that rebuild that view (`get_result` and reconnects through `reclaim`) walk at most 257 active nodes, the root included, in one pass. A legal workflow whose active tree is larger (for example after raising `Limits.max_managed_runs`) makes those reads raise `ManagedStateError(reason="binding_conflict")` instead of returning every pause. A summary read such as `get_subtree`, and cancellation, use other paths and are not limited this way.
 
 ## Streaming and events
 
@@ -350,7 +387,7 @@ for root_id in swept.adoptable:
 
 Run that every minute and a crashed fan-out is finished about three minutes later (the age plus the interval) plus the time the reclaim itself takes. Dendrux starts no poller: you choose the schedule and the process. Live children settle directly without any sweep. Size `stale_running` against the lease as in [Recovering a run](/docs/guides/recovery#size-the-lease-window): it must be at least three lease intervals, so a recovery demo with the default lease takes about 90 seconds.
 
-**Rolling upgrade.** A 0.7 process cannot continue a workflow that fanned out; it refuses with `pause_format_unsupported` and changes nothing. While any process that controls workflows is still on 0.7, set `Limits(max_parallel_subagents=1)` on every Agent, run `sweep()` only from 0.8 processes, and raise the limit only after every controller is upgraded. Never route a workflow that has written a fan-out wait back to 0.7: workflows with one child at a time keep the older format, but data already written for several children cannot be downgraded by lowering the limit. Finish or cancel such workflows on 0.8 first.
+**Upgrading.** Running 0.7 and 0.8 workers on the same database at the same time is not supported: 0.8 may write a parallel wait that 0.7 cannot read, and 0.7 refuses it with `ManagedStateError(reason="wait_invalid")`. Stop or drain the 0.7 workers (and their sweep jobs), deploy 0.8 to every worker, and start them again. Paused runs wait and continue on 0.8. Keep Agent settings unchanged for runs started before the upgrade: a non-default `Limits` is fingerprinted at pause time and a different one raises `GovernanceMismatchError`. See [Upgrading to 0.8.0](/docs/upgrading-to-0.8.0#upgrading-all-workers-at-once).
 
 A parent waiting on a subagent is exempt from `abandoned_waiting`; a corrupt managed wait is reported and left unchanged. Both count toward `max_runs`. Pass the previous `result.cursor` (an opaque token starting with `sweep:v1:`) to continue both the running and the waiting scans past them.
 

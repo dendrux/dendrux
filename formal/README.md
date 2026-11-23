@@ -231,9 +231,9 @@ Paths are under `packages/python/src/dendrux/`.
 | `CStart`, `CRetry` | `agent.py:Agent.cancel_run`, and the module `dendrux.cancel_run`, which shares the same service; both use `runtime/_managed_cancel.py:cancel_scope` |
 | `CMarkRoot`, `CMarkKids` | `runtime/_managed_cancel.py:mark_subtree` → `runtime/stores/sql/_sql_lifecycle.py:_SqlLifecycle.mark_cancel_requested` |
 | `CScan` | `runtime/_managed_cancel.py:_scan_frontier` → `get_managed_cancel_children_page`; truncation at the `max_nodes` bound; skipped corrupt headers (`ManagedCancelPages`, `cascade_truncated`) |
-| `CPick` | `agent.py:Agent._cancel_one` → `runtime/stores/sql/_sql_lifecycle.py:_SqlLifecycle.request_cancel` (order from `runtime/_managed_cancel.py:cancel_descendants`) |
-| `CCas` | `agent.py:Agent._cancel_one` → `runtime/_run_events.py:_transition_with_event` over `PAUSE_STATUS_VALUES` → `finalize_with_event` |
-| `CDone`, `CCrash` | End of `Agent.cancel_run`; the call dying at any await |
+| `CPick` | `runtime/_cancel.py:cancel_one` → `runtime/stores/sql/_sql_lifecycle.py:_SqlLifecycle.request_cancel` (descendant order from the frontier walk in `runtime/_managed_cancel.py`, settled by `runtime/_cancel.py:_settle_descendants`) |
+| `CCas` | `runtime/_cancel.py:cancel_one` → `runtime/_run_events.py:_transition_with_event` over `PAUSE_STATUS_VALUES` → `finalize_with_event` |
+| `CDone`, `CCrash` | End of `runtime/_cancel.py:cancel_run`; the call dying at any await |
 
 ## Running the checks
 
