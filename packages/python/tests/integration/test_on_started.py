@@ -93,6 +93,27 @@ async def test_async_callback_observes_claim_in_caller_before_model(store, entry
     assert result.run_id not in agent._task_manager._owned
 
 
+@pytest.mark.parametrize("entry", ["run_stream", "resume_stream"])
+@pytest.mark.parametrize("callback", [None, lambda run_id: None], ids=["none", "callable"])
+async def test_runner_stream_refuses_on_started_at_construction(store, engine, entry, callback):
+    agent, provider = make_agent(store)
+    resolver = AsyncMock(return_value=store)
+    options = dict(
+        agent=agent, provider=provider, state_store_resolver=resolver, on_started=callback
+    )
+    with pytest.raises(ValueError) as refused:
+        if entry == "run_stream":
+            runner.run_stream(user_input="go", tenant_id=None, **options)
+        else:
+            runner.resume_stream("01ARZ3NDEKTSV4RRFFQ69G5FAV", **options)
+    assert str(refused.value) == "on_started is only supported on run()/retry()."
+    resolver.assert_not_awaited()
+    assert provider.call_history == []
+    async with engine.connect() as conn:
+        assert (await conn.scalars(select(AgentRun.id))).first() is None
+        assert (await conn.scalars(select(RunEvent.id))).first() is None
+
+
 @pytest.mark.parametrize("entry", ["run", "retry"])
 async def test_sync_callback_and_provider_options(store, entry):
     agent, provider = make_agent(store)

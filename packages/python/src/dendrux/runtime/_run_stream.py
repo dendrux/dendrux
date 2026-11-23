@@ -47,7 +47,11 @@ from dendrux.runtime import (
     _run_start,
     _run_tools,
 )
-from dendrux.runtime._entry_checks import resolve_runner_tenant, runner_entry_checks
+from dendrux.runtime._entry_checks import (
+    reject_stream_on_started,
+    resolve_runner_tenant,
+    runner_entry_checks,
+)
 from dendrux.runtime._managed_cancel import (
     ManagedRootStoppedError,
 )
@@ -241,6 +245,7 @@ def run_stream(
 ) -> RunStream: ...
 
 
+@reject_stream_on_started
 def run_stream(
     agent: Agent,
     *,
@@ -292,10 +297,7 @@ def run_stream(
     raises to the managed driver instead of yielding ``RUN_ERROR``.
     """
     invocation = _managed_invocation
-    # Validate depth early — synchronous, before generator starts.
-    # Full resolution (parent context, clamping) happens inside _generate()
-    # because parent_ctx requires async state_store resolution first.
-    # But validation of the raw input can fail fast here.
+    # Validate the depth now. Parent context and clamping are resolved on iteration.
     requested_tenant_id = tenant_id
     tenant_explicit = _tenant_scope_chosen(tenant_id)
     tenant_id = resolve_runner_tenant(agent, "stream", tenant_id, state_store=state_store)

@@ -39,6 +39,7 @@ from dendrux.runtime import (
     _run_start,
     _run_tools,
 )
+from dendrux.runtime._entry_checks import reject_stream_on_started
 from dendrux.runtime._managed_cancel import (
     ManagedRootStoppedError,
 )
@@ -482,6 +483,7 @@ async def _initial_stream_images(
     return store, results, None, False
 
 
+@reject_stream_on_started
 def resume_stream(
     run_id: str,
     *,
@@ -498,8 +500,7 @@ def resume_stream(
 ) -> RunStream:
     """Stream a resumed run as RunEvents, returning a RunStream.
 
-    Synchronous — returns immediately. All async setup (store resolution,
-    pause state load, claim, history build) runs lazily on first iteration.
+    Store resolution, pause loading, claiming and history setup run on first iteration.
 
     ``_claimed`` (internal, 0.7): continue a run this caller already owns
     (a managed parent claimed for adoption) from its checkpoint, exactly as
