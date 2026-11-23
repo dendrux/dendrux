@@ -24,7 +24,8 @@ class _FailingCleanupBus(live.LiveUpdates):
             raise RuntimeError("transport cleanup failed") from error
 
 
-def _abandon_listener(bus: _FailingCleanupBus) -> None:
+def _abandon_listener(bus: _FailingCleanupBus) -> Any:
+    """Strand the listener on a closed loop; returns its outermost coroutine."""
     loop = asyncio.new_event_loop()
 
     async def start() -> None:
@@ -35,14 +36,19 @@ def _abandon_listener(bus: _FailingCleanupBus) -> None:
 
     loop.run_until_complete(start())
     loop.close()  # the listener task is still pending, its loop gone
+    return bus._listener_task.get_coro()
 
 
 def test_listener_finalized_without_a_loop_raises_nothing_unraisable(monkeypatch):
     unraisable: list[object] = []
     monkeypatch.setattr(sys, "unraisablehook", lambda args: unraisable.append(args))
     bus = _FailingCleanupBus()
-    _abandon_listener(bus)
+    coroutine = _abandon_listener(bus)
     bus._listener_task = None
+    # Outermost first, as close() on a task's coroutine does; GC order of the inner
+    # frames differs between interpreters (see the send/close test below).
+    coroutine.close()
+    del coroutine
     gc.collect()
     assert unraisable == []
 
