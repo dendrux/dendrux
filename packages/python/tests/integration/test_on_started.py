@@ -12,6 +12,7 @@ from dendrux import Agent, cancel_run
 from dendrux.llm.mock import MockLLM
 from dendrux.loops.base import BaseNotifier
 from dendrux.loops.react import ReActLoop
+from dendrux.loops.single import SingleCall
 from dendrux.runtime import _run_tools, runner
 from dendrux.runtime.context import (
     DelegationContext,
@@ -131,14 +132,24 @@ async def test_managed_child_does_not_inherit_callback(store):
     assert seen == [result.run_id]
 
 
+async def retry_source(store, entry):
+    if entry == "run":
+        return None
+    seeder, _ = make_agent(store)
+    return await seeder.run("hello", tenant_id=None)
+
+
 @pytest.mark.parametrize("engine", ["sqlite_file"], indirect=True)
 @pytest.mark.parametrize("entry", ["run", "retry"])
+@pytest.mark.parametrize("loop_type", [ReActLoop, SingleCall])
 @pytest.mark.parametrize("when", ["before", "inside", "after"])
 @pytest.mark.parametrize("cancel", ["agent", "module", "task"])
-async def test_cancellation_at_callback_boundary(store, monkeypatch, entry, when, cancel):
-    loop = ReActLoop()
+async def test_cancellation_at_callback_boundary(
+    store, monkeypatch, entry, loop_type, when, cancel
+):
+    loop = loop_type()
     agent, provider = make_agent(store, loop=loop)
-    source = await agent.run("hello", tenant_id=None) if entry == "retry" else None
+    source = await retry_source(store, entry)
     loop_run = AsyncMock(wraps=loop.run)
     monkeypatch.setattr(loop, "run", loop_run)
     entered, release = asyncio.Event(), asyncio.Event()
@@ -201,24 +212,25 @@ async def test_cancellation_at_callback_boundary(store, monkeypatch, entry, when
     (event,) = [event for event in events if event.event_type == "run.cancelled"]
     assert event.data["reason"] == ("task_cancelled" if cancel == "task" else "cancel_requested")
     assert run_id not in agent._task_manager._owned
+    assert provider.calls_made == 0
     loop_run.assert_not_called()
-    assert provider.calls_made == int(source is not None)
 
 
 @pytest.mark.parametrize("entry", ["run", "retry"])
+@pytest.mark.parametrize("loop_type", [ReActLoop, SingleCall])
 @pytest.mark.parametrize("changed", ["status", "epoch"])
 @pytest.mark.parametrize("partial_control", [False, True], ids=["full-control", "legacy-control"])
 async def test_changed_claim_stops_before_loop(
-    store, engine, monkeypatch, entry, changed, partial_control
+    store, engine, monkeypatch, entry, loop_type, changed, partial_control
 ):
     from sqlalchemy import update
 
     from dendrux.db.models import AgentRun
     from dendrux.runtime.state import RunControl
 
-    loop = ReActLoop()
+    loop = loop_type()
     agent, provider = make_agent(store, loop=loop)
-    source = await agent.run("hello", tenant_id=None) if entry == "retry" else None
+    source = await retry_source(store, entry)
     loop_run = AsyncMock(wraps=loop.run)
     monkeypatch.setattr(loop, "run", loop_run)
     discovery = AsyncMock(wraps=_run_tools._discover_runtime_tools)
@@ -248,6 +260,67 @@ async def test_changed_claim_stops_before_loop(
     expected = ("success", "winner", 0) if changed == "status" else ("running", None, 1)
     assert (row.status, row.answer, row.claim_epoch) == expected
     assert (result.status.value, result.answer) == expected[:2]
+    assert provider.calls_made == 0
     discovery.assert_not_called()
     loop_run.assert_not_called()
-    assert provider.calls_made == int(source is not None)
+
+
+@pytest.mark.parametrize("entry", ["run", "retry"])
+async def test_sync_callback_return_value_is_ignored(store, entry):
+    source = await retry_source(store, entry)
+    agent, provider = make_agent(store)
+    seen = []
+
+    def save_id(run_id):
+        seen.append(run_id)
+        return run_id
+
+    if source:
+        result = await agent.retry(source.run_id, tenant_id=None, on_started=save_id)
+    else:
+        result = await agent.run("hello", tenant_id=None, on_started=save_id)
+    assert seen == [result.run_id]
+    assert result.status == RunStatus.SUCCESS and provider.calls_made == 1
+
+
+@pytest.mark.parametrize("engine", ["sqlite_file"], indirect=True)
+@pytest.mark.parametrize("entry", ["run", "retry"])
+@pytest.mark.parametrize("change", ["cancel", "reclaim"])
+async def test_single_call_reads_claim_at_provider_boundary(store, engine, entry, change):
+    from sqlalchemy import update
+
+    from dendrux.db.models import AgentRun
+
+    source = await retry_source(store, entry)
+    agent, provider = make_agent(store, loop=SingleCall())
+    started = []
+    ready, release = asyncio.Event(), asyncio.Event()
+
+    class Notifier(BaseNotifier):
+        async def on_llm_call_started(self, run_id, iteration, **kwargs):
+            ready.set()
+            await release.wait()
+
+    options = dict(tenant_id=None, on_started=started.append, notifier=Notifier())
+    task = asyncio.create_task(
+        agent.retry(source.run_id, **options) if source else agent.run("hello", **options)
+    )
+    try:
+        await wait_for_gate(ready, task=task)
+        (run_id,) = started
+        if change == "cancel":
+            await cancel_run(run_id, tenant_id=None, state_store=store)
+        else:
+            async with engine.begin() as conn:
+                await conn.execute(
+                    update(AgentRun).where(AgentRun.id == run_id).values(claim_epoch=1)
+                )
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+    result = await task
+    assert provider.calls_made == 0
+    expected = RunStatus.CANCELLED if change == "cancel" else RunStatus.RUNNING
+    row = await store.get_run(run_id)
+    assert result.status == expected and row.status == expected.value
+    assert row.claim_epoch == int(change == "reclaim")

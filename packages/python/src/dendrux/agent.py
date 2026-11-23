@@ -1399,6 +1399,8 @@ class Agent:
     ) -> RunResult:
         """Start a new agent run.
 
+        Delegates to runner.run() with this agent's provider and persistence config.
+
         Args:
             user_input: The user's input: a string, or a sequence of strings
                 and images (``Image``, ``ImageRef``, ``ImagePart``) in order.
@@ -1494,8 +1496,7 @@ class Agent:
             DelegationDepthExceededError: If this run would exceed the inherited
                 max_delegation_depth from a parent run.
         """
-        requested_tenant_id = tenant_id
-        tenant_id = entry_checks(
+        entry_checks(
             self,
             "run",
             tenant_id,
@@ -1510,15 +1511,18 @@ class Agent:
         _validate_max_delegation_depth(max_delegation_depth)
         provider = self._require_provider()
 
+        # Resolve output_type: run-level overrides agent default
         resolved_output_type = (
             self._output_type if isinstance(output_type, _UnsetType) else output_type
         )
 
+        # Validate output_type + loop compatibility at call time
         if resolved_output_type is not None:
             from dendrux.loops.single import SingleCall
 
             effective_loop = self._loop
             if effective_loop is None:
+                # Runner will default to ReActLoop — that's not SingleCall
                 raise ValueError(
                     f"output_type={resolved_output_type.__name__} requires SingleCall loop. "
                     f"Set loop=SingleCall() on the Agent or remove output_type."
@@ -1531,20 +1535,14 @@ class Agent:
 
         store = await self._resolve_state_store()
 
-        if idempotency_key is not None and store is None:
-            raise ValueError(
-                "idempotency_key requires persistence (database_url or state_store). "
-                "Idempotency cannot work without durable state."
-            )
+        from dendrux.runtime import runner
 
-        from dendrux.runtime.runner import run as runner_run
-
-        run_kwargs: dict[str, Any] = {}
+        runner._require_idempotency_store(store, idempotency_key)
         resolved_depth = self._resolve_run_max_delegation_depth(max_delegation_depth)
         if not isinstance(resolved_depth, _UnsetType):
-            run_kwargs["max_delegation_depth"] = resolved_depth
+            kwargs["max_delegation_depth"] = resolved_depth
 
-        return await runner_run(
+        return await runner.run(
             self,
             provider=provider,
             user_input=user_input,
@@ -1555,13 +1553,12 @@ class Agent:
             replay_last=replay_last,
             replay_reasoning=replay_reasoning,
             state_store=store,
-            tenant_id=requested_tenant_id,
+            tenant_id=tenant_id,
             metadata=metadata,
             extra_notifier=notifier,
             on_started=on_started,
             idempotency_key=idempotency_key,
             output_type=resolved_output_type,
-            **run_kwargs,
             **kwargs,
         )
 
@@ -1577,7 +1574,10 @@ class Agent:
     ) -> RunResult:
         """Retry a terminal run with approximate prior context.
 
-        Seeds a new run from the source conversation with fresh counters and usage.
+        Creates a fresh run seeded with the original run's conversation
+        history from persisted traces. The LLM sees the prior conversation
+        and can continue from context. This is NOT resume — it's a new
+        run with approximate context, fresh counters, fresh usage.
 
         Works for any terminal run (error, cancelled, max_iterations,
         success). Source run must have used a retry-capable loop (not

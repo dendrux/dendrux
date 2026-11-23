@@ -46,12 +46,8 @@ from dendrux.runtime._run_errors import (
 )
 from dendrux.runtime._tenant_checks import _tenant_scope_chosen
 from dendrux.runtime.context import (
-    DelegationContext,
-    get_store_identity,
-    reset_delegation_context,
     resolve_child_tenant,
     resolve_parent_link,
-    set_delegation_context,
 )
 from dendrux.runtime.replay import (
     PARTS_KEY,
@@ -363,7 +359,10 @@ async def retry(
 ) -> RunResult:
     """Retry a terminal run with approximate prior context.
 
-    Seeds a new run from the original conversation's persisted traces.
+    Creates a fresh run seeded with the original run's conversation history
+    from persisted traces. The LLM sees the prior conversation and can
+    continue from context. This is NOT resume (no pause_data, no exact
+    state reconstruction) — it's a new run with approximate context.
 
     Works for any terminal run (error, cancelled, max_iterations, success).
     Source run must have been executed with a retry-capable loop (not
@@ -435,6 +434,7 @@ async def retry(
             retry_context, retry_user = _refresh_retry_user(
                 initial_history, users, raw_user, user_input, source_parts, skill_session
             )
+        # 5. Create the retry run
         resolved_strategy = strategy or _native.NativeToolCalling()
         provider_kwargs = dict(kwargs)
         run_id = generate_ulid()
@@ -466,7 +466,6 @@ async def retry(
             replay_runs,
         )
         input_edges = await _retry_edges(image_runtime, source_parts)
-        ctx_token = None
         mcp_meta: dict[str, Any] = {}
         result: RunResult | None = None
         lifecycle = _run_start._RunLifecycle(
@@ -523,22 +522,16 @@ async def retry(
                         "retry_of": original_run_id,
                     },
                 )
-                this_ctx = DelegationContext(
-                    run_id=run_id,
+                result = await _run_started.bind_context_and_notify(
+                    lifecycle,
+                    agent,
+                    on_started,
+                    extra_notifier,
                     trace_link=trace_link,
                     delegation_level=delegation_level,
-                    persisted=True,
-                    store_identity=get_store_identity(state_store),
-                    max_delegation_depth=effective_max_depth,
+                    max_depth=effective_max_depth,
                     tenant_id=tenant_id,
                     tenant_explicit=tenant_explicit,
-                    state_store=state_store,
-                    lease_interval_s=agent.lease_interval.total_seconds(),
-                    loop=asyncio.get_running_loop(),
-                )
-                ctx_token = set_delegation_context(this_ctx)
-                result = await _run_started.notify_started(
-                    lifecycle, on_started, delegation_level, extra_notifier
                 )
                 if result is not None:
                     return result
@@ -619,8 +612,6 @@ async def retry(
         finally:
             _run_images._release_memory_edges(image_runtime, state_store, run_id)
             lifecycle._release()
-            if ctx_token is not None:
-                reset_delegation_context(ctx_token)
 
 
 retry.__module__ = "dendrux.runtime.runner"

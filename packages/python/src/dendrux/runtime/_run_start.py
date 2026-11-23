@@ -32,6 +32,7 @@ from dendrux.runtime._managed_cancel import (
     ManagedStopLifecycle,
 )
 from dendrux.runtime._run_errors import logger
+from dendrux.runtime.context import reset_delegation_context
 from dendrux.runtime.state import (
     ClaimResult,
     _initial_loop_state,
@@ -47,6 +48,7 @@ if TYPE_CHECKING:
     from collections.abc import (
         Callable,
     )
+    from contextvars import Token
 
     from dendrux.agent import Agent
     from dendrux.llm.base import LLMProvider
@@ -188,6 +190,7 @@ class _RunLifecycle(ManagedStopLifecycle):
     recorder: LoopRecorder | None = None
     recorder_started: bool = False
     notifier_started: bool = False
+    context_token: Token[DelegationContext | None] | None = None
 
     def _mark_notifier_started(self) -> None:
         self.notifier_started = True
@@ -299,6 +302,9 @@ class _RunLifecycle(ManagedStopLifecycle):
     def _release(self) -> None:
         if self.registered and self.manager is not None:
             self.manager.release_current(self.run_id)
+        if self.context_token is not None:
+            reset_delegation_context(self.context_token)
+            self.context_token = None
 
 
 def _recorder_tool_defs(agent: Agent) -> list[Any]:

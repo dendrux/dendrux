@@ -38,10 +38,7 @@ from dendrux.runtime._subagents import _tighten
 from dendrux.runtime._tenant_checks import _tenant_scope_chosen
 from dendrux.runtime.context import (
     DelegationContext,
-    get_store_identity,
-    reset_delegation_context,
     resolve_child_tenant,
-    set_delegation_context,
     take_managed_invocation,
 )
 from dendrux.runtime.state import ClaimResult, claimed_store, unclaimed_store
@@ -157,23 +154,23 @@ async def run(
 ) -> RunResult:
     """Run an agent to completion.
 
+    This is the primary API for executing a Dendrux agent. It wires together the agent
+    definition, LLM provider, strategy, and loop, then executes the loop until completion.
+
     Args:
         agent: Agent definition (model, tools, prompt, limits).
         provider: LLM provider to use for this run.
         user_input: The user's input to process.
         strategy: Communication strategy. Defaults to NativeToolCalling.
         loop: Execution loop. Defaults to ReActLoop.
-        state_store: Optional persistence backend. If provided, the run
-            is persisted to the database with full traces.
+        state_store: Optional persistence backend that saves the run with full traces.
         tenant_id: Optional tenant ID for multi-tenant isolation.
         metadata: Optional developer linking data (thread_id, user_id, etc.).
             Stored in agent_runs.meta — Dendrux stores it, never reads it.
-        extra_notifier: Optional additional LoopNotifier for best-effort
-            notifications (e.g. ConsoleNotifier).
-        max_delegation_depth: Maximum allowed delegation depth for the
-            run tree. Default 10. None means unbounded. Propagated to
-            all child runs via contextvar. Raises DelegationDepthExceededError
-            if a child run would exceed this depth.
+        extra_notifier: Optional best-effort LoopNotifier (e.g. ConsoleNotifier).
+        max_delegation_depth: Depth limit for the run tree (default 10, None for unbounded).
+            Child runs inherit it via contextvar and raise DelegationDepthExceededError
+            if they would exceed it.
         on_started: Receives the new persisted root id before model or tool work.
         **kwargs: Forwarded to the LLM provider.
 
@@ -352,7 +349,6 @@ async def _run_once(
         # --- Delegation context ---
         parent_run_id, delegation_level = _managed.parent_link(invocation, parent_ctx, state_store)
 
-        ctx_token = None
         mcp_meta: dict[str, Any] = {}
         result: RunResult | None = None
         lifecycle = _run_start._RunLifecycle(
@@ -452,26 +448,24 @@ async def _run_once(
                 )
 
                 _configure_fanout(lifecycle.recorder, state_store)
-                this_ctx = DelegationContext(
-                    run_id=run_id,
+                result = await _run_started.bind_context_and_notify(
+                    lifecycle,
+                    agent,
+                    on_started,
+                    extra_notifier,
                     trace_link=trace_link,
                     delegation_level=delegation_level,
-                    persisted=state_store is not None,
-                    store_identity=get_store_identity(state_store),
-                    max_delegation_depth=effective_max_depth,
+                    max_depth=effective_max_depth,
                     tenant_id=tenant_id,
                     tenant_explicit=tenant_explicit,
-                    state_store=state_store,
-                    lease_interval_s=agent.lease_interval.total_seconds(),
-                    loop=asyncio.get_running_loop(),
-                )
-                ctx_token = set_delegation_context(this_ctx)
-                result = await _run_started.notify_started(
-                    lifecycle, on_started, delegation_level, extra_notifier
                 )
                 if result is not None:
                     return result
 
+                # Emit init governance events (skills + MCP) inside the try block
+                # so discovery failures flow through the error cleanup path.
+                # _MCPDiscoveryError is caught here, mcp.error emitted, then the
+                # original cause is re-raised for the outer except Exception.
                 await _run_tools._discover_runtime_tools(
                     agent, lifecycle.recorder, extra_notifier, run_id, resolved_loop, mcp_meta
                 )
@@ -569,8 +563,6 @@ async def _run_once(
         finally:
             _run_images._release_memory_edges(image_runtime, state_store, run_id)
             lifecycle._release()
-            if ctx_token is not None:
-                reset_delegation_context(ctx_token)
 
 
 run.__module__ = "dendrux.runtime.runner"
