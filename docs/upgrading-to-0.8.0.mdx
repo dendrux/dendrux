@@ -12,8 +12,8 @@ description: What changes when you move from 0.7.x to 0.8.0 (parallel subagents,
 | Your setup | Action |
 | --- | --- |
 | Built-in store, no subagents | Upgrade and run. Read [Behaviour changes](#behaviour-changes) once, and the [SQLite fix](#sqlite-fix-and-the-aiosqlite-floor) if you use a SQLite file. |
-| Using `Agent(subagents=...)` | A model can now call several subagents in one response, up to 4 by default. Read [Parallel subagents](/docs/guides/subagents#parallel-subagents) and [Several paused subagents](/docs/guides/subagents#several-paused-subagents). Set `Limits(max_parallel_subagents=1)` to keep the 0.7 behaviour. |
-| Rolling 0.8 out across many workers that run subagents | Read [Rolling upgrade](#rolling-upgrade). |
+| Using `Agent(subagents=...)` | A model can now call several subagents in one response, up to 4 by default. Read [Parallel subagents](/docs/guides/subagents#parallel-subagents) and [Several paused subagents](/docs/guides/subagents#several-paused-subagents). Upgrade every worker together (see [Upgrading](#upgrading-all-workers-at-once)). \|
+| Many workers on one database, with or without subagents | Upgrade all of them together; see [Upgrading all workers at once](#upgrading-all-workers-at-once). |
 | Code that filters on the `managed_batch_unsupported` code for an oversized batch | Read [Changed codes](#changed-codes). |
 | Handlers for `StructuredOutputValidationError` that read its text | Read [Structured-output errors](#structured-output-errors). |
 | A custom `StateStore` or `SQLStateStore` subclass | Run the store kit again. See [Custom stores](#custom-stores). |
@@ -23,9 +23,9 @@ description: What changes when you move from 0.7.x to 0.8.0 (parallel subagents,
 
 | Area | 0.7.x | 0.8.0 | What to do |
 | --- | --- | --- | --- |
-| Subagent calls per response | One. Two were refused with `managed_batch_unsupported` | Up to `Limits.max_parallel_subagents` (default 4, 1 to 32) run in parallel | Set the limit on the root Agent for new workflows; `1` keeps the 0.7 rule. Do not change it on Agents with runs in flight (see [Rolling upgrade](#rolling-upgrade)) |
+| Subagent calls per response | One. Two were refused with `managed_batch_unsupported` | Up to `Limits.max_parallel_subagents` (default 4, 1 to 32) run in parallel | Keep Agent settings unchanged for runs that started before the upgrade; changing the limit on an Agent with paused runs strands them (see [Upgrading](#upgrading-all-workers-at-once)) |
 | An oversized subagent batch | Code `managed_batch_unsupported` | Code `managed_fanout_limit`, with the requested count and the limit in the tool result, events and logs. The whole batch is still refused | Change any filter on the old code. A subagent beside a client tool, and an `exclusive_subagents` conflict, keep `managed_batch_unsupported` |
-| Several paused subagents | Not possible | `result.pendings` lists every pause; each continuation through the root names its leaf with `expected_pause_id` | Loop `while result.pendings:`; see the [guide](/docs/guides/subagents#several-paused-subagents) |
+| Several paused subagents | Not possible | `result.pendings` lists every pause of a workflow of up to 257 active runs (see [pending read bound](/docs/guides/subagents#the-pending-read-bound)); each continuation through the root names its leaf with `expected_pause_id` | Loop `while result.pendings:`; see the [guide](/docs/guides/subagents#several-paused-subagents) |
 | A paused root that only waits for subagents | Looked like any paused run | `RunSummary.waiting_for == "subagents"` | See [waiting_for](#waiting_for) |
 | Stopping a run from a process with no `Agent` | Not possible | `dendrux.cancel_run(run_id, tenant_id=..., database_url= or state_store=)` | See [dendrux.cancel_run](#dendruxcancel_run) |
 | Learning a new run's id before it finishes | Not possible with `run()` | `on_started=` callback | See [on_started](#on_started-and-onstartederror) |
@@ -82,20 +82,21 @@ The fix needs `aiosqlite>=0.22.1`. Dendrux now requires it (the floor was `>=0.1
 
 Cancelled live-update `flush()` and `close()` calls now stay cancelled: a caller that cancelled a task awaiting them is no longer resumed as if the call succeeded when the transport's cleanup raised.
 
-## Rolling upgrade
+## Upgrading all workers at once
 
-A 0.7 process cannot continue a workflow written for several children. `reclaim`, resume and submit refuse it with `RunNotReclaimableError(reason="pause_format_unsupported")` before changing any state; the stale-running `sweep()` is not covered by that guard. Workflows with one child at a time keep the older format.
+**Running 0.7 and 0.8 workers on the same database at the same time is not supported.** 0.8 may write a parallel wait that 0.7 cannot read. A 0.7 process that meets one refuses to read, submit, resume or reclaim it with `ManagedStateError(reason="wait_invalid")` and changes nothing; its sweep, and the recovery guard for newer formats (`RunNotReclaimableError(reason="pause_format_unsupported")`), are separate cases and the stale-running `sweep()` is not covered by either. A mixed fleet can therefore stall workflows, and no per-Agent setting makes it safe: each Agent in a tree supplies its own limit, so even a limit of 1 on the root does not stop a child that was left at the default from writing a parallel wait.
 
-**Why the Agent settings must not change under a paused run.** An Agent's governance settings, including a non-default `Limits`, are fingerprinted when a run pauses. A later resume, submit or reclaim compares the fingerprint of the Agent that continues it with the saved one. With the default `on_governance_change="raise"`, a difference raises `GovernanceMismatchError` (`changed=("limits",)`) and the run stays paused. The default `max_parallel_subagents=4` is left out of the fingerprint, so a 0.7 run continues on 0.8 with unchanged settings; setting it to 1 changes the fingerprint and strands every run that paused before the change. So do not edit the limit on existing Agents.
+Upgrade like this:
 
-While any process that controls workflows is still on 0.7:
+1. Stop the 0.7 workers, or let them drain. Stop 0.7 `sweep()` jobs too.
+2. Deploy 0.8 to **every** worker and every maintenance job.
+3. Start them again.
 
-1. Upgrade controllers to 0.8 **without changing any Agent's settings**. Runs already in flight, including paused approvals written by 0.7, keep being continued by Agents configured exactly as before, until they drain.
-2. Create **new** workflows only through an Agent configured with `Limits(max_parallel_subagents=1)`, so a 0.7 process is never asked to continue a fan-out. Runs created this way are fingerprinted with limit 1 and must be continued by Agents that keep limit 1 until they finish.
-3. Run `sweep()` only from processes on 0.8.
-4. When every controller is on 0.8, start new workflows with the default (or a higher) limit. Keep the limit-1 Agent configuration alive until its in-flight runs have drained.
+Paused runs simply wait and continue on 0.8. Keep Agent settings unchanged for runs that started before the upgrade, and do not edit `Limits` on an Agent that has paused runs. An Agent's governance settings, including a non-default `Limits`, are fingerprinted when a run pauses and compared on every later resume, submit or reclaim. With the default `on_governance_change="raise"`, a difference raises `GovernanceMismatchError` (`changed=("limits",)`). The default `max_parallel_subagents=4` is left out of the fingerprint, so a run paused by 0.7 continues on 0.8 with unchanged settings; setting the limit to 1 changes it.
 
-Never route a workflow that has written a fan-out wait back to 0.7: lowering the limit does not convert data already written. Finish or cancel such a workflow on 0.8 first. Nesting multiplies concurrency; `Limits.max_managed_runs` (default 128) stays the overall bound.
+> **A mismatch can follow an approval that already ran.** For a workflow, the approval is submitted to the paused child first and the root's governance is checked when it adopts the finished child. If the settings differ, the call raises `GovernanceMismatchError`, but the approved action has run and the approval is consumed: resubmitting it raises `RunNotPausedError`, and the root stays paused until it adopts the child. Restore the original Agent settings and call `resume(root_id, tenant_id=...)` with no token, which adopts the finished child; do not replay the approval. A pause checked directly before it is claimed fails earlier and nothing is consumed. Stale-running `reclaim` can also raise `RunNotReclaimableError(reason="governance_changed")` for the same cause.
+
+Nesting multiplies concurrency; `Limits.max_managed_runs` (default 128) stays the overall bound. Never route a workflow that has written a parallel wait back to 0.7.
 
 ## Custom stores
 
