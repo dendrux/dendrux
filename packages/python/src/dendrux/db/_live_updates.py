@@ -111,22 +111,45 @@ def _cancel_count() -> int:
     return task.cancelling() if task is not None else 0
 
 
-def _restore_caller_exit(baseline: int = 0) -> None:
+def _delivered_cancel(error: BaseException) -> asyncio.CancelledError | None:
+    """The ``CancelledError`` in ``error``'s cause/context chain, if one was delivered."""
+    seen: set[int] = set()
+    pending: BaseException | None = error
+    while pending is not None and id(pending) not in seen:
+        if isinstance(pending, asyncio.CancelledError):
+            return pending
+        seen.add(id(pending))
+        pending = pending.__cause__ or pending.__context__
+    return None
+
+
+def _restore_caller_exit(
+    error: BaseException | None = None, baseline: int = 0, *, timed_out: bool = False
+) -> None:
     """Call first in a handler that would treat a failure as ordinary.
 
     A cleanup that fails while a cancel or a close() unwinds replaces the
     ``CancelledError`` / ``GeneratorExit`` with its own error. Without a running
     loop the coroutine is being finalized, so end it as close() expects. On a
-    loop, a cancel that arrived during this operation (the count rose above
-    ``baseline``, taken when it started) stays a cancel. A count left by an
-    earlier cancel the task already handled does not, and a timeout this module
-    started has already uncancelled the task, so neither is restored.
+    loop, a cancel stays a cancel when the task's count rose above ``baseline``
+    (taken at the operation's start) or a ``CancelledError`` was delivered to
+    this operation (``error`` is one, or has one in its chain), and it keeps its
+    original reason. A transport's own CancelledError with no cancel requested
+    (count 0) is an ordinary failure, as is a count left by an earlier handled
+    cancel with no CancelledError in the chain. An
+    expired module timeout (``timed_out``) has already uncancelled its task.
     """
     try:
         task = asyncio.current_task()
     except RuntimeError:
         raise GeneratorExit from None
-    if task is not None and task.cancelling() > baseline:
+    if task is None:
+        return
+    count = task.cancelling()
+    cancel = None if timed_out or error is None or count == 0 else _delivered_cancel(error)
+    if cancel is not None:
+        raise cancel from None
+    if count > baseline:
         raise asyncio.CancelledError from None
 
 
@@ -498,12 +521,13 @@ class LiveUpdates(ABC):
 
     async def _send_batch(self, messages: Sequence[str], count: int, remaining: float) -> bool:
         baseline = _cancel_count()
+        limit = asyncio.timeout(min(self.send_timeout_s, remaining))
         try:
-            async with asyncio.timeout(min(self.send_timeout_s, remaining)):
+            async with limit:
                 await self.send(messages)
         except (Exception, asyncio.CancelledError) as error:
             self._drop_batch(count)
-            _restore_caller_exit(baseline)
+            _restore_caller_exit(error, baseline, timed_out=limit.expired())
             self._send_failure(error, count)
             return False
         self._counts["sent"] += count
@@ -865,12 +889,13 @@ class LiveUpdates(ABC):
         self._close_timeout_logged = False
         deadline = monotonic() + self.close_timeout_s
         baseline = _cancel_count()
+        limit = asyncio.timeout(self.close_timeout_s)
         try:
-            async with asyncio.timeout(self.close_timeout_s):
+            async with limit:
                 await self._close_resources(deadline)
         except (Exception, asyncio.CancelledError) as error:
             self._abort_all()
-            _restore_caller_exit(baseline)
+            _restore_caller_exit(error, baseline, timed_out=limit.expired())
             self._close_failed(error)
 
     def _close_failed(self, error: BaseException) -> None:

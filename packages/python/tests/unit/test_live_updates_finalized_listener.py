@@ -291,3 +291,60 @@ async def test_failed_flush_after_a_committed_bind_does_not_cancel_the_bound_wor
     result = await durability._ownership_handoff(store, operation, cleanup, run_id="run")
     assert result == "bound"
     assert cancelled == []
+
+
+class _HangingBus(live.LiveUpdates):
+    """send and aclose_sender hang; cleanup either lets the cancel through or replaces it."""
+
+    def __init__(self, replace_with=None, **limits):
+        super().__init__(**limits)
+        self.replace_with = replace_with
+
+    async def _hang(self):
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError as error:
+            if self.replace_with is None:
+                raise
+            raise self.replace_with("cleanup failed") from error
+
+    async def send(self, messages):
+        await self._hang()
+
+    async def aclose_sender(self):
+        await self._hang()
+
+    async def receive(self):
+        yield None
+        await asyncio.Future()
+
+
+@pytest.mark.parametrize("replace_with", [None, ConnectionError, TimeoutError])
+@pytest.mark.parametrize("operation", ["flush", "close"])
+async def test_a_cancel_pending_at_entry_is_not_consumed(operation, replace_with):
+    bus = _HangingBus(replace_with, send_timeout_s=30, flush_deadline_s=30, close_timeout_s=30)
+
+    async def cancelled_then_straight_into_the_bus():
+        asyncio.current_task().cancel("caller gave up")
+        if operation == "flush":
+            bus.enqueue(["r"])
+            await bus.flush()
+        else:
+            await bus.close()
+        return "carried on"
+
+    task = asyncio.create_task(cancelled_then_straight_into_the_bus())
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert task.cancelled()
+
+
+async def test_a_cancel_during_send_keeps_its_original_message():
+    bus = _HangingBus(send_timeout_s=30, flush_deadline_s=30)
+    bus.enqueue(["r"])
+    task = asyncio.create_task(bus.flush())
+    await asyncio.sleep(0.05)
+    task.cancel("caller gave up")
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await task
+    assert caught.value.args == ("caller gave up",)
