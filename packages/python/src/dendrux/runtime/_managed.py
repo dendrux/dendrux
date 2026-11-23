@@ -17,6 +17,7 @@ from dendrux.runtime import (
     _managed_definitions,
     _managed_route,
     _managed_stream,
+    _refusal_view,
 )
 from dendrux.runtime._entry_checks import entry_checks
 from dendrux.runtime._managed_adoption import _FAILURE_CODES as _FAILURE_CODES
@@ -925,38 +926,30 @@ def routed_stream(
     from dendrux.runtime.runner import resume_stream
     from dendrux.types import RunEvent, RunEventType
 
-    leaf_kwargs = {
-        "tool_results": tool_results,
-        "user_input": user_input,
-        "expected_pause_id": expected_pause_id,
-        "notifier": notifier,
-        "tenant_explicit": tenant_explicit,
-    }
-
-    async def open_first(state: _StreamState, record: RunRecord) -> Any:
+    async def open_first(
+        state: _StreamState, found: Route, target: Any, admitted: _refusal_view.AdmittedRoot
+    ) -> Any:
         store = state.store
-        found = await route(root_agent, store, run_id, tenant_id=record.tenant_id, admitted=record)
-        state.root_run_id, state.tenant_id = run_id, found.tenant_id
-        if await _managed_route.reaches_fanout(store, found):  # a fan-out below (0.8)
-            return await _managed_stream.open_fanout_leaf(state, root_agent, found, **leaf_kwargs)
         resumed = RunEvent(type=RunEventType.RUN_RESUMED, run_id=run_id)
-        no_payload = tool_results is None and user_input is None
-        if no_payload and found.routed and found.leaf.status in _TERMINAL_VALUES:
-            return await _adopt_finished(state, found, resumed, notifier)
-        require_leaf_pause(found, expected_pause_id)
-        leaf = found.leaf_agent
-        if found.routed:
+        if target is not None:
+            leaf, leaf_id, waiting = target
+        else:
+            if found.adoptable(tool_results, user_input):
+                return await _adopt_finished(state, found, resumed, notifier, admitted)
+            require_leaf_pause(found, expected_pause_id)
+            leaf, leaf_id, waiting = found.leaf_agent, found.leaf.id, list(found.waiting)
+        if waiting:
             entry_checks(
                 leaf,
                 "resume_stream",
                 found.tenant_id,
                 default_tenant=UNSCOPED,
-                run_id=found.leaf.id,
+                run_id=leaf_id,
                 tool_results=tool_results,
                 user_input=user_input,
             )
         first = resume_stream(
-            found.leaf.id,
+            leaf_id,
             agent=leaf,
             provider=leaf._require_provider(),
             state_store=store,
@@ -965,27 +958,34 @@ def routed_stream(
             extra_notifier=notifier,
             expected_pause_id=expected_pause_id,
             _tenant_explicit=tenant_explicit,
+            _on_definition_refusal=admitted.refusal_event if waiting else None,
         )
-        if not found.routed:
+        if not waiting:
             state.waiting = []
             state.current, state.root_active = first, True
             return first, None
-        return await _managed_stream._owned_leaf_stream(
-            state, found.root_run_id, list(found.waiting), first, resumed
-        )
+        return await _continuation_refusals.open_leaf(state, waiting, first, resumed, admitted)
 
-    checked = _continuation_refusals.routed_open(open_first, run_id, tenant_id)
+    checked = _continuation_refusals.routed_open(
+        open_first, route, run_id, tenant_id, expected_pause_id
+    )
     return workflow_stream(root_agent, checked, run_id=run_id, notifier=notifier)
 
 
-async def _adopt_finished(state: _StreamState, found: Route, resumed: Any, notifier: Any) -> Any:
+async def _adopt_finished(
+    state: _StreamState,
+    found: Route,
+    resumed: Any,
+    notifier: Any,
+    admitted: _refusal_view.AdmittedRoot,
+) -> Any:
     """A payload-free resume adopts a finished subagent without a token: its parent's
     continuation opens the stream, or the root view when another caller adopts."""
     waiting = list(found.waiting)
     claim = await claim_adoption(waiting[-1], state.store)
     if claim is None:
         state.waiting = []
-        view = await _managed_route.root_view(state.store, found.root_run_id)
+        view = await admitted.latest()
         return _Single(_managed_stream._event(view)), None
     parent = waiting.pop()
     first = _managed_stream._waiting_continuation(parent, state.store, claim, notifier)
