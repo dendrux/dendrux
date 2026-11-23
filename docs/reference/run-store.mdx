@@ -112,13 +112,14 @@ async def list_runs(
     started_after: datetime | None = None,
     started_before: datetime | None = None,
     metadata_filter: dict[str, Any] | None = None,
+    include_waiting: bool = True,
     limit: int = 50,
     offset: int = 0,
 ) -> list[RunSummary]
 
 async def count_runs(*, status=..., agent_name=..., parent_run_id=...,
                      tenant_id: TenantScope = UNSCOPED, started_after=..., started_before=...,
-                     metadata_filter=...) -> int
+                     metadata_filter=..., include_waiting: bool = True) -> int
 
 # every method below also takes tenant_id: TenantScope = UNSCOPED
 async def get_run(run_id: str) -> RunDetail | None
@@ -141,12 +142,13 @@ async def get_notes(run_id: str, *, undelivered_only: bool = False) -> list[RunN
 
 | Method | Returns | Notes |
 | --- | --- | --- |
-| `list_runs` | `RunSummary` page | Filters AND together. `metadata_filter` is exact-match across `meta` keys. |
+| `list_runs` | `RunSummary` page | Filters AND together. `metadata_filter` is exact-match across `meta` keys. `include_waiting=False` leaves out runs that are only waiting on their subagents; see [Telling a person's turn from a subagent wait](#telling-a-persons-turn-from-a-subagent-wait). |
 | `count_runs` | `int` | Same filters as `list_runs`, for pagination totals. |
 | `get_run` | `RunDetail` or `None` | One run's full anchor row. |
 | `get_events` | `StoredEvent` list | `after_sequence_index` is a strict `>` cursor (reconnect-safe). Pass `limit=` (1 to 1,000). See [Bounded list reads](#bounded-list-reads) and [Event ordering](/docs/architecture/event-ordering). |
 | `stream_events` | async iterator | Raw events; does not stop at terminal status. A failed read propagates and closes the iterator. After reconnecting, reopen it with `after_sequence_index` set to the last event your application processed, or use `follow` for read recovery. Polls every `poll_interval_s` per caller; with live updates a hint for the run wakes it early. Each caller waits at least `poll_interval_s / 10` between idle polling reads, including reads woken by hints or gaps. Full pages are drained immediately without that wait. Each caller takes one slot in the hint hub (at most 10,000 per `LiveUpdates`; beyond that `FollowCapacityError`). Without `tenant_id` it reads any tenant's run and prints a `DeprecationWarning`; prefer `follow`. |
 | `get_pending` | `PendingPause` or `None` | What a paused run is waiting on. See [Pending and live reads](#pending-and-live-reads). |
+| `get_pendings` | `PendingPause` list | Every external pause a subagent workflow waits on, in stable order (0.8). A run with one pause gives a one-item list; a run waiting on nothing gives an empty list. |
 | `follow` | `Follow` (async iterator) | A hardened live feed. See [Pending and live reads](#pending-and-live-reads). |
 | `get_llm_calls` | `LLMCall` list | Per-LLM-call usage, cache, raw payloads. Pass `limit=`; page with `offset=`. |
 | `get_tool_invocations` | `ToolInvocation` list | Per tool execution: params, result, success. Pass `limit=`; page with `offset=`. |
@@ -159,12 +161,14 @@ async def get_notes(run_id: str, *, undelivered_only: bool = False) -> list[RunN
 
 ### Pending and live reads
 
-Two calls exist to serve a frontend from your own routes. Both require an explicit `tenant_id` (a string, `None`, or `UNSCOPED`; leaving it out is a `TypeError`) and never fail open. The recipe is [Build your own read routes](/docs/recipes/build-your-own-read-routes).
+Three calls exist to serve a frontend from your own routes. Both require an explicit `tenant_id` (a string, `None`, or `UNSCOPED`; leaving it out is a `TypeError`) and never fail open. The recipe is [Build your own read routes](/docs/recipes/build-your-own-read-routes).
 
 [//]: # "docs-test: skip - API signature listing, not runnable code"
 
 ```python
 async def get_pending(run_id: str, *, tenant_id: TenantScope) -> PendingPause | None
+
+async def get_pendings(run_id: str, *, tenant_id: TenantScope) -> list[PendingPause]
 
 def follow(run_id: str, *, tenant_id: TenantScope, after_sequence_index: int | None = None,
            include_payloads: bool = False, until_terminal: bool = True,
@@ -178,7 +182,22 @@ def follow(run_id: str, *, tenant_id: TenantScope, after_sequence_index: int | N
 | `client_tool` | The arguments the client tool receives. With the default `PII(restore="all")` these hold real values. Authorize the actor before you show them. |
 | `approval`, `input` | The arguments exactly as the model sent them (PII placeholders), which is what a person approves. If the recorded model arguments are unavailable, `params` is `None` and `args_hidden` is `True`: resolve that pause on the server, never approve an empty object. |
 
-`get_pending` reports the run you ask about: for a run that delegated, list the tree with `get_subtree` and call `get_pending` for each waiting node.
+For a managed subagent workflow, call `get_pending` or `get_pendings` with the **root** run id. `get_pending` returns the first external pause (`get_pendings()[0]`) and each item carries `agent_name`, `agent_path` and `origin_run_id` for the child that needs the answer. For a legacy (non-managed) delegated run, `get_pending` reports only the run you ask about: list the tree with `get_subtree` and ask for each waiting node.
+
+**`get_pendings`** lists every external pause (approval, client tool, input, requested or budget pause) that a workflow waits on, depth first, siblings in the order of their parent's tool calls. It is read-only: it claims nothing and changes no epoch. The scope rules, bounds and errors are those of `get_pending`. Use it after a restart to rebuild a "needs a person" list, and in the resume loop in [Several paused subagents](/docs/guides/subagents#several-paused-subagents). When subagents are still working and nothing needs a person, both reads give `None` / an empty list: the root's stored status is `paused`, but see the next section.
+
+On the browser envelope, `RunResult.to_dict()` and the wire view carry a `pendings` list next to `pending` (additive); a run with a single pause has one item.
+
+### Telling a person's turn from a subagent wait
+
+A parent that is only waiting for its running subagents is stored as `paused`, so `list_runs(status="paused")` includes it next to runs that need a person. Since 0.8, `RunSummary`, `RunDetail` and the nodes of `get_subtree` carry `waiting_for: str | None`. It is `"subagents"` when the stored status is `paused` and the stored pause reason is exactly `managed_wait`, and `None` otherwise. A missing, null or malformed reason stays a plain pause, so a person looks at it. The label describes the parent only; a child can still wait for an approval, a client tool or input, which `get_pendings` reports.
+
+```python
+needs_attention = await runs.list_runs(status="paused", tenant_id="acme", include_waiting=False)
+how_many = await runs.count_runs(status="paused", tenant_id="acme", include_waiting=False)
+```
+
+`include_waiting=True` is the default and changes nothing: stored statuses and the existing `status` filter keep their meaning, and no migration is needed. `include_waiting=False` is a store capability (`waiting_filter`); the built-in SQL stores declare it, and a custom store without it raises `StoreCapabilityError`. The filter reads pause data for every candidate row, so it can be slower on very large tables, and `limit` bounds the rows returned, not the candidates examined. A paused `get_run` costs one extra primary-key read for the label. `dendrux runs` shows `waiting_for` and takes `--exclude-waiting`.
 
 **`follow`** yields `StoredEvent` items, `FollowHeartbeat` when quiet, and a final `FollowEnd(reason, cursor)` where `reason` is `terminal`, `max_duration`, `lagging` or `error`. Use `async for` (after `await follow.start()` if you want to check the scope and capacity before sending response headers) and `await follow.aclose()` when done. `follow.drained_terminal` is `True` when the run is already finished and has nothing left to send; a route can answer 204 without iterating (see [How a follow ends](#how-a-follow-ends)). One coordinator task per `RunStore` serves every follower in your process and reads the watched runs in batches, so database load grows with watched runs, not with open connections, and one follower costs a small constant number of statements however many pauses the run has. With healthy live updates a hint makes a run due at once and a safety poll runs every 10 seconds; without them an idle run is read every 0.5 seconds, backing off to 2 seconds (see [Scaling](/docs/guides/scaling#what-a-reader-does)). Events pass through the [redacted view](#redacted-views) unless `include_payloads=True`.
 
@@ -429,9 +448,9 @@ See [Chatbot threads](/docs/recipes/chatbot-threads) for the full pattern.
 
 All returned from `dendrux.store`. Fields, exact as persisted:
 
-**`RunSummary`** (from `list_runs`): `run_id`, `agent_name`, `status`, `created_at`, `updated_at`, `iteration_count`, `total_input_tokens`, `total_output_tokens`, `total_cache_read_tokens`, `total_cache_creation_tokens`, `total_cost_usd`, `model`, `parent_run_id`, `delegation_level`, and (0.5.0) `tenant_id`. List views never load pause state, and `offset` is capped at 10,000.
+**`RunSummary`** (from `list_runs`): `run_id`, `agent_name`, `status`, `created_at`, `updated_at`, `iteration_count`, `total_input_tokens`, `total_output_tokens`, `total_cache_read_tokens`, `total_cache_creation_tokens`, `total_cost_usd`, `model`, `parent_run_id`, `delegation_level`, (0.5.0) `tenant_id` and (0.8) `waiting_for`. List views never load pause state, and `offset` is capped at 10,000.
 
-**`RunDetail`** (from `get_run`): every `RunSummary` field plus `strategy`, `input_data`, `answer`, `error`, `failure_reason`, `cancel_requested` (`True` between a `cancel_run` request and the run reaching a terminal status), `pause_requested` (`True` between a `request_pause` request and the run pausing), and (0.5.0) `error_info`, the structured summary of a provider failure that ended the run (`None` otherwise).
+**`RunDetail`** (from `get_run`): every `RunSummary` field plus `strategy`, `input_data`, `answer`, `error`, `failure_reason`, `cancel_requested` (`True` between a `cancel_run` request and the run reaching a terminal status), `pause_requested` (`True` between a `request_pause` request and the run pausing), and (0.5.0) `error_info`, the structured summary of a provider failure that ended the run (`None` otherwise), and (0.8) `waiting_for`.
 
 **`StoredEvent`** (from `get_events`): `sequence_index`, `iteration_index`, `event_type`, `correlation_id`, `data`, `created_at`.
 
