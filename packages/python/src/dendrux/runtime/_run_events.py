@@ -25,6 +25,7 @@ from dendrux.runtime import (
 from dendrux.runtime._run_errors import (
     logger,
 )
+from dendrux.runtime.state import unclaimed_store
 from dendrux.types import (
     ErrorInfo,
     RunStatus,
@@ -223,12 +224,13 @@ async def _transition_with_event(
     ``failure_reason``; the transition event still carries the reason.
     """
     atomic = getattr(state_store, "finalize_with_event", None)
-    # Stores predating a keyword (e.g. failure_reason) cannot persist it;
-    # the transition and its event (which carries the reason) still happen.
-    if finalize_kwargs.get("failure_reason") is None or not _run_contracts._accepts_kwarg(
-        atomic or state_store.finalize_run_if_status_in, "failure_reason"
-    ):
-        finalize_kwargs.pop("failure_reason", None)
+    reason = finalize_kwargs.pop("failure_reason", None)
+    if reason is not None:
+        # The claim wrapper accepts **kwargs to inject the epoch. Inspect the actual writer.
+        method = "finalize_with_event" if atomic is not None else "finalize_run_if_status_in"
+        writer = getattr(unclaimed_store(state_store), method)
+        if _run_contracts._accepts_kwarg(writer, "failure_reason"):
+            finalize_kwargs["failure_reason"] = reason
     if atomic is not None:
         seq = await atomic(
             run_id,

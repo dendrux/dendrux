@@ -32,6 +32,7 @@ from dendrux.runtime._managed_cancel import (
     ManagedStopLifecycle,
 )
 from dendrux.runtime._run_errors import logger
+from dendrux.runtime.context import reset_delegation_context
 from dendrux.runtime.state import (
     ClaimResult,
     _initial_loop_state,
@@ -43,9 +44,11 @@ from dendrux.types import (
 )
 
 if TYPE_CHECKING:
+    import asyncio
     from collections.abc import (
         Callable,
     )
+    from contextvars import Token
 
     from dendrux.agent import Agent
     from dendrux.llm.base import LLMProvider
@@ -187,6 +190,8 @@ class _RunLifecycle(ManagedStopLifecycle):
     recorder: LoopRecorder | None = None
     recorder_started: bool = False
     notifier_started: bool = False
+    context_token: Token[DelegationContext | None] | None = None
+    failure_write_started: bool = False
 
     def _mark_notifier_started(self) -> None:
         self.notifier_started = True
@@ -226,7 +231,7 @@ class _RunLifecycle(ManagedStopLifecycle):
         if not self.started and isinstance(exc, (RunAlreadyActiveError, IdempotencyConflictError)):
             return
         _run_observers._attach_run_error_meta(exc, self.run_id, meta)
-        if self.owned and self.store is not None:
+        if self.owned and self.store is not None and not self.failure_write_started:
             await _persist_run_failure(self.store, self.run_id, exc)
         if self.started:
             await self._fail_sinks(exc, recorder, notifier)
@@ -272,11 +277,12 @@ class _RunLifecycle(ManagedStopLifecycle):
 
     async def _cancelled(
         self,
+        cancellation: asyncio.CancelledError,
         result: RunResult | None,
         meta: dict[str, Any],
         recorder: LoopRecorder | None,
         notifier: LoopNotifier | None,
-    ) -> tuple[RunResult, bool]:
+    ) -> RunResult:
         manager = self.manager if self.registered else None
         interrupted, swallow = _run_events._take_task_interrupt(manager, self.run_id)
         cancelled = await _run_events._drain_task_cancellation(
@@ -290,11 +296,16 @@ class _RunLifecycle(ManagedStopLifecycle):
         _run_observers._attach_mcp_meta(cancelled, meta)
         if self.started:
             await self._cancel_finish(recorder, notifier, cancelled)
-        return cancelled, _run_events._may_swallow_cancellation(swallow)
+        if _run_events._may_swallow_cancellation(swallow):
+            return cancelled
+        raise cancellation
 
     def _release(self) -> None:
         if self.registered and self.manager is not None:
             self.manager.release_current(self.run_id)
+        if self.context_token is not None:
+            reset_delegation_context(self.context_token)
+            self.context_token = None
 
 
 def _recorder_tool_defs(agent: Agent) -> list[Any]:

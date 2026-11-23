@@ -56,6 +56,7 @@ _NUMBERS = frozenset(
     }
 )
 _ENUMS = {
+    "callback_outcome": frozenset({"raised"}),
     "error_kind": frozenset({"timeout", "connection", "cancelled", "closed", "other", "tls"}),
     "db_kind": frozenset(
         [
@@ -518,6 +519,14 @@ METADATA_TOO_LARGE = Code(
     _BASE_FIELDS | frozenset(["entry", "bytes", "limit"]),
     "Metadata exceeds its byte bound.",
     "Reduce metadata or raise the bound.",
+)
+ON_STARTED_FAILED = Code(
+    "on_started_failed",
+    logging.ERROR,
+    "runtime",
+    _BASE_FIELDS | frozenset({"callback_outcome"}),
+    "The root run's on_started callback raises, before the owner checks cancellation or its claim.",
+    "Check the run status. If the caller receives OnStartedError, inspect its __cause__.",
 )
 RUN_FAILED = Code(
     "run_failed",
@@ -2189,6 +2198,7 @@ REGISTRY = MappingProxyType(
             TENANT_SCOPE_REQUIRED,
             RESERVED_METADATA_KEY,
             METADATA_TOO_LARGE,
+            ON_STARTED_FAILED,
             RUN_FAILED,
             READ_ARGUMENT_INVALID,
             PAUSE_DATA_NOT_JSONB,

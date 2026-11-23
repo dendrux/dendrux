@@ -104,6 +104,7 @@ from dendrux.errors import (
 from dendrux.errors import (
     InvalidImageError as InvalidImageError,
 )
+from dendrux.errors import OnStartedError as OnStartedError
 from dendrux.errors import (
     RunFencedError as RunFencedError,
 )

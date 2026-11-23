@@ -1351,6 +1351,7 @@ class Agent:
         tenant_id: str | None = ...,
         metadata: dict[str, Any] | None = ...,
         notifier: LoopNotifier | None = ...,
+        on_started: Callable[[str], Awaitable[None] | None] | None = ...,
         max_delegation_depth: int | None,
         idempotency_key: str | None = ...,
         output_type: type[BaseModel] | None = ...,
@@ -1371,6 +1372,7 @@ class Agent:
         tenant_id: str | None = ...,
         metadata: dict[str, Any] | None = ...,
         notifier: LoopNotifier | None = ...,
+        on_started: Callable[[str], Awaitable[None] | None] | None = ...,
         idempotency_key: str | None = ...,
         output_type: type[BaseModel] | None = ...,
         **kwargs: Any,
@@ -1389,6 +1391,7 @@ class Agent:
         tenant_id: str | None | _OmittedType = _OMITTED,
         metadata: dict[str, Any] | None = None,
         notifier: LoopNotifier | None = None,
+        on_started: Callable[[str], Awaitable[None] | None] | None = None,
         max_delegation_depth: int | None | _UnsetType = _UNSET,
         idempotency_key: str | None = None,
         output_type: type[BaseModel] | None | _UnsetType = _UNSET,
@@ -1396,8 +1399,7 @@ class Agent:
     ) -> RunResult:
         """Start a new agent run.
 
-        Delegates to runner.run() with this agent's provider and persistence
-        config.
+        Delegates to runner.run() with this agent's provider and persistence config.
 
         Args:
             user_input: The user's input: a string, or a sequence of strings
@@ -1449,6 +1451,9 @@ class Agent:
             notifier: Optional notifier for lifecycle events (e.g. ConsoleNotifier
                 for terminal output, custom notifiers for Slack/Telegram/etc.).
                 Composed with PersistenceRecorder internally if persistence is enabled.
+            on_started: Receives the new persisted root id. Save the id and return promptly.
+                For child, ephemeral, and cached runs, read RunResult.run_id. For active
+                duplicates, read RunAlreadyActiveError.run_id.
             max_delegation_depth: Maximum allowed delegation depth for the run
                 tree. Default 10. None means unbounded. Child runs inherit
                 this limit automatically.
@@ -1457,9 +1462,8 @@ class Agent:
                 returned. If still active, RunAlreadyActiveError is raised. If the
                 same key is reused with different input, IdempotencyConflictError
                 is raised. Requires persistence (database_url or state_store).
-                The hash includes ``history``, ``context``
-                and the ``runs`` / ``replay_last`` / ``replay_reasoning`` knobs —
-                same input with a different prefix is a different request.
+                The hash includes ``history``, ``context``, ``runs``, ``replay_last``, and
+                ``replay_reasoning``. A different prefix makes a different request.
             **kwargs: Forwarded to the LLM provider. Pass ``model=`` to override
                 the provider's configured model for this call only (e.g.
                 ``model="claude-opus-4-1"``) — useful for per-turn model selection
@@ -1487,13 +1491,12 @@ class Agent:
                 is provided without persistence, or if the replay knobs are
                 invalid (``ReplayRunError`` for a bad run id).
             RunAlreadyActiveError: If idempotency_key matches an active run.
-            IdempotencyConflictError: If idempotency_key is reused with
-                different request parameters.
+            IdempotencyConflictError: If an idempotency key is reused with different parameters.
+            dendrux.errors.OnStartedError: If the start callback fails the new run.
             DelegationDepthExceededError: If this run would exceed the inherited
                 max_delegation_depth from a parent run.
         """
-        requested_tenant_id = tenant_id
-        tenant_id = entry_checks(
+        entry_checks(
             self,
             "run",
             tenant_id,
@@ -1532,20 +1535,14 @@ class Agent:
 
         store = await self._resolve_state_store()
 
-        if idempotency_key is not None and store is None:
-            raise ValueError(
-                "idempotency_key requires persistence (database_url or state_store). "
-                "Idempotency cannot work without durable state."
-            )
+        from dendrux.runtime import runner
 
-        from dendrux.runtime.runner import run as runner_run
-
-        run_kwargs: dict[str, Any] = {}
+        runner._require_idempotency_store(store, idempotency_key)
         resolved_depth = self._resolve_run_max_delegation_depth(max_delegation_depth)
         if not isinstance(resolved_depth, _UnsetType):
-            run_kwargs["max_delegation_depth"] = resolved_depth
+            kwargs["max_delegation_depth"] = resolved_depth
 
-        return await runner_run(
+        return await runner.run(
             self,
             provider=provider,
             user_input=user_input,
@@ -1556,12 +1553,12 @@ class Agent:
             replay_last=replay_last,
             replay_reasoning=replay_reasoning,
             state_store=store,
-            tenant_id=requested_tenant_id,
+            tenant_id=tenant_id,
             metadata=metadata,
             extra_notifier=notifier,
+            on_started=on_started,
             idempotency_key=idempotency_key,
             output_type=resolved_output_type,
-            **run_kwargs,
             **kwargs,
         )
 
@@ -1572,6 +1569,7 @@ class Agent:
         tenant_id: str | None | _OmittedType = _OMITTED,
         metadata: dict[str, Any] | None = None,
         notifier: LoopNotifier | None = None,
+        on_started: Callable[[str], Awaitable[None] | None] | None = None,
         **kwargs: Any,
     ) -> RunResult:
         """Retry a terminal run with approximate prior context.
@@ -1590,15 +1588,16 @@ class Agent:
             tenant_id: Optional tenant ID for the retry run.
             metadata: Optional developer metadata for the retry run.
             notifier: Optional notifier for lifecycle events.
+            on_started: As in run(), receives the new retry run id.
             **kwargs: Forwarded to the LLM provider.
 
         Returns:
             RunResult from the retry run.
 
         Raises:
-            ValueError: If no provider/persistence configured, if the
-                source run is not terminal, or if the source run was
-                SingleCall.
+            ValueError: If provider or persistence is missing, the source is still active,
+                or the source used SingleCall.
+            dendrux.errors.OnStartedError: If the start callback fails the retry run.
         """
         requested_tenant_id = tenant_id
         tenant_id = entry_checks(
@@ -1633,6 +1632,7 @@ class Agent:
             tenant_id=requested_tenant_id,
             metadata=metadata,
             extra_notifier=notifier,
+            on_started=on_started,
             **kwargs,
         )
 
@@ -3070,8 +3070,9 @@ class Agent:
         Raises:
             ValueError: If no provider is configured, or if ``history`` is invalid.
         """
-        requested_tenant_id = tenant_id
-        tenant_id = entry_checks(
+        if "on_started" in kwargs:
+            raise ValueError("on_started is only supported on run()/retry().")
+        entry_checks(
             self,
             "stream",
             tenant_id,
@@ -3088,10 +3089,9 @@ class Agent:
 
         from dendrux.runtime.runner import run_stream as runner_run_stream
 
-        stream_kwargs: dict[str, Any] = {}
         resolved_depth = self._resolve_run_max_delegation_depth(max_delegation_depth)
         if not isinstance(resolved_depth, _UnsetType):
-            stream_kwargs["max_delegation_depth"] = resolved_depth
+            kwargs["max_delegation_depth"] = resolved_depth
 
         stream = runner_run_stream(
             self,
@@ -3104,11 +3104,10 @@ class Agent:
             replay_last=replay_last,
             replay_reasoning=replay_reasoning,
             state_store_resolver=self._resolve_state_store,
-            tenant_id=requested_tenant_id,
+            tenant_id=tenant_id,
             metadata=metadata,
             extra_notifier=notifier,
             idempotency_key=idempotency_key,
-            **stream_kwargs,
             **kwargs,
         )
         if self._subagents:
