@@ -7,6 +7,8 @@ description: How a running or paused dendrux run is cleanly cancelled from any p
 
 `agent.cancel_run(run_id)` terminates a run. It works whether the run is currently paused in the DB, running on another server, or executing inside a process the current `Agent` owns. It uses three mechanisms in parallel: an atomic CAS for paused runs, a cooperative flag for running runs anywhere, and an in-process interrupt for runs this `Agent` instance is executing (`run()` and `stream()`). Whichever condition applies wins, and the run ends in status `cancelled`.
 
+The same operation is available without an `Agent` as `dendrux.cancel_run(run_id, tenant_id=..., state_store= or database_url=)`, for a route or CLI that cannot build the agent graph; see [Cancel a run without an Agent](/docs/recipes/cancel-run#cancel-a-run-without-an-agent). It has no in-process interrupt, so every running run stops at its next checkpoint.
+
 A run on another server is never preempted: it finishes its current model call or tool and cancels at the next checkpoint. Only a run executing in the same process, on the same `Agent` instance, is interrupted mid-step.
 
 On Python 3.11, persisted runs detect cancellation lost during their recorder's store awaits and recover it before the next model call or tool dispatch on the recorder's task; handled cancellation inside provider or tool code does not trigger this guard. Cancellation lost before recorder creation (including the run's first save), after its last dispatch checkpoint (including its final write), or outside the recorder's store awaits is not recovered, and parallel tool batches dispatching on worker tasks are not guarded; Python 3.12+ is unchanged.
@@ -23,8 +25,11 @@ There is one method on `Agent` for cancellation, and its behavior depends on wha
 | Streaming (`running`) via `stream()` / `resume_stream()` on **this** `Agent` instance | Additionally sets an in-process interrupt. The loop abandons the in-flight model stream immediately and yields `RUN_CANCELLED` with the current turn’s partial text as `answer`. |
 | Terminal (`success`, `error`, `cancelled`, `max_iterations`) | No-op. Returns the current persisted state. Does not raise. |
 
-If `on_started` raises, the owner finalizes the run as `cancelled` when its control read sees a pending request, or as `error` when the request commits after that read.
-The terminal write clears `cancel_requested` in both cases.
+### Cancelling around `on_started`
+
+The `on_started=` callback of `run()` and `retry()` receives the run id before the first model call, so a cancel can arrive before, during or after it. The callback is called even if a cancel is already pending. When it returns, the run reads its control state again: a pending cancel (from `Agent.cancel_run`, `dendrux.cancel_run` or `task.cancel()`) finalizes the run as `cancelled`; a run that `sweep()` or `reclaim()` took over stops without model or tool work.
+
+If the callback raises, the outcome follows the same read. When the control read sees a pending request, the run ends `cancelled`. When the request commits after that read, the late `error` wins: the run ends `error` (code `on_started_failed`), the caller gets `OnStartedError`, and the terminal write clears `cancel_requested`. Either way there is exactly one terminal event. See [`on_started`](/docs/reference/agent#on_started).
 
 The caller does not have to know which branch applies. `cancel_run` sets the cooperative flag, attempts the paused-state CAS, and fires the in-process interrupt in the same call. Exactly one path produces the terminal `run.cancelled` event.
 
@@ -238,7 +243,8 @@ print(result.meta["cascade"])
 - The built-in store marks cancellation requests on each level of the run tree before reading the next level, then finalizes paused descendants deepest first with `run_id` last. New child admission under a marked parent is refused. An in-flight creator already past its check commits before that parent is scanned. On SQLite, delegated creation briefly reserves the writer before its first read; Postgres uses a parent-row lock.
 - Each run's outcome is listed in `meta["cascade"]`: `cancelled` (finalized now), `cancel_requested` (it is running; it stops at its next checkpoint, or is interrupted at once if it is running in this process) or `terminal` (already finished).
 - Paused descendants (`waiting_*` or `paused`) are finalized in the same call.
-- `cascade=False` (the default) cancels only `run_id`; its children keep running.
+- `cascade=False` (the default on `Agent.cancel_run`) cancels only `run_id`; its legacy delegated children keep running. Managed subagents are always included. The module function `dendrux.cancel_run` defaults to `cascade=True`.
+- **Repeat a cascade that did not finish.** If a cascade fails partway (for example a store error), call `cancel_run` again; it is safe to repeat. Running runs still stop at their checkpoints. A run that is paused stays paused, with its cancel request set, until a later `cancel_run` settles it: the paused owner of a crashed cancel is not settled by anything else in 0.8. A workflow's paused root can therefore look "waiting on subagents" while a cancel is pending; repeat the call.
 - `tenant_id=` scopes the call: the root must belong to that tenant or `RunNotFoundError` is raised. Even explicit `UNSCOPED` traversal stays inside the root's actual tenant, including NULL. Terminal rows retain their flags and timestamps; their active descendants are still visited.
 - Traversal is bounded by `Budget.max_subtree_nodes` (default 10,000, including the root). `cascade_truncated` logs the retained count and limit when traversal is cut. Cancel remaining subtrees explicitly or deliberately raise the bound. The outcome summary is capped at 1,000 entries; `meta["cascade_truncated"]` can also indicate summary truncation.
 - Cancelling a nested run that shares a task with its ancestors interrupts that run and its active nested descendants while allowing the ancestors to continue.
@@ -246,6 +252,10 @@ print(result.meta["cascade"])
 - Stores written for earlier releases that do not implement `get_subtree` raise `NotImplementedError` naming the missing method when `cascade=True` is used.
 
 External callers only set flags and finalize paused rows. The `run.cancelled` event of a running descendant is written by that run's own runner when it observes the flag.
+
+### Custom recorders and a cancelled pause
+
+The cancel of a paused run is a compare-and-set on its status; it does not change the run's owner epoch. A custom recorder that does a fenced write in `on_run_finished` after the run has paused can therefore land that write after the cancel. The built-in recorder never writes after a pause commits. If you write your own recorder, do no fenced write after the pause is saved, or accept that it may land on a cancelled run.
 
 ## Which wins: completion or cancellation
 
