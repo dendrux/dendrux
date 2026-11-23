@@ -21,8 +21,10 @@ custom-store authors and code that reads error text must take. No schema migrati
     pause makes one pause per leaf that observes the breach.
   - **Streaming.** `stream()` and `resume_stream()` run parallel children, with child tool
     progress live. The non-terminal `SUBAGENT_PAUSED` event carries the child `run_id`,
-    `pause_id`, and `call_ids`. Read arguments through tenant-scoped `get_pending()` or
-    `get_pendings()`. This updates the 0.8 pre-release event shape and affects no 0.7 users.
+    `pause_id`, and ordered `call_ids` on `RunEvent`. These replace the pre-release
+    `RunEvent.pending` field. Read arguments during progress through tenant-scoped
+    `store.get_pending()` or `store.get_pendings()`. Terminal events carry the full
+    `run_result`. This change affects no 0.7 users.
     Events pass through one bounded queue. A held approval batch can be resumed on a
     stream, and `resume_stream(root, expected_pause_id=)` answers any paused child.
   - **Recovery.** `reclaim(root)` reconnects every branch without rerunning finished children.

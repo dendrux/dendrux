@@ -162,7 +162,6 @@ class _ManagedPendingPause(PendingPause):
     _wire_display: dict[str, Any] | None = field(
         default=None, kw_only=True, repr=False, compare=False
     )
-    _parallel: bool = field(default=False, kw_only=True, repr=False, compare=False)
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, PendingPause):
@@ -175,7 +174,6 @@ class _ManagedPendingPause(PendingPause):
         leaf: ManagedHop,
         path: list[str],
         *,
-        parallel: bool,
         mapping: dict[str, str] | None,
     ) -> _ManagedPendingPause:
         pause = replace(
@@ -184,7 +182,6 @@ class _ManagedPendingPause(PendingPause):
             agent_name=leaf.agent_name,
             agent_path=path,
             origin_run_id=leaf.run_id,
-            _parallel=parallel,
         )
         if mapping and pause.kind != "client_tool":
             # Keep the safe display, without attaching the child's audit mapping to a public read.
@@ -762,7 +759,6 @@ class _PendingReader:
                     run_id,
                     leaf,
                     workflow.agent_path(path),
-                    parallel=len(workflow.leaves) > 1,
                     mapping=mapping,
                 )
             )

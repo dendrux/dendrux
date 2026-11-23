@@ -603,7 +603,25 @@ async def test_approval_batch_checks_each_leaf_generation(store, monkeypatch, tr
         assert first.tool_calls[0].args_hidden and first.tool_calls[0].params is None
 
 
-async def test_batched_legacy_pause_json_keeps_client_arguments(store, engine):
+async def test_approval_batch_scopes_the_evidence_query(store):
+    from dendrux.runtime._managed_pending import leaf_approval_params
+
+    children = [approver("first"), approver("second")]
+    root = root_agent(store, *children)
+    fan = await fan_out(store, root, await start_root(store, root), children)
+    generations = {
+        child: await store.get_active_pause_sequence(child, tenant_id=TENANT)
+        for child in fan.children
+    }
+    expected = {
+        child: {fan.results[child].pending.tool_calls[0].id: {"text": agent.name}}
+        for child, agent in zip(fan.children, children, strict=True)
+    }
+    assert await leaf_approval_params(store, generations, TENANT) == expected
+    assert await leaf_approval_params(store, generations, OTHER_TENANT) == {}
+
+
+async def test_batched_legacy_pause_json_keeps_client_arguments(store, engine, caplog):
     from dendrux.runtime._managed_pending import leaf_summaries
     from tests.integration.test_050_pending_reads import _poison_pause_data
 
@@ -611,11 +629,67 @@ async def test_batched_legacy_pause_json_keeps_client_arguments(store, engine):
     root = root_agent(store, *children)
     root_id = await start_root(store, root)
     fan = await fan_out(store, root, root_id, children)
-    await _poison_pause_data(engine, fan.child(0), r"\u0000")
+    await _poison_pause_data(engine, fan.child(1), r"\u0000")
     summaries = await leaf_summaries(store, fan.children, TENANT)
     params = [summaries[i].pause["pending_tool_calls"][0]["params"] for i in fan.children]
-    assert params == [{"sheet": "S\x001"}, {"sheet": "S1"}]
+    assert params == [{"sheet": "S1"}, {"sheet": "S\x001"}]
     assert await leaf_summaries(store, fan.children, OTHER_TENANT) == {}
+    logged = [
+        r.run_id for r in caplog.records if getattr(r, "code", None) == "pause_data_not_jsonb"
+    ]
+    assert logged == ([fan.child(1)] if engine.dialect.name == "postgresql" else [])
+
+
+@pytest.mark.parametrize("engine", ["sqlite_file", "postgres"], indirect=True)
+async def test_nested_run_wire_readdresses_redacted_pause(store, monkeypatch):
+    from dendrux.runtime import _managed
+
+    reviewer, other = approver("reviewer"), approver("other")
+    middle = Agent(
+        name="middle",
+        description="Delegate two reviews.",
+        prompt="p",
+        provider=ScriptedLLM(
+            [LLMResponse(tool_calls=[ToolCall(c.name, {"task": "go"}) for c in (reviewer, other)])]
+        ),
+        subagents=[reviewer, other],
+    )
+    root = root_agent(store, middle, responses=[call("middle", {"task": "go"}, "outer")])
+    placeholder = "<<NAME_1>>"
+    bind = store.bind_managed_children
+
+    async def bind_with_leaf_mapping(request):
+        first, second = request.children
+        first = replace(first, child_pii_mapping={placeholder: reviewer.name})
+        return await bind(replace(request, children=(first, second)))
+
+    prepare = _managed_fanout.prepare_handoff
+
+    async def finish_fanout_before_claim_check(claimed, run_id, *args):
+        handoff = await prepare(claimed, run_id, *args)
+        await _managed_fanout.drive_fanout(handoff.meta[_managed.DESCEND_KEY])
+        # The middle run is now parked. Its old owner reads that subtree's result
+        # on fencing, and the waiting outer run must re-address it to the root.
+        await claimed.get_run_control(run_id)
+        pytest.fail("expected the parked middle run to fence its old owner")
+
+    monkeypatch.setattr(_managed_fanout, "prepare_handoff", finish_fanout_before_claim_check)
+    monkeypatch.setattr(store, "bind_managed_children", bind_with_leaf_mapping)
+    try:
+        result = await root.run("go", tenant_id=TENANT)
+        wire = result.to_dict()
+        first, second = wire["pendings"]
+        assert result.pending.tool_calls[0].params == {"text": reviewer.name}
+        assert first == wire["pending"]
+        assert first["run_id"] == second["run_id"] == result.run_id
+        assert first["origin_run_id"] == result.pending.origin_run_id != result.run_id
+        assert first["agent_path"] == ["lead", "middle", placeholder]
+        assert first["agent_name"] == placeholder
+        assert first["pending_tool_calls"][0]["params"] == {"text": placeholder}
+        assert second["agent_path"] == ["lead", "middle", "other"]
+    finally:
+        for agent in (root, middle, reviewer, other):
+            await agent.close()
 
 
 async def test_root_wire_uses_each_childs_own_mapping(store: Any) -> None:

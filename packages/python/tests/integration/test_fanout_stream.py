@@ -651,7 +651,7 @@ async def test_a5_subagent_paused_while_a_sibling_runs_then_resume_stream(store,
 
 
 @pytest.mark.parametrize("entry", ["stream", "resume_stream"])
-async def test_parallel_pause_events_only_carry_identities(store, entry, monkeypatch):
+async def test_parallel_pause_progress_ids_and_terminal_result(store, entry, monkeypatch):
     from dendrux.store import RunStore
 
     sentinel = "stream-sentinel@example.test"
@@ -701,7 +701,14 @@ async def test_parallel_pause_events_only_carry_identities(store, entry, monkeyp
             sentinel,
             mapping_only,
         }
-        for event in events:
+        terminal = events[-1]
+        assert terminal.type == RunEventType.RUN_PAUSED
+        fetched = await root.get_result(terminal.run_id, tenant_id=TENANT)
+        assert terminal.run_result.pendings == fetched.pendings
+        assert terminal.run_result.to_dict() == fetched.to_dict()
+        call = terminal.run_result.pending.tool_calls[0]
+        assert (call.name, call.params) == ("read", {"text": sentinel})
+        for event in events[:-1]:
             payload = repr(asdict(event))
             assert sentinel not in payload and mapping_only not in payload
         (signal,) = [e for e in events if e.type == RunEventType.SUBAGENT_PAUSED]

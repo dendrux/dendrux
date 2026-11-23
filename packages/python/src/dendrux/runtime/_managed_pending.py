@@ -425,8 +425,21 @@ async def leaf_summaries(store: Any, ids: list[str], tenant: str | None) -> dict
     except DBAPIError as exc:
         if not store.json_conversion_error(exc):
             raise
-    _codes.log_code(logging.getLogger(__name__), _codes.PAUSE_DATA_NOT_JSONB, run_id=ids[0])
-    return await read_pause_summaries(store, ids, tenant, whole=True)
+    return await _recover_leaf_summaries(store, ids, tenant)
+
+
+async def _recover_leaf_summaries(
+    store: Any, ids: list[str], tenant: str | None
+) -> dict[str, PauseSummary]:
+    """Isolate the rows PostgreSQL rejected so the diagnostic names each affected run."""
+    if len(ids) == 1:
+        _codes.log_code(logging.getLogger(__name__), _codes.PAUSE_DATA_NOT_JSONB, run_id=ids[0])
+        return await read_pause_summaries(store, ids, tenant, whole=True)
+    # Healthy groups still use the bounded projection. Only failed groups split again.
+    middle = len(ids) // 2
+    summaries: dict[str, PauseSummary] = await leaf_summaries(store, ids[:middle], tenant)
+    summaries.update(await leaf_summaries(store, ids[middle:], tenant))
+    return summaries
 
 
 def _active_generation(seq: Any, *inputs: Any) -> Any:
