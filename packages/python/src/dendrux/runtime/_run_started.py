@@ -7,11 +7,11 @@ from inspect import isawaitable
 from typing import TYPE_CHECKING, cast
 
 from dendrux import _codes
-from dendrux._lifecycle import CancelReason, StoredEventType
+from dendrux._lifecycle import CancelReason
 from dendrux.errors import OnStartedError, RunFencedError
 from dendrux.runtime._run_errors import logger
-from dendrux.runtime._run_events import _transition_with_event
 from dendrux.runtime._run_outcome import _finalize_loop_cancelled
+from dendrux.runtime._run_start import _persist_run_failure
 from dendrux.runtime.context import DelegationContext, get_store_identity, set_delegation_context
 from dendrux.types import RunResult, RunStatus
 
@@ -107,15 +107,14 @@ async def _fail_started(
     safe = OnStartedError(run_id)
     # The outer error handler must not replace or repeat this atomic transition.
     lifecycle.failure_write_started = True
-    won = await _transition_with_event(
+    won = await _persist_run_failure(
         store,
         run_id,
-        status=RunStatus.ERROR.value,
-        allowed_current_statuses=[RunStatus.RUNNING.value],
-        error=safe.safe_message,
-        failure_reason=safe.code,
-        event_type=StoredEventType.RUN_ERROR.value,
-        event_data={"error": safe.safe_message, "code": safe.code},
+        None,
+        payload={"error": safe.safe_message, "code": safe.code},
+        finalize={"error": safe.safe_message},
+        optional_failure_reason=safe.code,
+        strict=True,
     )
     if not won:
         if await _cancel_requested(store, run_id):

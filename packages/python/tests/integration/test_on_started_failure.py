@@ -351,11 +351,13 @@ async def test_failure_logs_registered_callback_code(store, caplog):
     )
 
 
-@pytest.mark.parametrize("atomic", [True, False], ids=["atomic", "cas-and-event"])
-async def test_callback_failure_on_older_store(store, monkeypatch, atomic):
+@pytest.mark.parametrize(
+    "writer", ["finalize_with_event", "finalize_run_if_status_in", "finalize_run"]
+)
+async def test_callback_failure_on_older_store(store, monkeypatch, writer):
     agent, provider = make_agent(store)
     writes = []
-    final = store.finalize_with_event if atomic else store.finalize_run_if_status_in
+    final = getattr(store, writer)
 
     async def legacy_atomic(
         run_id, *, status, allowed_current_statuses, error, claim_epoch, event_type, event_data
@@ -381,9 +383,24 @@ async def test_callback_failure_on_older_store(store, monkeypatch, atomic):
             claim_epoch=claim_epoch,
         )
 
-    monkeypatch.setattr(store, "finalize_with_event", legacy_atomic if atomic else None)
-    if not atomic:
+    async def legacy_finalize(run_id, *, status, expected_current_status, error, claim_epoch):
+        writes.append((run_id, status, [expected_current_status], claim_epoch))
+        return await final(
+            run_id,
+            status=status,
+            expected_current_status=expected_current_status,
+            error=error,
+            claim_epoch=claim_epoch,
+        )
+
+    monkeypatch.setattr(
+        store, "finalize_with_event", legacy_atomic if writer == "finalize_with_event" else None
+    )
+    if writer == "finalize_run_if_status_in":
         monkeypatch.setattr(store, "finalize_run_if_status_in", legacy_cas)
+    elif writer == "finalize_run":
+        monkeypatch.setattr(store, "finalize_run_if_status_in", None)
+        monkeypatch.setattr(store, "finalize_run", legacy_finalize)
     original = ValueError("private")
 
     def fail(run_id):
