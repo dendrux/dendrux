@@ -58,6 +58,7 @@ from dendrux.types import (
     PauseState,
     RunEventType,
     RunStatus,
+    RunStream,
     _usage_from_dict,
 )
 
@@ -77,7 +78,6 @@ if TYPE_CHECKING:
         ContentPart,
         RunEvent,
         RunResult,
-        RunStream,
         ToolResult,
     )
 
@@ -500,7 +500,8 @@ def resume_stream(
 ) -> RunStream:
     """Stream a resumed run as RunEvents, returning a RunStream.
 
-    Store resolution, pause loading, claiming and history setup run on first iteration.
+    Synchronous — returns immediately. All async setup (store resolution,
+    pause state load, claim, history build) runs lazily on first iteration.
 
     ``_claimed`` (internal, 0.7): continue a run this caller already owns
     (a managed parent claimed for adoption) from its checkpoint, exactly as
@@ -517,7 +518,6 @@ def resume_stream(
     ``__anext__`` and leaves the run waiting.
     """
     from dendrux.types import RunEvent, RunResult
-    from dendrux.types import RunStream as _RunStream
 
     input_items: tuple[Any, ...] = ()
     if user_input is not None:
@@ -784,7 +784,7 @@ def resume_stream(
             )
         return None
 
-    return _RunStream(
+    return RunStream(
         run_id=run_id,
         generator=stream_context.wrap(_generate()),
         cleanup=lambda: _run_events._shielded_cleanup(_cleanup, run_id=run_id),

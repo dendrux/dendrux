@@ -65,7 +65,7 @@ class _When:
             safe_id = (
                 run_id if isinstance(run_id, str) and _ULID_PATTERN.fullmatch(run_id) else None
             )
-            _codes.log_code(logger, _codes.UNKNOWN, run_id=safe_id, retryable=False)
+            _codes.log_code(logger, _codes.FAKE_MODEL_PREDICATE_ERROR, run_id=safe_id)
         # Raise outside the handler so callback text is absent even from __context__.
         raise FakeModelScriptError("FakeModel when() predicate raised", code="predicate_error")
 

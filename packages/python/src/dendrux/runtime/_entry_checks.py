@@ -48,6 +48,7 @@ RunnerEntryPoint: TypeAlias = Literal["run", "stream", "retry"]
 _NEW_RUN_ENTRIES = frozenset({"run", "stream", "retry"})
 
 _T = TypeVar("_T", bound="TenantScope")
+_CallbackT = TypeVar("_CallbackT")
 _P = ParamSpec("_P")
 
 
@@ -96,10 +97,11 @@ def runner_entry_checks(
     check_runner_budget(agent, fields.get("provider"), fields.get("provider_kwargs"))
 
 
-def check_on_started(value: object) -> None:
-    """Validate the start callback before run or retry performs any I/O."""
+def check_on_started(value: _CallbackT) -> _CallbackT:
+    """Validate and return the start callback before run or retry performs any I/O."""
     if value is not None and not callable(value):
         raise ValueError("on_started must be callable or None")
+    return value
 
 
 def reject_stream_on_started(entry: Callable[_P, RunStream]) -> Callable[_P, RunStream]:

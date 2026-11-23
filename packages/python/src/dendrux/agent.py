@@ -1512,24 +1512,24 @@ class Agent:
         _validate_max_delegation_depth(max_delegation_depth)
         provider = self._require_provider()
 
-        resolved_output_type = (
-            self._output_type if isinstance(output_type, _UnsetType) else output_type
-        )
+        # Resolve output_type: run-level overrides agent default
+        if isinstance(output_type, _UnsetType):
+            output_type = self._output_type
 
-        if resolved_output_type is not None:
+        # Validate output_type + loop compatibility at call time
+        if output_type is not None:
             from dendrux.loops.single import SingleCall
 
-            effective_loop = self._loop
-            if effective_loop is None:
+            if self._loop is None:
                 # Runner will default to ReActLoop — that's not SingleCall
                 raise ValueError(
-                    f"output_type={resolved_output_type.__name__} requires SingleCall loop. "
+                    f"output_type={output_type.__name__} requires SingleCall loop. "
                     f"Set loop=SingleCall() on the Agent or remove output_type."
                 )
-            if not isinstance(effective_loop, SingleCall):
+            if not isinstance(self._loop, SingleCall):
                 raise ValueError(
-                    f"output_type={resolved_output_type.__name__} is only supported with "
-                    f"SingleCall loop, not {type(effective_loop).__name__}."
+                    f"output_type={output_type.__name__} is only supported with "
+                    f"SingleCall loop, not {type(self._loop).__name__}."
                 )
 
         store = await self._resolve_state_store()
@@ -1557,7 +1557,7 @@ class Agent:
             extra_notifier=notifier,
             on_started=on_started,
             idempotency_key=idempotency_key,
-            output_type=resolved_output_type,
+            output_type=output_type,
             **kwargs,
         )
 
@@ -1599,8 +1599,7 @@ class Agent:
             dendrux.errors.OnStartedError: If the start callback fails the retry run.
         """
         check_on_started(on_started)
-        requested_tenant_id = tenant_id
-        tenant_id = entry_checks(
+        resolved_tenant_id = entry_checks(
             self,
             "retry",
             tenant_id,
@@ -1620,7 +1619,7 @@ class Agent:
                 "retry() requires persistence (database_url or state_store). "
                 "Retry reads traces from the original run."
             )
-        await _check_retry_source(store, run_id, tenant_id)
+        await _check_retry_source(store, run_id, resolved_tenant_id)
 
         from dendrux.runtime.runner import retry as runner_retry
 
@@ -1629,7 +1628,7 @@ class Agent:
             agent=self,
             provider=provider,
             state_store=store,
-            tenant_id=requested_tenant_id,
+            tenant_id=tenant_id,
             metadata=metadata,
             extra_notifier=notifier,
             on_started=on_started,

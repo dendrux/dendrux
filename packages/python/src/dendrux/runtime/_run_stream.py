@@ -80,8 +80,11 @@ from dendrux.skills._session import SkillSession
 from dendrux.types import (
     IdempotencyConflictError,
     RunAlreadyActiveError,
+    RunEvent,
     RunEventType,
+    RunResult,
     RunStatus,
+    RunStream,
 )
 
 if TYPE_CHECKING:
@@ -103,15 +106,10 @@ if TYPE_CHECKING:
         ContentPart,
         CreateRunResult,
         Limits,
-        RunEvent,
-        RunResult,
-        RunStream,
     )
 
 
 def _cached_stream_event(cached: RunResult, run_id: str) -> RunEvent:
-    from dendrux.types import RunEvent
-
     event_type = {
         RunStatus.ERROR: RunEventType.RUN_ERROR,
         RunStatus.CANCELLED: RunEventType.RUN_CANCELLED,
@@ -297,7 +295,10 @@ def run_stream(
     raises to the managed driver instead of yielding ``RUN_ERROR``.
     """
     invocation = _managed_invocation
-    # Validate the depth now. Parent context and clamping are resolved on iteration.
+    # Validate depth early — synchronous, before generator starts.
+    # Full resolution (parent context, clamping) happens inside _generate()
+    # because parent_ctx requires async state_store resolution first.
+    # But validation of the raw input can fail fast here.
     requested_tenant_id = tenant_id
     tenant_explicit = _tenant_scope_chosen(tenant_id)
     tenant_id = resolve_runner_tenant(agent, "stream", tenant_id, state_store=state_store)
@@ -310,9 +311,6 @@ def run_stream(
             f"max_delegation_depth must be a non-negative integer or None, "
             f"got {max_delegation_depth!r}"
         )
-
-    from dendrux.types import RunEvent, RunResult
-    from dendrux.types import RunStream as _RunStream
 
     # Validate input + chat history synchronously so TypeError / ValueError
     # surfaces to the caller immediately, not as a RUN_ERROR event. Image
@@ -771,7 +769,7 @@ def run_stream(
             return cancelled_result
         return None
 
-    stream = _RunStream(
+    stream = RunStream(
         run_id=run_id,
         generator=stream_context.wrap(_generate()),
         cleanup=lambda: _run_events._shielded_cleanup(_cleanup, run_id=run_id),

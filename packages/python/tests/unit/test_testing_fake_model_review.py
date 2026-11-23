@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import logging
 
 import pytest
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -133,7 +134,8 @@ async def test_predicate_exception_after_same_slot_succeeds(caplog, run_id):
     assert caught.value.code == "predicate_error"
     assert "SENTINEL-PREDICATE-73" not in _texts(caught.value) + caplog.text
     (record,) = [r for r in caplog.records if r.name == "dendrux.testing.fake_model"]
-    assert record.code == "unknown" and record.kind == "provider"
+    assert record.code == "fake_model_predicate_error" and record.kind == "testing"
+    assert not hasattr(record, "retryable")
     assert getattr(record, "run_id", None) == (None if run_id.startswith("SENTINEL") else run_id)
     assert "SENTINEL" not in repr(record.__dict__)
     assert fake.script_errors() == [("a", 0, "predicate_error")]
@@ -208,6 +210,7 @@ async def test_fanout_missing_when_branch_fails_all_used(tmp_path, streaming):
 
 
 async def test_fanout_predicate_exception_after_same_slot_succeeds(tmp_path, caplog):
+    caplog.set_level(logging.DEBUG)
     fake = FakeModel(
         {
             "parent": [

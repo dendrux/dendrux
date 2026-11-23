@@ -398,7 +398,8 @@ async def retry(
             run was SingleCall, or if no traces exist.
     """
     check_on_started(on_started)
-    # Missing and foreign-tenant sources both raise RunNotFoundError.
+    # 1. Validate source run is terminal. A missing run and another tenant's
+    # run raise the same RunNotFoundError (B13), so retry is no existence oracle.
     tenant_explicit = _tenant_scope_chosen(tenant_id)
     tenant_id = resolve_runner_tenant(agent, "retry", tenant_id, state_store=state_store)
     await ensure_agent_limits_fit(agent, state_store)
@@ -476,8 +477,6 @@ async def retry(
             run_id, state_store, getattr(agent, "_task_manager", None)
         )
 
-        seed_kwargs: dict[str, Any] = {}
-        run_guardrails = None
         try:
             try:
                 seed_kwargs, run_guardrails = await _run_entry._runtime_seeds(
