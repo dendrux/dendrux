@@ -210,3 +210,141 @@ async def test_close_budget_expiry_with_timeout_cleanup_is_an_ordinary_close_tim
     bus = _CleanupTimesOutBus(close_timeout_s=0.1)
     await bus.close()
     assert bus._state == "closed"
+
+
+class _FailingSendBus(live.LiveUpdates):
+    def __init__(self, error=None, **limits):
+        super().__init__(**limits)
+        self.error = error or ConnectionError("send failed")
+
+    async def send(self, messages):
+        raise self.error
+
+    async def receive(self):
+        yield None
+        await asyncio.Future()
+
+
+async def _handle_one_cancel_and_keep_the_count() -> None:
+    """The task handles a cancel without uncancel(), as ordinary code does."""
+    task = asyncio.current_task()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.sleep(1)
+    assert task.cancelling() == 1
+
+
+async def test_handled_cancel_does_not_turn_a_send_failure_into_a_cancel():
+    bus = _FailingSendBus()
+    await _handle_one_cancel_and_keep_the_count()
+    bus.enqueue(["r"])
+    await bus.flush()  # an ordinary failure: counted, never a CancelledError
+    assert bus.stats().dropped_failed == 1
+
+
+async def test_handled_cancel_does_not_turn_a_module_timeout_into_a_cancel():
+    bus = _CleanupReplacesCancelBus(send_timeout_s=0.1, flush_deadline_s=5)
+    await _handle_one_cancel_and_keep_the_count()
+    bus.enqueue(["r"])
+    await bus.flush()
+    assert bus.stats().dropped_failed == 1
+    closing = _CleanupTimesOutBus(close_timeout_s=0.1)
+    await closing.close()
+    assert closing._state == "closed"
+
+
+async def test_a_new_cancel_after_a_handled_one_is_still_a_cancel():
+    async def flush_after_a_handled_cancel(bus):
+        await _handle_one_cancel_and_keep_the_count()
+        bus.enqueue(["r"])
+        await bus.flush()
+
+    bus = _CleanupReplacesCancelBus(send_timeout_s=5, flush_deadline_s=5)
+    await _cancel_after_it_starts(flush_after_a_handled_cancel(bus))
+
+    async def close_after_a_handled_cancel(bus):
+        await _handle_one_cancel_and_keep_the_count()
+        await bus.close()
+
+    await _cancel_after_it_starts(
+        close_after_a_handled_cancel(_CleanupReplacesCancelBus(close_timeout_s=5))
+    )
+
+
+async def test_failed_flush_after_a_committed_bind_does_not_cancel_the_bound_work():
+    from types import SimpleNamespace
+
+    from dendrux.runtime import durability
+
+    store = SimpleNamespace(live_updates=_FailingSendBus())
+    store.live_updates.enqueue(["r"])
+    cancelled: list[object] = []
+
+    async def operation():
+        durability._mark_commit_issued()
+        return "bound"
+
+    async def cleanup(result):
+        cancelled.append(result)
+
+    await _handle_one_cancel_and_keep_the_count()
+    result = await durability._ownership_handoff(store, operation, cleanup, run_id="run")
+    assert result == "bound"
+    assert cancelled == []
+
+
+class _HangingBus(live.LiveUpdates):
+    """send and aclose_sender hang; cleanup either lets the cancel through or replaces it."""
+
+    def __init__(self, replace_with=None, **limits):
+        super().__init__(**limits)
+        self.replace_with = replace_with
+
+    async def _hang(self):
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError as error:
+            if self.replace_with is None:
+                raise
+            raise self.replace_with("cleanup failed") from error
+
+    async def send(self, messages):
+        await self._hang()
+
+    async def aclose_sender(self):
+        await self._hang()
+
+    async def receive(self):
+        yield None
+        await asyncio.Future()
+
+
+@pytest.mark.parametrize("replace_with", [None, ConnectionError, TimeoutError])
+@pytest.mark.parametrize("operation", ["flush", "close"])
+async def test_a_cancel_pending_at_entry_is_not_consumed(operation, replace_with):
+    bus = _HangingBus(replace_with, send_timeout_s=30, flush_deadline_s=30, close_timeout_s=30)
+
+    async def cancelled_then_straight_into_the_bus():
+        asyncio.current_task().cancel("caller gave up")
+        if operation == "flush":
+            bus.enqueue(["r"])
+            await bus.flush()
+        else:
+            await bus.close()
+        return "carried on"
+
+    task = asyncio.create_task(cancelled_then_straight_into_the_bus())
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert task.cancelled()
+
+
+async def test_a_cancel_during_send_keeps_its_original_message():
+    bus = _HangingBus(send_timeout_s=30, flush_deadline_s=30)
+    bus.enqueue(["r"])
+    task = asyncio.create_task(bus.flush())
+    await asyncio.sleep(0.05)
+    task.cancel("caller gave up")
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await task
+    assert caught.value.args == ("caller gave up",)
