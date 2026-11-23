@@ -266,12 +266,12 @@ def test_documentary_returns_never_preapprove_future_return_changes() -> None:
 
 def test_documentary_inventory_does_not_hide_stale_active_entries() -> None:
     entries = ab.load_allowlist(COMMITTED_ALLOWLIST)
-    assert len(ab.classify([], entries).stale) == 9
+    assert len(ab.classify([], entries).stale) == 10
 
 
 def test_changes_reference_release_migration_rows() -> None:
     entries = ab.load_allowlist(COMMITTED_ALLOWLIST)
-    assert all(e.b_item.startswith(("0.6:", "0.7:")) for e in entries)
+    assert all(e.b_item.startswith(("0.6:", "0.7:", "0.8:")) for e in entries)
 
 
 @pytest.mark.parametrize(

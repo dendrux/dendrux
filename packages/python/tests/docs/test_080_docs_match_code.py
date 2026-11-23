@@ -32,7 +32,7 @@ def test_documented_public_names_exist() -> None:
     assert callable(dendrux.cancel_run)
     assert "on_started" in inspect.signature(dendrux.Agent.run).parameters
     assert "on_started" in inspect.signature(dendrux.Agent.retry).parameters
-    assert errors.OnStartedError.__mro__[1] is RuntimeError
+    assert issubclass(errors.OnStartedError, RuntimeError)
     assert not issubclass(errors.OnStartedError, errors.RunControlError)
     assert "waiting_for" in RunSummary.__dataclass_fields__
     assert "waiting_for" in RunDetail.__dataclass_fields__
