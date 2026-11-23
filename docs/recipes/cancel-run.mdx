@@ -56,6 +56,35 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
+## Cancel a run without an Agent
+
+An admin route, a CLI or a job runner often needs to stop a run but has no `Agent` built, and building one means loading its tools, subagents and provider keys. Use `dendrux.cancel_run`. It needs only the database.
+
+[//]: # "docs-test: skip - fragment: relies on `store` and `current_tenant`, defined by setup shown elsewhere"
+
+```python
+import dendrux
+
+result = await dendrux.cancel_run(
+    run_id,
+    tenant_id=current_tenant,   # required; None for an untenanted run; UNSCOPED is refused
+    state_store=store,          # or database_url="postgresql+asyncpg://..."
+)
+if result.status.value == "cancelled":
+    ...  # the run was paused and is now cancelled
+elif result.meta.get("cancel_requested"):
+    ...  # the run is working; it stops at its next checkpoint
+```
+
+- Pass exactly one of `state_store=` and `database_url=`. A `state_store` stays yours and is never closed. A `database_url` store is opened, checked against the schema and disposed inside the call, which costs an engine per call: for a route that cancels often, create one store at startup and pass it.
+- The operation is the one `Agent.cancel_run` performs: a paused run is cancelled at once; a running run gets a durable request and stops at its next checkpoint, in whichever process owns it; a finished run is left as it is. Subagents of a managed workflow are always included, deepest first and the root last. `cascade=True` (the default here) also includes legacy delegated descendants. The result has the same shape as `Agent.cancel_run`, including `meta["cascade"]`.
+- `max_nodes=` bounds the traversal (default 10,000, the root included). When `meta["cascade_truncated"]` is true, call again with a larger `max_nodes`; there is no cursor, so the same bound visits the same runs.
+- A managed subagent id is refused with `ManagedChildControlError`: cancel its root.
+- It has no task registry. A run working in another process, or in this one, is not interrupted mid-call; it stops at its next checkpoint, after the in-flight model or tool call finishes. For the faster same-process stop, call `Agent.cancel_run` on the instance that runs it.
+- It returns a receipt, like the Agent method. Confirm with the `run.cancelled` event or `RunStore.get_run`.
+
+> **Repeat a cascade that failed.** If a cascade stops partway with an error, or you cancelled a workflow whose owner process died, call `cancel_run` again. Running runs still stop at their checkpoints, but a run that is paused stays paused, with its cancel request set, until a later `cancel_run` settles it. Dendrux starts no background process to do this.
+
 ## What happens, by state
 
 `cancel_run` looks at the run's current persisted status and picks one of four paths.
@@ -223,4 +252,4 @@ Traversal stays inside the root's actual tenant, including untenanted runs, even
 ## Where this fits
 
 - Architecture: [Cancellation](/docs/architecture/cancellation), [Pause and resume](/docs/architecture/pause-resume), [Event ordering](/docs/architecture/event-ordering).
-- Reference: [HTTP API surface](/docs/reference/http-api) (`cancel_run` semantics and the cancel write route).
+- Reference: [`dendrux.cancel_run`](/docs/reference/agent#cancel_run), [HTTP API surface](/docs/reference/http-api) (`cancel_run` semantics and the cancel write route).

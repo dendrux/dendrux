@@ -223,8 +223,11 @@ async def test_callback_error_observes_cancel_at_control_read(
 @pytest.mark.parametrize("outcome", ["return", "raise"])
 @pytest.mark.parametrize("policy", ["error", "reclaim"])
 async def test_stale_callback_yields_to_postgres_winner(
-    store, engine, entry, outcome, policy, caplog
+    store, engine, entry, outcome, policy, caplog, callback_spans
 ):
+    sentinel = f"callback-private-{uuid4().hex}"
+    otel, exporter = callback_spans
+    caplog.set_level(logging.DEBUG)
     source = await retry_source(store, entry)
     effects = []
 
@@ -246,9 +249,9 @@ async def test_stale_callback_yields_to_postgres_winner(
         entered.set()
         await release.wait()
         if outcome == "raise":
-            raise ValueError("stale callback")
+            raise ValueError(sentinel)
 
-    task = asyncio.create_task(invoke(agent, source, callback))
+    task = asyncio.create_task(invoke(agent, source, callback, notifier=otel))
     try:
         await wait_for_gate(entered, task=task)
         (run_id,) = ids
@@ -286,6 +289,7 @@ async def test_stale_callback_yields_to_postgres_winner(
     assert await store.get_run(run_id) == winner
     assert await store.get_run_events(run_id) == winner_events
     assert run_id not in agent._task_manager._owned
+    assert_safe_sinks(sentinel, caplog, exporter, result, str(result), winner, winner_events)
     if outcome == "raise":
         assert_callback_log(caplog, run_id)
     assert any(

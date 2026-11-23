@@ -2317,8 +2317,8 @@ class StructuredOutputValidationError(RuntimeError):
 
     ``raw_response`` holds the rejected text for in-memory debugging only: it is
     never part of ``str(error)``, so it cannot reach a persisted run error,
-    event or log. ``validation_error`` lists error kinds and field locations,
-    never the rejected values.
+    event or log. ``validation_error`` is an error count and allowlisted error
+    kinds; field locations and rejected values are omitted.
     ``usage``, ``model`` and ``stop_reason`` describe the LLM call that
     produced the invalid response (``None`` when unknown), so its tokens and
     cost are not lost: the call was made and billed even though its output was

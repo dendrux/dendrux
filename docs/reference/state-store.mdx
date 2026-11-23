@@ -30,7 +30,7 @@ Construct a store once per worker event loop and pass it as `Agent(state_store=s
 
 ## Capability matrix
 
-A custom store declares a class attribute `capabilities: StoreCapabilities`. This frozen dataclass has `version=1`, six flags that default to `False`, and a `deployment` field that defaults to `None`. Method names alone never enable a capability.
+A custom store declares a class attribute `capabilities: StoreCapabilities`. This frozen dataclass has `version=1`, eight flags that default to `False`, and a `deployment` field that defaults to `None`. Method names alone never enable a capability.
 
 | Capability | Promise | Required methods and keyword parameters |
 | --- | --- | --- |
@@ -40,6 +40,8 @@ A custom store declares a class attribute `capabilities: StoreCapabilities`. Thi
 | `atomic_completion` | Tool intent and completion are durable; completion includes observation and event; finalization includes the final trace | `start_tool_call`, `complete_tool_call`, `finalize_with_event(trace=)` |
 | `recovery` | Bounded lease marking and atomic reclaim | `mark_lease_expired(finalise_unrecoverable=)`, `get_lease_expired`, `reclaim_run`, `get_replayed_tool_calls`; see [Recovery contract](#recovery-contract) |
 | `managed_subagents` | Bind one child atomically while parking its parent, and read the cancel frontier; requires all five durability flags above | `bind_managed_child(request)`, `get_managed_cancel_children_page`, `is_managed_root_stopped`, `get_managed_run_control`; see [Managed subagent stores](#managed-subagent-stores) |
+| `managed_fanout` | Bind two to 32 children at once while parking their parent (0.8). Requires `managed_subagents`. Without it the effective `max_parallel_subagents` is 1 | `bind_managed_children`, `get_managed_children(…, tenant_id=)`; certified by the store kit |
+| `waiting_filter` | Report `waiting_for` and leave out runs that only wait on subagents (0.8). Without it `include_waiting=False` raises `StoreCapabilityError` | `list_runs` and `count_runs` accept `include_waiting`; `get_waiting_for(run_id, *, tenant_id)` |
 
 `deployment` is descriptive, not a feature switch: it says how many processes may share the store's data. It is one of:
 
@@ -53,7 +55,7 @@ A store with an explicit capability declaration but no `deployment` still runs, 
 
 The table lists the added requirements, not full method signatures. Implement the protocol in `dendrux.runtime.state`; do not copy a shortened table entry as a method definition. Signature validation requires the named keyword-only parameters. A forwarding subclass override should preserve those named parameters and pass them through; do not rely on a bare `**kwargs` declaration satisfying validation.
 
-The built-in `SQLiteStateStore`, `PostgresStateStore` and `MySQLStateStore` declare all six capabilities through `SQLStateStore`. Live updates are not a capability; see below.
+The built-in `SQLiteStateStore`, `PostgresStateStore` and `MySQLStateStore` declare all eight capabilities through `SQLStateStore`. Live updates are not a capability; see below.
 
 ### Recovery contract
 

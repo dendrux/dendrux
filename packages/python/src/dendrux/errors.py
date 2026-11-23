@@ -23,10 +23,11 @@ Suggested HTTP mappings:
          ImagePersistenceUnsupportedError, BudgetConfigurationError (configuration),
          TenantScopeRequiredError (pass tenant_id), SubagentConfigurationError (at Agent build),
          SqliteSchemaSyncError (legacy SQLite file needs migration),
-         SchemaOutOfDateError (run `dendrux db migrate`)
-    502: ProviderError (including ProviderAuthError, ProviderUnavailableError and
-         ProviderStreamIncompleteError)
-    503: ProviderRateLimitError (``retry_after``), BlobContentionError (transient, safe to retry)
+         SchemaOutOfDateError (run `dendrux db migrate`),
+         OnStartedError (the on_started callback failed)
+    502: ProviderError (including ProviderAuthError and ProviderStreamIncompleteError)
+    503: ProviderRateLimitError (``retry_after``), ProviderUnavailableError,
+         BlobContentionError (transient, safe to retry)
     504: ProviderTimeoutError
 
 Image errors never carry image bytes, base64, data URLs, file paths or URL
