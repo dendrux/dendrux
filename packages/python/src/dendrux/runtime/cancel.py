@@ -42,7 +42,8 @@ async def cancel_run(
     Args:
         run_id: The run to cancel. A managed subagent run is refused; cancel its root.
         tenant_id: Required. The run's tenant, or ``None`` for an untenanted run. The
-            cascade stays inside this tenant. ``UNSCOPED`` is refused.
+            cascade stays inside this tenant, which is checked when the call starts
+            (write-time scoping comes in a later release). ``UNSCOPED`` is refused.
         database_url: Open a temporary store for this call, then dispose it.
         state_store: Use this store. It stays owned by the caller and is never closed.
             Prefer a shared store for frequent calls, such as a server route.

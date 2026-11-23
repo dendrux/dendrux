@@ -80,7 +80,7 @@ The fix needs `aiosqlite>=0.22.1`. Dendrux now requires it (the floor was `>=0.1
 
 `RunStore.from_database_url(url).get_pending()` and `get_pendings()` on SQLite no longer raise `StoreCapabilityError` for a paused fan-out workflow. 0.7.0 is not affected.
 
-Cancelled live-update `flush()` and `close()` calls now stay cancelled: a caller that cancelled a task awaiting them is no longer resumed as if the call succeeded when the transport's cleanup raised.
+Live-update `flush()` and `close()` now handle cancellation this way. A cancellation already pending when the call starts is delivered before the transport is called. One that arrives during the send or close propagates with its reason, even if the transport's cleanup replaces it with another error. A transport's own timeout or cancelled future counts as a failed send: it no longer cancels the caller or fan-out children that have already started.
 
 ## Upgrading all workers at once
 
@@ -94,7 +94,7 @@ Upgrade like this:
 
 Paused runs simply wait and continue on 0.8. Keep Agent settings unchanged for runs that started before the upgrade, and do not edit `Limits` on an Agent that has paused runs. An Agent's governance settings, including a non-default `Limits`, are fingerprinted when a run pauses and compared on every later resume, submit or reclaim. With the default `on_governance_change="raise"`, a difference raises `GovernanceMismatchError` (`changed=("limits",)`). The default `max_parallel_subagents=4` is left out of the fingerprint, so a run paused by 0.7 continues on 0.8 with unchanged settings; setting the limit to 1 changes it.
 
-> **A mismatch is refused before anything is written.** If the Agent that continues a run has different governance settings, or different skills, from the one that paused it, every continuation (`submit_*`, `resume`, the stream variants and `reclaim`) raises `GovernanceMismatchError` (or the skill error) before any write. Nothing changes: the pending approval or input stays pending and the same token is still valid. Retry the same call with the Agent configured as it was when the run paused. On a stream, the refusal arrives as the terminal `run_error` event, as in 0.7. Stale-running `reclaim` can raise `RunNotReclaimableError(reason="governance_changed")` for the same cause.
+> **A mismatch is refused before anything is written.** What counts as a mismatch follows the governance policy you selected. With `on_governance_change="raise"` (the default), a continuation by an Agent whose governance settings differ from the saved ones raises `GovernanceMismatchError`; with `"warn"`, a changed setting such as a limit is reported but a direct approval still completes. Skills refuse only when a saved manifest entry no longer matches (changed or missing content); adding an extra skill to a direct Agent with a saved manifest still completes. When a continuation is refused (`submit_*`, `resume`, the stream variants and `reclaim`), it is refused before any write: the pending approval or input stays pending and the same token is still valid, so retry the same call with the Agent configured as it was when the run paused. On a stream, the refusal arrives as the terminal `run_error` event, as in 0.7. Stale-running `reclaim` can raise `RunNotReclaimableError(reason="governance_changed")` for the same cause.
 
 Nesting multiplies concurrency; `Limits.max_managed_runs` (default 128) stays the overall bound. Never route a workflow that has written a parallel wait back to 0.7.
 
