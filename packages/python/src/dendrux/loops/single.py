@@ -43,7 +43,6 @@ from dendrux.loops._helpers import (
 )
 from dendrux.loops._images import ImageCallSite, release_wire
 from dendrux.loops._llm_call import EventRelay, ProviderCallSite, StreamCall, stream_call_events
-from dendrux.loops._run_context import start_callback_delivered
 from dendrux.loops.base import Loop
 from dendrux.loops.react import (
     ReActLoop,
@@ -375,17 +374,33 @@ async def _single_complete(
     return response, validated_output
 
 
+async def _record_single_failure(
+    calls: ProviderCallSite, prepared: PreparedRequest, exc: Exception, started_at: float
+) -> bool:
+    """Record a provider failure and report whether it is eligible for image retry."""
+    if isinstance(exc, StructuredOutputValidationError):
+        await _record_rejected_call(
+            exc,
+            agent=calls.agent,
+            provider=calls.provider,
+            run_id=calls.run_id,
+            recorder=calls.recorder,
+            notifier=calls.notifier,
+            warnings=calls.warnings,
+            semantic_messages=prepared.semantic,
+            duration_ms=int((time.monotonic() - started_at) * 1000),
+            model=calls.pkw.get("model"),
+        )
+        return False
+    await calls.record_failure(exc, started_at, 1)
+    return bool(prepared.slots)
+
+
 async def _single_attempt(
-    pre: _SinglePrelude,
-    prepared: PreparedRequest,
-    output_type: type[BaseModel] | None,
-    control_reader: Callable[[], Awaitable[Any]],
-) -> _Attempt | None:
-    """Admit one provider call and record its outcome. None means cancelled before dispatch."""
+    pre: _SinglePrelude, prepared: PreparedRequest, output_type: type[BaseModel] | None
+) -> _Attempt:
+    """Run one admitted provider call under its lease and account for the outcome."""
     calls = pre.calls
-    if start_callback_delivered(pre.run_id) and await control_reader() is not None:
-        return None
-    await calls.started(prepared, None, 1)
     started_at = None
     try:
         with telemetry_context(
@@ -397,24 +412,7 @@ async def _single_attempt(
                 started_at = time.monotonic()
                 response, validated_output = await _single_complete(pre, prepared, output_type)
     except Exception as exc:
-        if started_at is None:
-            raise  # No provider call to bill, record as failed, or retry.
-        if isinstance(exc, StructuredOutputValidationError):
-            await _record_rejected_call(
-                exc,
-                agent=calls.agent,
-                provider=calls.provider,
-                run_id=pre.run_id,
-                recorder=calls.recorder,
-                notifier=calls.notifier,
-                warnings=pre.warnings,
-                semantic_messages=prepared.semantic,
-                duration_ms=int((time.monotonic() - started_at) * 1000),
-                model=pre.pkw.get("model"),
-            )
-            raise
-        await calls.record_failure(exc, started_at, 1)
-        if not prepared.slots:
+        if started_at is None or not await _record_single_failure(calls, prepared, exc, started_at):
             raise
         prepared = release_wire(prepared)
         return _Attempt(prepared, None, None, started_at, exc)
@@ -447,9 +445,9 @@ async def _single_batch_call(
                 usage=UsageStats(),
                 meta=guardrail_meta(g_engine, pre.warnings),
             )
-        attempt = await _single_attempt(pre, prepared, output_type, control_reader)
-        if attempt is None:
+        if not await calls.start_single_attempt(prepared, control_reader):
             break
+        attempt = await _single_attempt(pre, prepared, output_type)
         if attempt.failure is None:
             return attempt
         prepared = attempt.prepared

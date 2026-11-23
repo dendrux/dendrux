@@ -62,10 +62,8 @@ async def _finalize_running_event(
     **kwargs: Any,
 ) -> tuple[bool, bool]:
     atomic = getattr(store, "finalize_with_event", None)
-    if optional_failure_reason is not None:
-        writer = "finalize_with_event" if atomic is not None and emit_event else "finalize_run"
-        _add_failure_reason(store, writer, optional_failure_reason, kwargs)
     if atomic is not None and emit_event:
+        _add_failure_reason(store, "finalize_with_event", optional_failure_reason, kwargs)
         kwargs.pop("error_info", None)  # Carried by the atomic lifecycle event.
         seq = await atomic(
             run_id,
@@ -76,6 +74,7 @@ async def _finalize_running_event(
             **kwargs,
         )
         return seq is not None, False
+    _add_failure_reason(store, "finalize_run", optional_failure_reason, kwargs)
     won = await store.finalize_run(
         run_id, status=status, expected_current_status=RunStatus.RUNNING.value, **kwargs
     )
@@ -212,8 +211,10 @@ async def _pause_request_message(state_store: StateStore, run_id: str) -> str | 
 
 
 def _add_failure_reason(
-    store: StateStore, method: str, reason: str, fields: dict[str, Any]
+    store: StateStore, method: str, reason: str | None, fields: dict[str, Any]
 ) -> None:
+    if reason is None:
+        return
     # The claim wrapper accepts **kwargs to inject the epoch. Inspect the actual writer.
     if _run_contracts._accepts_kwarg(getattr(unclaimed_store(store), method), "failure_reason"):
         fields["failure_reason"] = reason
@@ -237,9 +238,8 @@ async def _transition_with_event(
     """
     atomic = getattr(state_store, "finalize_with_event", None)
     reason = finalize_kwargs.pop("failure_reason", None)
-    if reason is not None:
-        method = "finalize_with_event" if atomic is not None else "finalize_run_if_status_in"
-        _add_failure_reason(state_store, method, reason, finalize_kwargs)
+    method = "finalize_with_event" if atomic is not None else "finalize_run_if_status_in"
+    _add_failure_reason(state_store, method, reason, finalize_kwargs)
     if atomic is not None:
         seq = await atomic(
             run_id,
