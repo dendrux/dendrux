@@ -2,8 +2,8 @@
 
 ## 0.8.0 - unreleased
 
-See [Upgrading to 0.8.0](../../docs/upgrading-to-0.8.0.mdx) for the steps that rolling upgrades,
-custom-store authors and code that reads error text must take. No schema migration is needed.
+See [Upgrading to 0.8.0](../../docs/upgrading-to-0.8.0.mdx) for the upgrade steps and what
+custom-store authors and code that reads error text must do. No schema migration is needed.
 
 ### Added
 
@@ -15,7 +15,8 @@ custom-store authors and code that reads error text must take. No schema migrati
   store capability (declared by the built-in SQL stores); without it the limit is 1. See the
   [Managed subagents guide](../../docs/guides/subagents.mdx).
   - **Several pauses.** `RunResult.pendings` lists every external pause of a workflow (depth
-    first, siblings in call order) on every result path, and `RunStore.get_pendings()` reads
+    first, siblings in call order) on every result path, for workflows of up to 257 active runs
+    (larger ones raise `ManagedStateError(reason="binding_conflict")` on those reads), and `RunStore.get_pendings()` reads
     them. A continuation through the root names its leaf with `expected_pause_id`; an unheld
     token raises `PauseStatusMismatchError(reason="pause_id")` with `current_pause_id`. A budget
     pause makes one pause per leaf that observes the breach.
@@ -89,7 +90,7 @@ custom-store authors and code that reads error text must take. No schema migrati
 
 ### Fixed
 
-- A continuation with changed governance settings or skills is refused before anything is written, so the pending approval or input can be retried.
+- A continuation that the selected governance policy refuses (`on_governance_change="raise"`), or whose saved skill manifest no longer matches, is refused before anything is written, so the pending approval or input can be retried.
 - A cancelled write on a file SQLite database could leave the file locked for every later writer
   (`lock_timeout`). Dendrux now closes a `sqlite+aiosqlite` connection's cursors and rolls back
   before the connection is closed, invalidated or garbage-collected, without waiting on the database
@@ -97,16 +98,16 @@ custom-store authors and code that reads error text must take. No schema migrati
   SQLite really opens for unusual URL forms.
 - `RunStore.from_database_url(...).get_pending()` and `get_pendings()` no longer raise
   `StoreCapabilityError` for a paused fan-out workflow on SQLite.
-- Cancelled live-update `flush()` and `close()` calls stay cancelled when the transport's cleanup
-  raises, and one abandoned at loop shutdown ends cleanly.
+- Live-update `flush()` and `close()` handle a cancelled caller differently when the transport's
+  cleanup fails, and one abandoned at loop shutdown ends cleanly.
 - The Agent-side `cancel_run` and the module function share one implementation; the behaviour of
   `Agent.cancel_run` is unchanged.
 
 ### Documentation
 
 - The subagents guide covers parallel fan-out, its limits, several pauses and the resume loop,
-  cancel and pause timing, the soft budget bound, recovery and the rolling upgrade; the stale
-  one-call-per-turn and "planned for 0.7.1" lines are gone.
+  cancel and pause timing, the soft budget bound, recovery and the all-at-once upgrade; the stale
+  "planned for 0.7.1" line is gone.
 - New: the `dendrux.cancel_run` recipe section, the `on_started` reference, the `waiting_for` and
   `include_waiting` reference, the FakeModel recipe and the 0.8 upgrade page.
 - The governance page now says subagent calls are not approval-gatable in 0.8. The cancellation and

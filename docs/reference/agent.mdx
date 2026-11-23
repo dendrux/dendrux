@@ -73,7 +73,7 @@ Agent(
 | `name` | Used for the run's owner and `cache_key_prefix`. Defaults to the class name. |
 | `description` | What this Agent does. Required and non-empty when registered as a subagent; shown to the parent's model as the tool description. Defaults to an empty string for standalone Agents. |
 | `tools` | List of `@tool`-decorated functions. Empty for a pure chatbot. |
-| `subagents` | Child Agent definitions exposed as blocking tools with one `task: str` argument. Each call starts a fresh child run. Requires managed-capable persistence and ReAct participants. One subagent call is allowed per model turn; ordinary server tools can run beside it. See [Managed subagents](/docs/guides/subagents) for store inheritance, root-id pause routing, streaming and current limits. |
+| `subagents` | Child Agent definitions exposed as blocking tools with one `task: str` argument. Each call starts a fresh child run. Requires managed-capable persistence and ReAct participants. A model may call several subagents in one response, up to `Limits.max_parallel_subagents` (default 4); ordinary server tools finish first. See [Managed subagents](/docs/guides/subagents) for store inheritance, root-id pause routing, streaming and current limits. |
 | `tool_sources` | MCP source declarations, compatibility servers, or shared hosts. See [MCP](/docs/architecture/mcp). |
 | `max_iterations` | ReAct safety cap on LLM turns. Default 10. |
 | `max_delegation_depth` | Delegation depth ceiling. The root is depth zero; omission uses 10, zero allows no children, and explicit `None` removes the ceiling. See [Managed subagents](/docs/guides/subagents#store-tenant-and-depth). |
