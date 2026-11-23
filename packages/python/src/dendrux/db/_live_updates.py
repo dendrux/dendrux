@@ -15,6 +15,7 @@ import math
 import random
 import socket
 import ssl
+import sys
 from abc import ABC, abstractmethod
 from collections import OrderedDict, deque
 from contextlib import suppress
@@ -27,7 +28,7 @@ from dendrux import _codes
 from dendrux.errors import FollowCapacityError, LiveUpdatesUnavailableError
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Callable, Iterable, Sequence
+    from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -111,46 +112,77 @@ def _cancel_count() -> int:
     return task.cancelling() if task is not None else 0
 
 
-def _delivered_cancel(error: BaseException) -> asyncio.CancelledError | None:
-    """The ``CancelledError`` in ``error``'s cause/context chain, if one was delivered."""
-    seen: set[int] = set()
-    pending: BaseException | None = error
-    while pending is not None and id(pending) not in seen:
-        if isinstance(pending, asyncio.CancelledError):
-            return pending
-        seen.add(id(pending))
-        pending = pending.__cause__ or pending.__context__
-    return None
-
-
-def _restore_caller_exit(
-    error: BaseException | None = None, baseline: int = 0, *, timed_out: bool = False
-) -> None:
-    """Call first in a handler that would treat a failure as ordinary.
-
-    A cleanup that fails while a cancel or a close() unwinds replaces the
-    ``CancelledError`` / ``GeneratorExit`` with its own error. Without a running
-    loop the coroutine is being finalized, so end it as close() expects. On a
-    loop, a cancel stays a cancel when the task's count rose above ``baseline``
-    (taken at the operation's start) or a ``CancelledError`` was delivered to
-    this operation (``error`` is one, or has one in its chain), and it keeps its
-    original reason. A transport's own CancelledError with no cancel requested
-    (count 0) is an ordinary failure, as is a count left by an earlier handled
-    cancel with no CancelledError in the chain. An
-    expired module timeout (``timed_out``) has already uncancelled its task.
-    """
+def _restore_caller_exit(error: BaseException | None = None, baseline: int = 0) -> None:
+    """Propagate requests received since the owning operation's checkpoint."""
     try:
-        task = asyncio.current_task()
+        count = _cancel_count()
     except RuntimeError:
+        # A transport may replace GeneratorExit while its coroutine is finalized off-loop.
         raise GeneratorExit from None
-    if task is None:
-        return
-    count = task.cancelling()
-    cancel = None if timed_out or error is None or count == 0 else _delivered_cancel(error)
-    if cancel is not None:
-        raise cancel from None
     if count > baseline:
-        raise asyncio.CancelledError from None
+        raise _caller_cancel(error) from None
+
+
+def _caller_cancel(error: BaseException | None) -> asyncio.CancelledError:
+    """Recover a delivered request from cleanup, ignoring the caller's enclosing handler."""
+    pending = [error]
+    seen = {id(sys.exception())}
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        if isinstance(current, asyncio.CancelledError):
+            return current
+        seen.add(id(current))
+        pending.extend((current.__context__, current.__cause__))
+    # An adapter that consumed the exception can leave only the request count.
+    return asyncio.CancelledError()
+
+
+async def _restore_adapter_exit(error: BaseException | None, baseline: int) -> None:
+    try:
+        _restore_caller_exit(error, baseline)
+    except asyncio.CancelledError:
+        # A request made just before the adapter returned may still await delivery.
+        # A later request at this checkpoint must not replace the original exception.
+        at_exit = _cancel_count()
+        try:
+            await asyncio.sleep(0)
+        except asyncio.CancelledError:
+            if _cancel_count() == at_exit:
+                raise
+        raise
+
+
+async def _adapter_failure(
+    timeout: float, operation: Callable[[], Awaitable[None]], abort: Callable[[], None]
+) -> BaseException | None:
+    """Run in the owning task. Return transport failures and propagate caller cancellation."""
+    limit = asyncio.timeout(timeout)
+    abort_on_exit = True
+    try:
+        # Deliver requests pending at entry before transport cleanup can replace them.
+        await asyncio.sleep(0)
+        baseline = _cancel_count()
+        failure: BaseException | None = None
+        try:
+            async with limit:
+                await operation()
+            if limit.expired():
+                failure = TimeoutError()
+        except (Exception, asyncio.CancelledError) as error:
+            failure = error
+        # The timeout has now withdrawn its own cancellation, even if cleanup swallowed it.
+        await _restore_adapter_exit(failure, baseline)
+        abort_on_exit = failure is not None
+        return failure
+    except GeneratorExit:
+        # Coroutine finalization can run after the adapter's event loop has closed.
+        abort_on_exit = False
+        raise
+    finally:
+        if abort_on_exit:
+            abort()
 
 
 def _quoted(run_id: str) -> str:
@@ -520,14 +552,12 @@ class LiveUpdates(ABC):
                 return
 
     async def _send_batch(self, messages: Sequence[str], count: int, remaining: float) -> bool:
-        baseline = _cancel_count()
-        limit = asyncio.timeout(min(self.send_timeout_s, remaining))
-        try:
-            async with limit:
-                await self.send(messages)
-        except (Exception, asyncio.CancelledError) as error:
-            self._drop_batch(count)
-            _restore_caller_exit(error, baseline, timed_out=limit.expired())
+        error = await _adapter_failure(
+            min(self.send_timeout_s, remaining),
+            lambda: self.send(messages),
+            lambda: self._drop_batch(count),
+        )
+        if error is not None:
             self._send_failure(error, count)
             return False
         self._counts["sent"] += count
@@ -888,20 +918,16 @@ class LiveUpdates(ABC):
     async def _close_owned(self) -> None:
         self._close_timeout_logged = False
         deadline = monotonic() + self.close_timeout_s
-        baseline = _cancel_count()
-        limit = asyncio.timeout(self.close_timeout_s)
-        try:
-            async with limit:
-                await self._close_resources(deadline)
-        except (Exception, asyncio.CancelledError) as error:
-            self._abort_all()
-            _restore_caller_exit(error, baseline, timed_out=limit.expired())
+        error = await _adapter_failure(
+            self.close_timeout_s, lambda: self._close_resources(deadline), self._abort_all
+        )
+        if error is not None:
             self._close_failed(error)
 
     def _close_failed(self, error: BaseException) -> None:
         if isinstance(error, TimeoutError):
             self._close_timeout()
-        elif isinstance(error, Exception):
+        else:
             self._last_error_type = _error_type(error)
             _codes.log_code(
                 logger,

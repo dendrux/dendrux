@@ -61,6 +61,7 @@ custom-store authors and code that reads error text must take. No schema migrati
 
 ### Changed
 
+- If a live-update adapter catches cancellation from the library deadline and returns, Dendrux records a failed send or a close timeout.
 - An oversized subagent batch reports `managed_fanout_limit` instead of
   `managed_batch_unsupported` in tool results, events and logs. A subagent beside a client tool and
   an `exclusive_subagents` conflict keep `managed_batch_unsupported`. Migration: change any filter
