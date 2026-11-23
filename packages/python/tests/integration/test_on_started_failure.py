@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import pickle
 from datetime import UTC, datetime, timedelta
 from functools import wraps
 from uuid import uuid4
@@ -13,7 +14,7 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from dendrux import Agent, aheartbeat, cancel_run, sweep, tool
+from dendrux import Agent, aheartbeat, cancel_run, errors, sweep, tool
 from dendrux._lifecycle import TERMINAL_EVENT_TYPES
 from dendrux.db.models import AgentRun
 from dendrux.llm.mock import MockLLM
@@ -64,10 +65,38 @@ async def test_callback_starts_independent_root_and_heartbeat(store, monkeypatch
     assert result.status == RunStatus.SUCCESS and get_delegation_context() is None
 
 
+@pytest.fixture
+def callback_spans():
+    tracer = TracerProvider()
+    exporter = InMemorySpanExporter()
+    tracer.add_span_processor(SimpleSpanProcessor(exporter))
+    try:
+        yield OpenTelemetryNotifier(tracer.get_tracer("f7")), exporter
+    finally:
+        tracer.shutdown()
+
+
+def assert_callback_log(caplog, run_id):
+    records = [r for r in caplog.records if getattr(r, "code", None) == "on_started_failed"]
+    assert [(r.run_id, r.callback_outcome) for r in records] == [(run_id, "raised")]
+
+
+def assert_safe_sinks(sentinel, caplog, exporter, *surfaces):
+    spans = exporter.get_finished_spans()
+    assert spans
+    for surface in (
+        *surfaces,
+        caplog.text,
+        [record.__dict__ for record in caplog.records],
+        [span.to_json() for span in spans],
+    ):
+        assert sentinel not in repr(surface)
+
+
 @pytest.mark.parametrize("entry", ["run", "retry"])
 @pytest.mark.parametrize("asynchronous", [True, False])
 async def test_failure_is_atomic_and_safe_on_every_sink(
-    store, entry, asynchronous, monkeypatch, caplog
+    store, entry, asynchronous, monkeypatch, caplog, callback_spans
 ):
     source = await retry_source(store, entry)
     agent, provider = make_agent(store)
@@ -75,9 +104,6 @@ async def test_failure_is_atomic_and_safe_on_every_sink(
     sentinel = f"callback-private-{uuid4().hex}"
     cause = ValueError(sentinel)
     original = RuntimeError(sentinel + "-outer")
-    tracer = TracerProvider()
-    exporter = InMemorySpanExporter()
-    tracer.add_span_processor(SimpleSpanProcessor(exporter))
     finalize = store.finalize_with_event
     transitions = []
 
@@ -94,54 +120,49 @@ async def test_failure_is_atomic_and_safe_on_every_sink(
 
     def fail(run_id):
         ids.append(run_id)
+        logging.getLogger(__name__).debug("Entering the failing callback")
         raise original from cause
 
     async def fail_async(run_id):
         await asyncio.sleep(0)
         fail(run_id)
 
-    notifier = CompositeNotifier([OpenTelemetryNotifier(tracer.get_tracer("f7")), Observer()])
-    caplog.set_level(logging.WARNING)
-    try:
-        with pytest.raises(Exception) as caught:
-            await invoke(agent, source, fail_async if asynchronous else fail, notifier=notifier)
-        (run_id,) = ids
-        row = await store.get_run(run_id)
-        events = await store.get_run_events(run_id)
-        spans = exporter.get_finished_spans()
-        assert spans and observed
-        surface = [
-            str(caught.value),
-            repr(caught.value),
-            repr(row),
-            repr(events),
-            caplog.text,
-            repr([record.__dict__ for record in caplog.records]),
-            repr([span.to_json() for span in spans]),
-            repr(observed),
-        ]
-        assert all(sentinel not in value for value in surface)
-        assert isinstance(caught.value, runner.OnStartedError)
-        assert caught.value.run_id == run_id and caught.value.__cause__ is original
-        assert caught.value.code == "on_started_failed"
-        assert observed[0].__cause__ is observed[0].__context__ is None
-        assert row.status == "error" and row.error == str(caught.value)
-        assert row.failure_reason == "on_started_failed"
-        (failed,) = [event for event in events if event.event_type == "run.error"]
-        assert failed.data["code"] == row.failure_reason and failed.data["error"] == row.error
-        (write,) = transitions
-        assert write["allowed_current_statuses"] == ["running"] and write["claim_epoch"] == 0
-        assert write["status"] == "error" and write["event_type"] == "run.error"
-        assert any(getattr(r, "run_id", None) == run_id for r in caplog.records)
-        assert provider.calls_made == 0 and run_id not in agent._task_manager._owned
-        assert get_delegation_context() is None
-    finally:
-        tracer.shutdown()
+    otel, exporter = callback_spans
+    notifier = CompositeNotifier([otel, Observer()])
+    caplog.set_level(logging.DEBUG)
+    with pytest.raises(Exception) as caught:
+        await invoke(agent, source, fail_async if asynchronous else fail, notifier=notifier)
+    (run_id,) = ids
+    row = await store.get_run(run_id)
+    events = await store.get_run_events(run_id)
+    assert "Entering the failing callback" in caplog.messages
+    assert_safe_sinks(
+        sentinel, caplog, exporter, str(caught.value), caught.value, row, events, observed
+    )
+    assert isinstance(caught.value, runner.OnStartedError)
+    assert caught.value.run_id == run_id and caught.value.__cause__ is original
+    assert caught.value.code == "on_started_failed"
+    assert observed[0].__cause__ is observed[0].__context__ is None
+    assert row.status == "error" and row.error == str(caught.value)
+    assert row.failure_reason == "on_started_failed"
+    (failed,) = [event for event in events if event.event_type == "run.error"]
+    assert failed.data["code"] == row.failure_reason and failed.data["error"] == row.error
+    (write,) = transitions
+    assert write["allowed_current_statuses"] == ["running"] and write["claim_epoch"] == 0
+    assert write["status"] == "error" and write["event_type"] == "run.error"
+    assert_callback_log(caplog, run_id)
+    assert provider.calls_made == 0 and run_id not in agent._task_manager._owned
+    assert get_delegation_context() is None
 
 
 @pytest.mark.parametrize("engine", ["sqlite_file", "postgres"], indirect=True)
 @pytest.mark.parametrize("when", ["inside", "at_failure_write"])
-async def test_callback_error_observes_cancel_at_control_read(store, engine, monkeypatch, when):
+async def test_callback_error_observes_cancel_at_control_read(
+    store, engine, monkeypatch, when, caplog, callback_spans
+):
+    caplog.set_level(logging.DEBUG)
+    otel, exporter = callback_spans
+    sentinel = f"callback-private-{uuid4().hex}"
     agent, provider = make_agent(store)
     ready, release = asyncio.Event(), asyncio.Event()
     ids = []
@@ -161,11 +182,13 @@ async def test_callback_error_observes_cancel_at_control_read(store, engine, mon
         if when == "inside":
             ready.set()
             await release.wait()
-        raise ValueError("callback failed")
+        raise ValueError(sentinel) from RuntimeError(sentinel + "-cause")
 
-    task = asyncio.create_task(invoke(agent, None, fail))
+    task = asyncio.create_task(invoke(agent, None, fail, notifier=otel))
     try:
         await wait_for_gate(ready, task=task)
+        if when == "at_failure_write":
+            assert_callback_log(caplog, ids[0])
         await cancel_run(ids[0], tenant_id=None, state_store=store)
         pending = await store.get_run(ids[0])
         assert pending.status == "running" and pending.cancel_requested
@@ -176,17 +199,21 @@ async def test_callback_error_observes_cancel_at_control_read(store, engine, mon
     if when == "inside":
         result = await task
         assert result.status == RunStatus.CANCELLED and row.error is None
+        response = result
         terminal = "run.cancelled"
     else:
         with pytest.raises(runner.OnStartedError) as caught:
             await task
         assert caught.value.run_id == ids[0] and row.error == str(caught.value)
+        response = caught.value
         terminal = "run.error"
     assert row.status == terminal.removeprefix("run.")
     events = await store.get_run_events(ids[0])
     assert [e.event_type for e in events if e.event_type in TERMINAL_EVENT_TYPES] == [terminal]
     assert events[-1].event_type == terminal
     assert provider.calls_made == 0 and ids[0] not in agent._task_manager._owned
+    assert_safe_sinks(sentinel, caplog, exporter, row, events, response, str(response))
+    assert_callback_log(caplog, ids[0])
     if when == "at_failure_write":
         assert row.cancel_requested is False
 
@@ -259,6 +286,8 @@ async def test_stale_callback_yields_to_postgres_winner(
     assert await store.get_run(run_id) == winner
     assert await store.get_run_events(run_id) == winner_events
     assert run_id not in agent._task_manager._owned
+    if outcome == "raise":
+        assert_callback_log(caplog, run_id)
     assert any(
         getattr(r, "code", None) == "run_fenced" and r.run_id == run_id for r in caplog.records
     )
@@ -316,3 +345,66 @@ async def test_failure_logs_registered_callback_code(store, caplog):
     assert any(
         getattr(r, "code", None) == code and r.run_id == caught.value.run_id for r in caplog.records
     )
+
+
+@pytest.mark.parametrize("atomic", [True, False], ids=["atomic", "cas-and-event"])
+async def test_callback_failure_on_older_store(store, monkeypatch, atomic):
+    agent, provider = make_agent(store)
+    writes = []
+    final = store.finalize_with_event if atomic else store.finalize_run_if_status_in
+
+    async def legacy_atomic(
+        run_id, *, status, allowed_current_statuses, error, claim_epoch, event_type, event_data
+    ):
+        writes.append((run_id, status, allowed_current_statuses, claim_epoch))
+        return await final(
+            run_id,
+            status=status,
+            allowed_current_statuses=allowed_current_statuses,
+            error=error,
+            claim_epoch=claim_epoch,
+            event_type=event_type,
+            event_data=event_data,
+        )
+
+    async def legacy_cas(run_id, *, status, allowed_current_statuses, error, claim_epoch):
+        writes.append((run_id, status, allowed_current_statuses, claim_epoch))
+        return await final(
+            run_id,
+            status=status,
+            allowed_current_statuses=allowed_current_statuses,
+            error=error,
+            claim_epoch=claim_epoch,
+        )
+
+    monkeypatch.setattr(store, "finalize_with_event", legacy_atomic if atomic else None)
+    if not atomic:
+        monkeypatch.setattr(store, "finalize_run_if_status_in", legacy_cas)
+    original = ValueError("private")
+
+    def fail(run_id):
+        raise original
+
+    with pytest.raises(runner.OnStartedError) as caught:
+        await invoke(agent, None, fail)
+    error = caught.value
+    assert error.__cause__ is original
+    assert writes == [(error.run_id, "error", ["running"], 0)]
+    row = await store.get_run(error.run_id)
+    assert row.status == "error" and row.error == error.safe_message and row.failure_reason is None
+    events = await store.get_run_events(error.run_id)
+    assert [e for e in events if e.event_type in TERMINAL_EVENT_TYPES] == [events[-1]]
+    assert events[-1].event_type == "run.error"
+    assert events[-1].data == {"error": error.safe_message, "code": error.code}
+    assert provider.calls_made == 0 and error.run_id not in agent._task_manager._owned
+
+
+def test_on_started_error_public_contract():
+    cls = runner.OnStartedError
+    assert RuntimeError in cls.__bases__ and not issubclass(cls, errors.RunControlError)
+    assert cls is errors.OnStartedError and cls.__module__ == errors.__name__
+    assert cls.__name__ in errors.__all__
+    error = pickle.loads(pickle.dumps(cls("root-id")))
+    assert type(error) is cls and error.run_id == "root-id"
+    assert error.code == "on_started_failed"
+    assert str(error) == error.safe_message == "The on_started callback failed."

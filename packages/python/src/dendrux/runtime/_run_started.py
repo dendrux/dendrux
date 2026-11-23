@@ -8,8 +8,9 @@ from typing import TYPE_CHECKING, cast
 
 from dendrux import _codes
 from dendrux._lifecycle import CancelReason, StoredEventType
-from dendrux.errors import RunControlError, RunFencedError, _KwargsReduceMixin
+from dendrux.errors import OnStartedError, RunFencedError
 from dendrux.runtime._run_errors import logger
+from dendrux.runtime._run_events import _transition_with_event
 from dendrux.runtime._run_outcome import _finalize_loop_cancelled
 from dendrux.runtime.context import DelegationContext, get_store_identity, set_delegation_context
 from dendrux.types import RunResult, RunStatus
@@ -21,18 +22,6 @@ if TYPE_CHECKING:
     from dendrux.loops.base import LoopNotifier
     from dendrux.runtime._run_start import _RunLifecycle
     from dendrux.runtime.state import StateStore, _ClaimedStateStore
-
-
-class OnStartedError(_KwargsReduceMixin, RunControlError):
-    """The persisted root's start callback failed before model or tool work."""
-
-    _init_fields = ("run_id",)
-    code = _codes.ON_STARTED_FAILED.name
-    safe_message = "The on_started callback failed."
-
-    def __init__(self, run_id: str) -> None:
-        self.run_id = run_id
-        super().__init__(self.safe_message)
 
 
 async def _cancel_requested(store: StateStore, run_id: str) -> bool:
@@ -102,6 +91,7 @@ async def _notify_started(
         if isawaitable(pending):
             await pending
     except Exception as exc:  # noqa: BLE001, RUF100 - user callback isolation; only fixed diagnostics.
+        _codes.log_code(logger, _codes.ON_STARTED_FAILED, run_id=run_id, callback_outcome="raised")
         failure = exc
     if not await _cancel_requested(store, run_id):
         if failure is not None:
@@ -117,7 +107,8 @@ async def _fail_started(
     safe = OnStartedError(run_id)
     # The outer error handler must not replace or repeat this atomic transition.
     lifecycle.failure_write_started = True
-    seq = await store.finalize_with_event(
+    won = await _transition_with_event(
+        store,
         run_id,
         status=RunStatus.ERROR.value,
         allowed_current_statuses=[RunStatus.RUNNING.value],
@@ -126,11 +117,10 @@ async def _fail_started(
         event_type=StoredEventType.RUN_ERROR.value,
         event_data={"error": safe.safe_message, "code": safe.code},
     )
-    if seq is None:
+    if not won:
         if await _cancel_requested(store, run_id):
             return await _cancel_started(lifecycle, store, notifier)
         return await lifecycle._fenced(lifecycle.recorder, notifier)
-    _codes.log_code(logger, _codes.ON_STARTED_FAILED, run_id=run_id)
     await lifecycle._fail_sinks(safe, lifecycle.recorder, notifier)
     # Observers can retain their error, so attach the private cause only to the caller's copy.
     raise OnStartedError(run_id) from failure
@@ -151,6 +141,3 @@ async def _cancel_started(
     )
     await lifecycle._finish(lifecycle.recorder, notifier, result)
     return result
-
-
-OnStartedError.__module__ = "dendrux.runtime.runner"

@@ -56,6 +56,7 @@ _NUMBERS = frozenset(
     }
 )
 _ENUMS = {
+    "callback_outcome": frozenset({"raised"}),
     "error_kind": frozenset({"timeout", "connection", "cancelled", "closed", "other", "tls"}),
     "db_kind": frozenset(
         [
@@ -523,9 +524,9 @@ ON_STARTED_FAILED = Code(
     "on_started_failed",
     logging.ERROR,
     "runtime",
-    _BASE_FIELDS,
-    "The root run's on_started callback raises and the owner finalizes the run as an error.",
-    "Inspect the callback exception on OnStartedError.__cause__ in the caller.",
+    _BASE_FIELDS | frozenset({"callback_outcome"}),
+    "The root run's on_started callback raises, before the owner checks cancellation or its claim.",
+    "Check the run status. If the caller receives OnStartedError, inspect its __cause__.",
 )
 RUN_FAILED = Code(
     "run_failed",

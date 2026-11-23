@@ -1492,7 +1492,7 @@ class Agent:
                 invalid (``ReplayRunError`` for a bad run id).
             RunAlreadyActiveError: If idempotency_key matches an active run.
             IdempotencyConflictError: If an idempotency key is reused with different parameters.
-            dendrux.runtime.runner.OnStartedError: If the start callback fails the new run.
+            dendrux.errors.OnStartedError: If the start callback fails the new run.
             DelegationDepthExceededError: If this run would exceed the inherited
                 max_delegation_depth from a parent run.
         """
@@ -1597,7 +1597,7 @@ class Agent:
         Raises:
             ValueError: If provider or persistence is missing, the source is still active,
                 or the source used SingleCall.
-            dendrux.runtime.runner.OnStartedError: If the start callback fails the retry run.
+            dendrux.errors.OnStartedError: If the start callback fails the retry run.
         """
         requested_tenant_id = tenant_id
         tenant_id = entry_checks(

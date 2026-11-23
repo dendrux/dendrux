@@ -8,44 +8,26 @@ Dendrux never forces a status-code contract.
 
 Suggested HTTP mappings:
 
-    RunNotFoundError            -> 404
-    RunNotPausedError           -> 409
-    PauseStatusMismatchError    -> 409
-    RunAlreadyClaimedError      -> 409
-    RunAlreadyTerminalError     -> 409
-    InvalidToolResultError      -> 400
-    ManagedResultRefusedError   -> 400 (an InvalidToolResultError)
-    ReplayRunError              -> 400 (404 when reason == "not_found")
-    PersistenceNotConfiguredError -> 500
-    SchemaNotInitializedError   -> 500
-    SkillMissingError           -> 409
-    ContextLengthExceededError  -> 413 or 400
-    SkillMismatchError          -> 409
-    SqliteSchemaSyncError       -> 500 (startup: legacy SQLite file needs migration)
-    SchemaOutOfDateError        -> 500 (startup: run `dendrux db migrate`)
-    ImageError                  -> 400 (base of the next three)
-    InvalidImageError           -> 400
-    ImageLimitError             -> 413
-    ImageFetchError             -> 400 (502 when reason is "http_status" or "timeout")
-    UnsupportedModalityError    -> 400
-    ImageRejectedError          -> 422
-    ProviderError               -> 502 (base of the provider errors below)
-    ProviderAuthError           -> 502
-    ProviderRateLimitError      -> 503 (``retry_after``)
-    ProviderTimeoutError        -> 504
-    ProviderUnavailableError    -> 503
-    ProviderStreamIncompleteError -> 502
-    ModelRefusalError           -> 422
-    ContentFilteredError        -> 422
-    BudgetConfigurationError    -> 500 (configuration)
-    TenantScopeRequiredError    -> 500 (configuration: pass tenant_id)
-    SubagentConfigurationError  -> 500 (configuration: raised when an Agent is built)
-    NoteLimitExceededError      -> 429 or 409 (too many notes on this run)
-    GovernanceMismatchError     -> 409
-    BlobNotFoundError           -> 404
-    BlobIntegrityError          -> 500
-    ImagePersistenceUnsupportedError -> 500
-    BlobContentionError         -> 503 (transient; safe to retry)
+    400: InvalidToolResultError (including ManagedResultRefusedError),
+         ReplayRunError (404 when reason == "not_found"), UnsupportedModalityError,
+         ImageError (including InvalidImageError and ImageFetchError).
+         ImageFetchError maps to 502 when reason == "http_status" or "timeout".
+    404: RunNotFoundError, BlobNotFoundError
+    409: RunNotPausedError, PauseStatusMismatchError, RunAlreadyClaimedError,
+         RunAlreadyTerminalError, SkillMissingError, SkillMismatchError, GovernanceMismatchError
+    413: ImageLimitError
+    413 or 400: ContextLengthExceededError
+    422: ImageRejectedError, ModelRefusalError, ContentFilteredError
+    429 or 409: NoteLimitExceededError (too many notes on this run)
+    500: PersistenceNotConfiguredError, SchemaNotInitializedError, BlobIntegrityError,
+         ImagePersistenceUnsupportedError, BudgetConfigurationError (configuration),
+         TenantScopeRequiredError (pass tenant_id), SubagentConfigurationError (at Agent build),
+         SqliteSchemaSyncError (legacy SQLite file needs migration),
+         SchemaOutOfDateError (run `dendrux db migrate`)
+    502: ProviderError (including ProviderAuthError, ProviderUnavailableError and
+         ProviderStreamIncompleteError)
+    503: ProviderRateLimitError (``retry_after``), BlobContentionError (transient, safe to retry)
+    504: ProviderTimeoutError
 
 Image errors never carry image bytes, base64, data URLs, file paths or URL
 paths/queries/credentials, and are raised with no ``__cause__`` and no
@@ -161,6 +143,18 @@ class StoreCapabilityError(TypeError):
             f"StateStore {store} capability '{capability}': {method} lacks {missing!r}. "
             + _capability_advice(capability)
         )
+
+
+class OnStartedError(_KwargsReduceMixin, RuntimeError):
+    """The persisted root's start callback failed before model or tool work."""
+
+    _init_fields = ("run_id",)
+    code = _codes.ON_STARTED_FAILED.name
+    safe_message = "The on_started callback failed."
+
+    def __init__(self, run_id: str) -> None:
+        self.run_id = run_id
+        super().__init__(self.safe_message)
 
 
 class RunControlError(RuntimeError):
@@ -1629,6 +1623,7 @@ __all__ = [
     "ManagedResultRefusedError",
     "ModelRefusalError",
     "NoteLimitExceededError",
+    "OnStartedError",
     "PROVIDER_ERROR_CATEGORIES",
     "PauseStatusMismatchError",
     "PersistenceNotConfiguredError",
