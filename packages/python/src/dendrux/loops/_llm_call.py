@@ -34,6 +34,7 @@ from dendrux.loops._helpers import (
     record_llm_started,
 )
 from dendrux.loops._images import control_stop, release_wire
+from dendrux.loops._run_context import start_callback_delivered
 from dendrux.types import StreamEventType
 
 if TYPE_CHECKING:
@@ -100,6 +101,15 @@ class ProviderCallSite:
             semantic_messages=prepared.semantic,
             semantic_tools=tools,
         )
+
+    async def start_single_attempt(
+        self, prepared: PreparedRequest, control_reader: Callable[[], Awaitable[Any]]
+    ) -> bool:
+        """Recheck the claim after on_started, then announce an admitted SingleCall attempt."""
+        if start_callback_delivered(self.run_id) and await control_reader() is not None:
+            return False
+        await self.started(prepared, None, 1)
+        return True
 
     async def record_failure(self, exc: BaseException, t0: float, iteration: int) -> None:
         """``llm.failed`` for a provider call that raised: record, then notify."""
