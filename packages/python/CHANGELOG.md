@@ -62,7 +62,8 @@ custom-store authors and code that reads error text must do. No schema migration
 
 ### Changed
 
-- If a live-update adapter catches cancellation from the library deadline and returns, Dendrux records a failed send or a close timeout.
+- A custom live-update adapter that catches the cancellation from Dendrux's own deadline and returns
+  is now counted as a failed send or a close timeout (see the live-update cancellation entry under Fixed).
 - An oversized subagent batch reports `managed_fanout_limit` instead of
   `managed_batch_unsupported` in tool results, events and logs. A subagent beside a client tool and
   an `exclusive_subagents` conflict keep `managed_batch_unsupported`. Migration: change any filter
@@ -99,8 +100,11 @@ custom-store authors and code that reads error text must do. No schema migration
   SQLite really opens for unusual URL forms.
 - `RunStore.from_database_url(...).get_pending()` and `get_pendings()` no longer raise
   `StoreCapabilityError` for a paused fan-out workflow on SQLite.
-- Live-update `flush()` and `close()` handle a cancelled caller differently when the transport's
-  cleanup fails, and one abandoned at loop shutdown ends cleanly.
+- Live-update `flush()` and `close()`: a cancellation pending at the start is delivered before the
+  transport is called, and one that arrives during the send or close propagates with its reason even
+  if the transport's cleanup replaces it. A transport's own timeout or cancelled future counts as a
+  failed send and no longer cancels the caller or already-started fan-out children. One abandoned
+  at loop shutdown ends cleanly.
 - The Agent-side `cancel_run` and the module function share one implementation; the behaviour of
   `Agent.cancel_run` is unchanged.
 

@@ -80,7 +80,7 @@ The fix needs `aiosqlite>=0.22.1`. Dendrux now requires it (the floor was `>=0.1
 
 `RunStore.from_database_url(url).get_pending()` and `get_pendings()` on SQLite no longer raise `StoreCapabilityError` for a paused fan-out workflow. 0.7.0 is not affected.
 
-Live-update `flush()` and `close()` handle a cancelled caller differently when the transport's cleanup fails: the cancellation handling in those two paths was reworked.
+Live-update `flush()` and `close()` now handle cancellation this way. A cancellation already pending when the call starts is delivered before the transport is called. One that arrives during the send or close propagates with its reason, even if the transport's cleanup replaces it with another error. A transport's own timeout or cancelled future counts as a failed send: it no longer cancels the caller or fan-out children that have already started.
 
 ## Upgrading all workers at once
 
