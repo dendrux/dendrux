@@ -318,7 +318,7 @@ async def _children(
         child = await read_hop(_bound_child_id(hop), UNSCOPED)
         return [_checked_child(hop, child, root_run_id, path)]
     store: Any = unclaimed_store(state)
-    raw = await store.get_pause_state(hop.run_id)
+    raw = await _fanout_pause(store, hop)
     fanout = fanout_wait(state, hop.run_id, raw, hop.binding)
     require_allowance(len(fanout.bindings), allowance, hop.run_id)
     rows = await fanout_children(
@@ -339,6 +339,17 @@ async def _children(
         )
         for row, child_path in rows
     ]
+
+
+@_safe_database_call
+async def _fanout_pause(store: Any, hop: ManagedHop) -> Any:
+    factory = getattr(store, "_session_factory", None)
+    if not callable(factory) or not callable(getattr(store, "pause_projection", None)):
+        return await store.get_pause_state(hop.run_id)
+    query = select(AgentRun.pause_data).where(AgentRun.id == hop.run_id)
+    async with factory() as session:
+        result = await session.execute(_apply_tenant_scope(query, hop.tenant_id))
+        return result.scalar_one_or_none()
 
 
 def needs_approval_display(summary: PauseSummary) -> bool:

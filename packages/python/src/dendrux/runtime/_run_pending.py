@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 
     from dendrux.runtime._managed_pending import FacingView
     from dendrux.runtime._pending import PendingPause
-    from dendrux.runtime.state import StateStore, TenantScope
+    from dendrux.runtime.state import RunRecord, StateStore, TenantScope
     from dendrux.types import RunResult
 
 _CONTROL_EVENT_LIMIT = 100
@@ -327,15 +327,23 @@ async def _build_cached_result(
     The contract is: "return the cached final outcome" — status, answer, error,
     iteration count, and aggregate usage. Not "return the identical object."
     """
-    from dendrux.types import RunResult
-
     run = await state_store.get_run(run_id)
     if run is None:
         raise RuntimeError(f"Idempotent run {run_id} not found in database")
 
-    output = _cached_output(run.answer, output_type, run_id)
+    result = _cached_record_result(run, output_type)
+    mapping = await state_store.get_pii_mapping(run_id)
+    if mapping:
+        result.meta = _run_errors._public_meta({"pii_mapping": mapping})
+    return await _attach_persisted_pending(state_store, result, run)
 
-    result = RunResult(
+
+def _cached_record_result(run: RunRecord, output_type: type | None = None) -> RunResult:
+    from dendrux.types import RunResult
+
+    output = _cached_output(run.answer, output_type, run.id)
+
+    return RunResult(
         run_id=run.id,
         status=RunStatus(run.status),
         answer=run.answer,
@@ -360,11 +368,6 @@ async def _build_cached_result(
             _stop_reason_from_meta(run.meta) if run.status == RunStatus.SUCCESS.value else None
         ),
     )
-
-    mapping = await state_store.get_pii_mapping(run_id)
-    if mapping:
-        result.meta = _run_errors._public_meta({"pii_mapping": mapping})
-    return await _attach_persisted_pending(state_store, result, run)
 
 
 def _stop_reason_from_meta(meta: dict[str, Any] | None) -> StopReason | None:

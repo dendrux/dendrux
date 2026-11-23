@@ -171,6 +171,43 @@ def test_send_and_close_finalized_without_a_loop_raise_nothing_unraisable(monkey
     assert unraisable == []
 
 
+def test_finalize_close_waiting_for_flush_with_live_listener(monkeypatch):
+    bus = _CleanupReplacesCancelBus(send_timeout_s=30, flush_deadline_s=30, close_timeout_s=30)
+    waiting_for_flush = asyncio.Event()
+    wait_until_idle = bus._idle.wait
+
+    async def wait_for_flush():
+        waiting_for_flush.set()
+        await wait_until_idle()
+
+    monkeypatch.setattr(bus._idle, "wait", wait_for_flush)
+
+    async def start(bus):
+        lease = await bus._acquire_listener()
+        bus.enqueue(["run"])
+        flushing = asyncio.create_task(bus.flush())
+        closing = asyncio.create_task(bus.close())
+        async with asyncio.timeout(5):
+            await waiting_for_flush.wait()
+        assert bus._in_flight and bus.healthy and lease in bus._leases
+        return closing, flushing, bus._listener_task
+
+    loop = asyncio.new_event_loop()
+    try:
+        closing, flushing, listener = loop.run_until_complete(start(bus))
+    finally:
+        loop.close()
+    try:
+        closing.get_coro().close()
+        assert listener.cancelling() == 0
+    finally:
+        # Finalize the flush after close has released its idle waiter.
+        flushing.get_coro().close()
+        listener.get_coro().close()
+    del closing, flushing, listener, bus
+    gc.collect()
+
+
 class _CleanupTimesOutBus(_CleanupReplacesCancelBus):
     async def aclose_sender(self):
         try:

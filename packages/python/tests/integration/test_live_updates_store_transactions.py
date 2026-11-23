@@ -343,3 +343,129 @@ async def test_enabled_bus_preserves_save_statement_budget_and_records_sends_sep
     assert len(bus.messages) == 2
     assert bus.stats().sent == 2
     assert not any("pg_notify" in sql for sql in groups[True])
+
+
+@pytest.fixture
+async def fanout_bind(live_store, engine):
+    from dendrux.runtime.durability import _fanout_ownership_handoff
+    from tests.integration.test_fanout_store_races import batch, fanout_parent
+
+    store, bus = live_store
+    root, calls = await fanout_parent(store, 2)
+    request = batch(root, calls)
+    children = [child.child_run_id for child in request.children]
+    before_send = []
+
+    async def bind(adapter):
+        async def send(messages):
+            if not before_send:
+                async with engine.connect() as reader:
+                    before_send.extend(
+                        await reader.scalars(
+                            select(AgentRun.status).where(AgentRun.id.in_(children))
+                        )
+                    )
+            await adapter()
+
+        bus.send = send
+        return await _fanout_ownership_handoff(
+            store, lambda: store.bind_managed_children(request), run_id=root
+        )
+
+    return bind, children, before_send
+
+
+async def assert_child_outcomes(store, children, status, cancellations):
+    statuses, counts = [], []
+    for child in children:
+        statuses.append((await store.get_run(child)).status)
+        events = await store.get_run_events(child)
+        counts.append(sum(event.event_type == "run.cancelled" for event in events))
+    assert (statuses, counts) == ([status] * 2, [cancellations] * 2)
+
+
+@pytest.mark.parametrize("engine", ["sqlite_file", "postgres"], indirect=True)
+@pytest.mark.parametrize(
+    "failure,prior",
+    [
+        ("connection", "handled"),
+        ("future", None),
+        ("future", "handled"),
+        ("adapter_timeout", "handled"),
+        ("wrapped_future", "handled"),
+        ("connection", "handling"),
+    ],
+)
+async def test_post_commit_hint_preserves_fanout_custody(live_store, fanout_bind, failure, prior):
+    store, bus = live_store
+    bind, children, before_send = fanout_bind
+
+    async def adapter():
+        if failure == "connection":
+            raise ConnectionError
+        if failure == "adapter_timeout":
+            async with asyncio.timeout(0):
+                await asyncio.Future()
+        future = asyncio.get_running_loop().create_future()
+        future.cancel("transport")
+        try:
+            await future
+        except asyncio.CancelledError as error:
+            if failure == "wrapped_future":
+                raise ConnectionError from error
+            raise
+
+    async def caller():
+        if prior:
+            asyncio.current_task().cancel("earlier")
+            try:
+                await asyncio.sleep(0)
+            except asyncio.CancelledError:
+                if prior == "handling":
+                    return await bind(adapter)
+        return await bind(adapter)
+
+    task = asyncio.create_task(caller())
+    await asyncio.wait({task})
+    assert before_send == ["running", "running"]
+    await assert_child_outcomes(store, children, "running", 0)
+    result = task.result()
+    assert result.outcome == "created"
+    assert [child.child_run_id for child in result.children if child.child_claim] == children
+    assert bus.stats().dropped_failed > 0
+
+
+@pytest.mark.parametrize("engine", ["sqlite_file", "postgres"], indirect=True)
+@pytest.mark.parametrize("when", ["suspended", "between_batches"])
+async def test_caller_cancel_at_post_commit_flush_finalizes_claims(live_store, fanout_bind, when):
+    store, bus = live_store
+    bind, children, before_send = fanout_bind
+    bus.max_batch = 1
+    caller_sends = 0
+    entered = asyncio.Event()
+
+    async def adapter():
+        nonlocal caller_sends
+        if asyncio.current_task() is not caller:
+            return  # The cleanup task can announce its own committed cancellation events.
+        caller_sends += 1
+        entered.set()
+        if when == "between_batches" and caller_sends == 1:
+            asyncio.get_running_loop().call_soon(caller.cancel, "stop")
+            return
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            raise ConnectionError from OSError()
+
+    caller = asyncio.create_task(bind(adapter))
+    async with asyncio.timeout(10):
+        await entered.wait()
+        if when == "suspended":
+            caller.cancel("stop")
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await caller
+    assert caught.value.args == ("stop",)
+    assert caller_sends == 1
+    assert before_send == ["running", "running"]
+    await assert_child_outcomes(store, children, "cancelled", 1)
