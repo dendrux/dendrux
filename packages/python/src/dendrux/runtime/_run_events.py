@@ -58,9 +58,22 @@ async def _finalize_running_event(
     event_data: dict[str, Any],
     *,
     emit_event: bool = True,
+    optional_failure_reason: str | None = None,
     **kwargs: Any,
 ) -> tuple[bool, bool]:
     atomic = getattr(store, "finalize_with_event", None)
+    if optional_failure_reason is not None:
+        if (
+            atomic is None
+            and (cas := getattr(store, "finalize_run_if_status_in", None)) is not None
+        ):
+            _add_failure_reason(store, "finalize_run_if_status_in", optional_failure_reason, kwargs)
+            won = await cas(
+                run_id, status=status, allowed_current_statuses=[RunStatus.RUNNING.value], **kwargs
+            )
+            return bool(won), bool(won and emit_event)
+        writer = "finalize_with_event" if atomic is not None and emit_event else "finalize_run"
+        _add_failure_reason(store, writer, optional_failure_reason, kwargs)
     if atomic is not None and emit_event:
         kwargs.pop("error_info", None)  # Carried by the atomic lifecycle event.
         seq = await atomic(
@@ -207,6 +220,14 @@ async def _pause_request_message(state_store: StateStore, run_id: str) -> str | 
     return reason if isinstance(reason, str) else None
 
 
+def _add_failure_reason(
+    store: StateStore, method: str, reason: str, fields: dict[str, Any]
+) -> None:
+    # The claim wrapper accepts **kwargs to inject the epoch. Inspect the actual writer.
+    if _run_contracts._accepts_kwarg(getattr(unclaimed_store(store), method), "failure_reason"):
+        fields["failure_reason"] = reason
+
+
 async def _transition_with_event(
     state_store: StateStore,
     run_id: str,
@@ -226,11 +247,8 @@ async def _transition_with_event(
     atomic = getattr(state_store, "finalize_with_event", None)
     reason = finalize_kwargs.pop("failure_reason", None)
     if reason is not None:
-        # The claim wrapper accepts **kwargs to inject the epoch. Inspect the actual writer.
         method = "finalize_with_event" if atomic is not None else "finalize_run_if_status_in"
-        writer = getattr(unclaimed_store(state_store), method)
-        if _run_contracts._accepts_kwarg(writer, "failure_reason"):
-            finalize_kwargs["failure_reason"] = reason
+        _add_failure_reason(state_store, method, reason, finalize_kwargs)
     if atomic is not None:
         seq = await atomic(
             run_id,
