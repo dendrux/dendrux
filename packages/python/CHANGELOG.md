@@ -15,7 +15,8 @@ custom-store authors and code that reads error text must do. No schema migration
   store capability (declared by the built-in SQL stores); without it the limit is 1. See the
   [Managed subagents guide](../../docs/guides/subagents.mdx).
   - **Several pauses.** `RunResult.pendings` lists every external pause of a workflow (depth
-    first, siblings in call order) on every result path, for workflows of up to 257 active runs
+    first, siblings in call order) on result paths (a refused stream on a store without the built-in SQL projection may return no
+    pendings: read them with the tenant-scoped `get_pendings` or `get_result`), for workflows of up to 257 active runs
     (larger ones raise `ManagedStateError(reason="binding_conflict")` on those reads), and `RunStore.get_pendings()` reads
     them. A continuation through the root names its leaf with `expected_pause_id`; an unheld
     token raises `PauseStatusMismatchError(reason="pause_id")` with `current_pause_id`. A budget
@@ -92,7 +93,7 @@ custom-store authors and code that reads error text must do. No schema migration
 
 ### Fixed
 
-- A continuation that the selected governance policy refuses (`on_governance_change="raise"`), or whose saved skill manifest no longer matches, is refused before anything is written, so the pending approval or input can be retried.
+- A continuation that the selected governance policy refuses (`on_governance_change="raise"`), or whose saved skill manifest no longer matches (for a managed parent, any change to its skill set), is refused before anything is written, so the pending approval or input can be retried.
 - A cancelled write on a file SQLite database could leave the file locked for every later writer
   (`lock_timeout`). Dendrux now closes a `sqlite+aiosqlite` connection's cursors and rolls back
   before the connection is closed, invalidated or garbage-collected, without waiting on the database
@@ -101,8 +102,9 @@ custom-store authors and code that reads error text must do. No schema migration
 - `RunStore.from_database_url(...).get_pending()` and `get_pendings()` no longer raise
   `StoreCapabilityError` for a paused fan-out workflow on SQLite.
 - Live-update `flush()` and `close()`: a cancellation pending at the start is delivered before the
-  transport is called, and one that arrives during the send or close propagates with its reason even
-  if the transport's cleanup replaces it. A transport's own timeout or cancelled future counts as a
+  transport is called, and one that arrives during the send or close propagates as a cancellation even
+  if the transport's cleanup replaces it (the caller's reason is preserved in the usual case; an
+  adapter that swallows or replaces the cancellation can change it). A transport's own timeout or cancelled future counts as a
   failed send and no longer cancels the caller or already-started fan-out children. One abandoned
   at loop shutdown ends cleanly.
 - The Agent-side `cancel_run` and the module function share one implementation; the behaviour of
