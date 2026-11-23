@@ -31,7 +31,7 @@ from dendrux.errors import (
 from dendrux.runtime import _managed_budget, _managed_cancel, _managed_definitions
 from dendrux.runtime._bounds import MAX_PAGE
 from dendrux.runtime._entry_checks import entry_checks
-from dendrux.runtime._managed_fanout_store import _UNPROJECTED
+from dendrux.runtime._managed_fanout_store import _UNPROJECTED, checkpoint_skill_pins
 from dendrux.runtime._managed_limits import _saved_walk_limit
 from dendrux.runtime._managed_pending import (
     fanout_children,
@@ -179,9 +179,13 @@ async def walk(root_agent: Agent, store: Any, root_run_id: str) -> tuple[list[_W
     waiting: list[_Waiting] = []
     agent: Agent = root_agent
     path: tuple[str, ...] = ()
-    limit = await _saved_walk_limit(store, record)
+    memo = _StateMemo(store)
+    limit = await _saved_walk_limit(memo, record)
+    state = memo.state
     for index in range(limit):
-        wait = await _outgoing(store, record, agent=agent)
+        wait = await _outgoing(
+            store, record, agent=agent, skill_pins=checkpoint_skill_pins(state.get("skills"))
+        )
         if wait is not None and wait.managed_fanout is not None:
             require_fanout(store, record.id)  # a fan-out ends this branch walk (0.8)
         if wait is None or wait.managed_wait is None:
@@ -189,16 +193,24 @@ async def walk(root_agent: Agent, store: Any, root_run_id: str) -> tuple[list[_W
         if index + 1 == limit:
             break
         binding = wait.managed_wait
-        child, path, loop = await _bound_child(store, record, binding, root_run_id, path)
+        child, path, state = await _bound_child_state(
+            store, record.id, record.tenant_id, binding, root_run_id, path
+        )
         child_agent = _execution(_registered(agent, path[-1], record.id), root_agent)
         intent = await _intent_call(store, record.id, binding.tool_call_id, wait.iteration)
-        waiting.append(_Waiting(agent, record.id, child_agent, path, intent, child.id, loop))
+        waiting.append(
+            _Waiting(agent, record.id, child_agent, path, intent, child.id, state.get("loop"))
+        )
         agent, record = child_agent, child
     raise ManagedStateError(reason="binding_conflict", run_id=root_run_id)
 
 
 async def _outgoing(
-    store: Any, record: RunRecord, *, agent: Agent | None = None
+    store: Any,
+    record: RunRecord,
+    *,
+    agent: Agent | None = None,
+    skill_pins: dict[str, str] | None | _UnsetType = _UNPROJECTED,
 ) -> PauseState | None:
     """The v3 managed wait of a parked parent, else None.
 
@@ -212,7 +224,13 @@ async def _outgoing(
         raw.get("schema_version") != 3 and raw.get("pause_reason") != MANAGED_WAIT_REASON
     ):
         return None
-    check_governance(agent, record.id, record.meta)
+    _check_definition(
+        agent,
+        record.id,
+        _record_governance(record),
+        skill_pins,
+        record.agent_name,
+    )
     return PauseState.from_managed_dict(raw, run_id=record.id)
 
 
@@ -322,7 +340,9 @@ class _Seen:
     record: RunRecord | None = None
     row_pause: tuple[str | None, str | None] = (None, None)
     row_waiting: bool = False
-    governance: dict[str, Any] | None | _UnsetType = None
+    governance: dict[str, Any] | None | _UnsetType = _UNPROJECTED
+    skill_pins: dict[str, str] | None | _UnsetType = _UNPROJECTED
+    agent_name: str | _UnsetType = _UNPROJECTED
 
     @classmethod
     def of_record(cls, record: RunRecord, state: dict[str, Any]) -> _Seen:
@@ -334,6 +354,8 @@ class _Seen:
             state.get(MANAGED_BINDING_KEY),
             record=record,
             governance=_record_governance(record),
+            skill_pins=checkpoint_skill_pins(state.get("skills")),
+            agent_name=getattr(record, "agent_name", _UNPROJECTED),
         )
 
     @classmethod
@@ -348,6 +370,8 @@ class _Seen:
             row_pause=(row.pause_id, row.pause_reason),
             row_waiting=waiting,
             governance=getattr(row, "governance", _UNPROJECTED),
+            skill_pins=getattr(row, "skill_pins", _UNPROJECTED),
+            agent_name=getattr(row, "agent_name", _UNPROJECTED),
         )
 
 
@@ -387,6 +411,7 @@ class _TreeWalk:
             children = await self._fanout(seen, wait, raw, agent, path)
         else:
             children = await self._single(seen, wait, agent, path)
+        governance, pins, name = await _projected_definition(self.store, self.root.tenant_id, seen)
         return WaitNode(
             run_id=seen.run_id,
             root_run_id=self.root.id,
@@ -394,9 +419,9 @@ class _TreeWalk:
             agent=agent,
             agent_path=path,
             pause_id=str(wait.pause_id),
-            governance=await _projected_governance(
-                self.store, self.root.tenant_id, seen.run_id, seen.governance
-            ),
+            governance=governance,
+            skill_pins=pins,
+            agent_name=name,
             version=4 if wait.managed_fanout is not None else 3,
             iteration=wait.iteration,
             children=children,
@@ -428,6 +453,8 @@ class _TreeWalk:
             status=seen.status,
             loop=seen.loop,
             governance=seen.governance,
+            skill_pins=seen.skill_pins,
+            agent_name=seen.agent_name,
             pause_id=pause.get("pause_id"),
             pause_reason=pause.get("pause_reason"),
             call=call,
@@ -569,18 +596,47 @@ def _record_governance(record: RunRecord) -> dict[str, Any] | None:
     return (getattr(record, "meta", None) or {}).get(GOVERNANCE_KEY)
 
 
-async def _projected_governance(
-    store: StateStore, tenant_id: str | None, run_id: str, saved: dict[str, Any] | None | _UnsetType
-) -> dict[str, Any] | None:
-    if isinstance(saved, _UnsetType):
-        # A custom fan-out store may project only status and binding.
-        return _record_governance(await _scoped_root(store, run_id, tenant_id))
-    return saved
+async def _projected_definition(
+    store: StateStore, tenant_id: str | None, node: _Seen | LeafNode
+) -> tuple[dict[str, Any] | None, dict[str, str] | None, str]:
+    saved, pins = node.governance, node.skill_pins
+    name = node.agent_name
+    if (
+        isinstance(saved, _UnsetType)
+        or isinstance(name, _UnsetType)
+        or isinstance(pins, _UnsetType)
+    ):
+        # An older projection needs the tenant-scoped record before its checkpoint.
+        record = await _scoped_root(store, node.run_id, tenant_id)
+        name, saved = record.agent_name, _record_governance(record)
+    if isinstance(pins, _UnsetType):
+        state = await store.get_loop_state(node.run_id) or {}
+        pins = checkpoint_skill_pins(state.get("skills"))
+    return saved, pins, name
+
+
+def _check_definition(
+    agent: Agent | None,
+    run_id: str,
+    governance: dict[str, Any] | None | _UnsetType,
+    pins: dict[str, str] | None | _UnsetType,
+    name: str | _UnsetType,
+) -> None:
+    if agent is None:
+        return
+    if isinstance(governance, _UnsetType) or isinstance(pins, _UnsetType):
+        raise ManagedStateError(reason="wait_invalid", run_id=run_id)
+    if name != agent.name:
+        raise RunNotReclaimableError(run_id, "agent_mismatch")
+    check_governance(agent, run_id, {GOVERNANCE_KEY: governance})
+    _managed_definitions.check_skill_pins(agent, run_id, pins)
 
 
 def _check_wait_governance(waits: Iterable[WaitNode]) -> None:
     for wait in waits:
-        check_governance(wait.agent, wait.run_id, {GOVERNANCE_KEY: wait.governance})
+        _check_definition(
+            wait.agent, wait.run_id, wait.governance, wait.skill_pins, wait.agent_name
+        )
 
 
 def _required_leaf(tree: WorkflowTree, pause_id: str | None) -> LeafNode:
@@ -627,7 +683,8 @@ async def _submit_or_reconnect(
     notifier: Any,
     fields: dict[str, Any],
 ) -> RunResult:
-    # Cycle: the driver imports routing to resolve bound children.
+    # Cycle: the fan-out driver imports routing. Moving this dispatch into the driver
+    # removes the import (the driver-extraction follow-up in _managed.reconnect).
     from dendrux.runtime import _managed_fanout
 
     # Legacy external pauses still block reconnect when their generation is missing.
@@ -637,7 +694,6 @@ async def _submit_or_reconnect(
         and all(value is None for value in fields.values())
         and not any(leaf.status in PAUSE_STATUSES for leaf in tree.leaves())
     ):
-        await _check_recovery_governance(store, tree)
         return await _managed_fanout.drive_tree(store, tree, notifier=notifier)
     leaf = _required_leaf(tree, expected_pause_id)
     parent = tree.ancestors(leaf.run_id)[0]
@@ -654,9 +710,9 @@ async def _check_recovery_governance(store: StateStore, tree: WorkflowTree) -> N
     _check_wait_governance(tree.waits())
     for leaf in tree.leaves():
         if leaf.status == RunStatus.RUNNING.value and leaf.loop == "react":
-            saved = await _projected_governance(store, tree.tenant_id, leaf.run_id, leaf.governance)
+            saved, pins, name = await _projected_definition(store, tree.tenant_id, leaf)
             try:
-                check_governance(leaf.agent, leaf.run_id, {GOVERNANCE_KEY: saved})
+                _check_definition(leaf.agent, leaf.run_id, saved, pins, name)
             except GovernanceMismatchError as exc:
                 # Stale-running recovery reports the store's typed refusal.
                 raise RunNotReclaimableError(leaf.run_id, "governance_changed") from exc

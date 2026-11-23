@@ -14,6 +14,7 @@ from dendrux.errors import (
 from dendrux.loops.react import ReActLoop
 from dendrux.loops.single import SingleCall
 from dendrux.runtime import _subagents
+from dendrux.skills._session import SkillSession
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -21,6 +22,12 @@ if TYPE_CHECKING:
     from dendrux.agent import Agent
 
 logger = logging.getLogger(__name__)
+
+
+def check_skill_pins(agent: Agent, run_id: str, saved: dict[str, str] | None) -> None:
+    session = SkillSession.prepare(agent)
+    if {skill.name: skill.digest for skill in session.available.values()} != saved:
+        raise RunNotReclaimableError(run_id, "skill_mismatch")
 
 
 def _check_definitions(root: Agent, store: Any) -> None:

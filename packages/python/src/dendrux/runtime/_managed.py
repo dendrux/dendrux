@@ -10,6 +10,7 @@ from dendrux import _codes
 from dendrux._lifecycle import TERMINAL_STATUSES, StoredEventType
 from dendrux.errors import ManagedStateError, RunNotFoundError
 from dendrux.runtime import (
+    _continuation_refusals,
     _managed_adoption,
     _managed_budget,
     _managed_cancel,
@@ -920,12 +921,7 @@ def routed_stream(
     notifier: Any,
     tenant_explicit: bool,
 ) -> RunStream:
-    """``Agent.resume_stream`` on a managed root, routed to the active leaf (0.7).
-
-    Routing errors (not found, a child id, a missing token) raise from the
-    first iteration before anything is claimed. A payload-free resume adopts a
-    finished subagent without a token.
-    """
+    """Route to a managed leaf. Definition refusals end with RUN_ERROR."""
     from dendrux.runtime.runner import resume_stream
     from dendrux.types import RunEvent, RunEventType
 
@@ -978,7 +974,8 @@ def routed_stream(
             state, found.root_run_id, list(found.waiting), first, resumed
         )
 
-    return workflow_stream(root_agent, open_first, run_id=run_id, notifier=notifier)
+    checked = _continuation_refusals.routed_open(open_first, run_id)
+    return workflow_stream(root_agent, checked, run_id=run_id, notifier=notifier)
 
 
 async def _adopt_finished(state: _StreamState, found: Route, resumed: Any, notifier: Any) -> Any:

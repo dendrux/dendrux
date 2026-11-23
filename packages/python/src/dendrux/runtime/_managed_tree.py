@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final, Literal, Protocol
 
 from dendrux._lifecycle import TERMINAL_STATUSES
+from dendrux._sentinel import _UNPROJECTED
 from dendrux.errors import ManagedStateError
 from dendrux.runtime._fanout_adoption_state import MAX_FANOUT, MIN_FANOUT, FanoutBinding
 
@@ -55,7 +56,9 @@ class LeafNode:
     pause_id: str | None = None
     pause_reason: str | None = None
     call: ToolCall | None = None
-    governance: dict[str, Any] | None | _UnsetType = None
+    governance: dict[str, Any] | None | _UnsetType = _UNPROJECTED
+    skill_pins: dict[str, str] | None | _UnsetType = _UNPROJECTED
+    agent_name: str | _UnsetType = _UNPROJECTED
 
     @property
     def is_terminal(self) -> bool:
@@ -97,7 +100,9 @@ class WaitNode:
     iteration: int
     children: tuple[WaitNode | LeafNode, ...]
     call: ToolCall | None = None
-    governance: dict[str, Any] | None = None
+    governance: dict[str, Any] | None | _UnsetType = _UNPROJECTED
+    skill_pins: dict[str, str] | None | _UnsetType = _UNPROJECTED
+    agent_name: str | _UnsetType = _UNPROJECTED
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "children", tuple(self.children))

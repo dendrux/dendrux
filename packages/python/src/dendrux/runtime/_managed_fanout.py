@@ -810,6 +810,7 @@ async def drive_tree(
     store: StateStore, tree: WorkflowTree, *, notifier: LoopNotifier | None
 ) -> RunResult:
     """Drive the already resolved branches and rebuild the root's pending view."""
+    await _managed_route._check_recovery_governance(store, tree)
     result = await drive_node(
         store, tree.root, tenant_id=tree.tenant_id, fanout_tree=True, notifier=notifier
     )

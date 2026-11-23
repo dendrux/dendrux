@@ -28,6 +28,8 @@ from dendrux.runtime._fanout_adoption_state import (
     adoption_marker,
     adoption_payload,
 )
+from dendrux.runtime._managed_definitions import check_skill_pins
+from dendrux.runtime._managed_fanout_store import checkpoint_skill_pins
 from dendrux.runtime._pending import _accepts_tenant
 from dendrux.runtime.durability import _ownership_handoff
 from dendrux.runtime.state import UNSCOPED, ClaimResult, _Unscoped, claimed_store
@@ -105,7 +107,6 @@ async def _admit_managed_parent(
     from dendrux.runtime import (
         submit as _submit,  # cycle: submit re-exports this module (AGENTS 6.2)
     )
-    from dendrux.skills._session import SkillSession
 
     record = await scoped_run(store, run_id, tenant_id)
     if record is None:
@@ -120,9 +121,7 @@ async def _admit_managed_parent(
         _codes.log_code(logger, _codes.GOVERNANCE_MISMATCH, run_id=run_id)
         raise GovernanceMismatchError(run_id, **change)
     state = await store.get_loop_state(run_id) or {}
-    pins = {s.name: s.digest for s in SkillSession.prepare(agent).available.values()}
-    if ((state.get("skills") or {}).get("pins", {})) != pins:
-        raise RunNotReclaimableError(run_id, "skill_mismatch")
+    check_skill_pins(agent, run_id, checkpoint_skill_pins(state.get("skills")))
     return saved
 
 

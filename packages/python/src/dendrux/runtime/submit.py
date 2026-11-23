@@ -39,24 +39,16 @@ from dendrux.errors import (
     RunNotFoundError,
     RunNotPausedError,
 )
-from dendrux.runtime._managed_claim import (
-    _admit_managed_parent as _admit_managed_parent,
-)
+from dendrux.runtime._managed_claim import _admit_managed_parent as _admit_managed_parent
 from dendrux.runtime._managed_claim import (
     _managed_adoption_validator as _managed_adoption_validator,
 )
-from dendrux.runtime._managed_claim import (
-    _refuse_tokenless_managed,
-)
-from dendrux.runtime._managed_claim import (
-    claim_managed_adoption as claim_managed_adoption,
-)
+from dendrux.runtime._managed_claim import _refuse_tokenless_managed
+from dendrux.runtime._managed_claim import claim_managed_adoption as claim_managed_adoption
 from dendrux.runtime._managed_claim import (
     managed_submission_descriptor as managed_submission_descriptor,
 )
-from dendrux.runtime._managed_claim import (
-    refuse_managed_results as refuse_managed_results,
-)
+from dendrux.runtime._managed_claim import refuse_managed_results as refuse_managed_results
 from dendrux.runtime._tenant_checks import _strict_tenancy_applies
 from dendrux.types import (
     ULID_CHARS,
@@ -1562,7 +1554,14 @@ def legacy_approval_denial(
 async def prepare_resume_results(
     agent: Agent, store: StateStore, run_id: str, pause: PauseState, results: list[ToolResult]
 ) -> list[ToolResult]:
-    if await _resume_status(store, run_id) == RunStatus.WAITING_APPROVAL.value:
+    status = await _resume_status(store, run_id)
+    return await prepare_results_for_status(agent, run_id, pause, results, status)
+
+
+async def prepare_results_for_status(
+    agent: Agent, run_id: str, pause: PauseState, results: list[ToolResult], status: str | None
+) -> list[ToolResult]:
+    if status == RunStatus.WAITING_APPROVAL.value:
         results = legacy_approval_denial(
             run_id, pause, await _validate_client_results(agent, run_id, results)
         )

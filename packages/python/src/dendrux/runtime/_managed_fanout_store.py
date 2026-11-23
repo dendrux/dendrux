@@ -13,6 +13,7 @@ import copy
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
+from dendrux._sentinel import _UNPROJECTED as _UNPROJECTED
 from dendrux._sentinel import _UnsetType
 from dendrux.runtime._fanout_adoption_state import MAX_FANOUT
 from dendrux.runtime.state import (
@@ -39,7 +40,6 @@ FANOUT_ENVELOPE_KEY = "managed_fanout"
 """Pause key of a fan-out wait's ordered binding envelope."""
 MAX_CHILD_READ = MAX_FANOUT
 """Most child ids one ``get_managed_children`` call reads."""
-_UNPROJECTED = _UnsetType()
 _ENVELOPE_KEYS = frozenset({"v", "n", "bindings"})
 _BINDING_KEYS = frozenset({"tool_call_id", "child_run_id"})
 
@@ -257,6 +257,15 @@ class ManagedChildRow:
     pause_reason: str | None
     governance: dict[str, Any] | None | _UnsetType = _UNPROJECTED
     """Projected run governance, when supplied by the store."""
+
+    agent_name: str | _UnsetType = _UNPROJECTED
+    skill_pins: dict[str, str] | None | _UnsetType = _UNPROJECTED
+
+
+def checkpoint_skill_pins(skills: Any) -> dict[str, str] | None:
+    """An absent skill section pins an empty catalogue. Malformed pins cannot match."""
+    section = skills or {}
+    return section.get("pins", {}) if isinstance(section, dict) else None
 
 
 class ManagedFanoutStore(Protocol):

@@ -460,6 +460,27 @@ def _validate_manifest(manifest: Any, run_id: str) -> None:
         raise ValueError(f"Invalid skill manifest for run '{run_id}'.")
 
 
+def check_manifest(session: SkillSession, manifest: Any, run_id: str) -> None:
+    _validate_manifest(manifest, run_id)
+    missing = []
+    mismatched = []
+    for entry in manifest["skills"]:
+        skill = session.available.get(entry["name"])
+        if skill is None:
+            missing.append(entry["name"])
+        elif skill.digest != entry["digest"]:
+            mismatched.append(SkillDigestMismatch(entry["name"], entry["digest"], skill.digest))
+    error = continuity_error(run_id, missing=missing, mismatched=mismatched)
+    if error:
+        raise error
+
+
+def check_image_manifest(agent: Agent, record: Any, run_id: str) -> None:
+    manifest = (getattr(record, "meta", None) or {}).get(META_KEY)
+    if manifest is not None:
+        check_manifest(SkillSession.prepare(agent), manifest, run_id)
+
+
 async def continuation(
     agent: Agent, store: StateStore, run_id: str, *, loop: Loop | None = None
 ) -> SkillSession:
@@ -468,18 +489,7 @@ async def continuation(
     record = await store.get_run(run_id)
     manifest = (record.meta or {}).get(META_KEY) if record else None
     if manifest is not None:
-        _validate_manifest(manifest, run_id)
-        missing = []
-        mismatched = []
-        for entry in manifest["skills"]:
-            skill = session.available.get(entry["name"])
-            if skill is None:
-                missing.append(entry["name"])
-            elif skill.digest != entry["digest"]:
-                mismatched.append(SkillDigestMismatch(entry["name"], entry["digest"], skill.digest))
-        error = continuity_error(run_id, missing=missing, mismatched=mismatched)
-        if error:
-            raise error
+        check_manifest(session, manifest, run_id)
         session = SkillSession(
             agent,
             skills=[session.available[e["name"]] for e in manifest["skills"]],

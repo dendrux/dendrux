@@ -16,6 +16,7 @@ from dendrux.chat import (
 from dendrux.errors import (
     BlobNotFoundError,
     InvalidImageError,
+    RunNotFoundError,
     safe_exception_info,
 )
 from dendrux.loops._helpers import (
@@ -72,7 +73,7 @@ if TYPE_CHECKING:
     from dendrux.media._catalog import BlobEdge
     from dendrux.media._runtime import ImageRuntime
     from dendrux.runtime._entry_guardrails import _EntryProjection
-    from dendrux.runtime.state import StateStore
+    from dendrux.runtime.state import RunRecord, StateStore
     from dendrux.skills._session import SkillSession
     from dendrux.types import (
         ContentPart,
@@ -578,6 +579,13 @@ def _single_full_source(plan: ReplayPlan | None) -> bool:
     return plan is not None and len(plan.summary.runs_full) == 1 and not plan.summary.runs_text
 
 
+async def read_resume_image_run(store: StateStore, run_id: str) -> RunRecord:
+    record = await store.get_run(run_id)
+    if record is None:
+        raise RunNotFoundError(run_id)
+    return record
+
+
 async def _ingest_resume_images(
     agent: Agent,
     provider: LLMProvider,
@@ -588,13 +596,13 @@ async def _ingest_resume_images(
     tool_results: list[ToolResult] | None,
     input_items: tuple[Any, ...],
     loop_method: str = "run",
+    record: RunRecord | None = None,
 ) -> tuple[list[ToolResult] | None, tuple[ContentPart, ...] | None]:
     """Ingest resume-time images (direct ``resume`` / ``resume_stream``) before the claim.
 
     The run, its pause status and the submitted call ids are checked first,
     so a resume that cannot claim writes no blob.
     """
-    from dendrux.errors import RunNotFoundError
     from dendrux.runtime.submit import (
         check_new_image_capability,
         ingest_tool_result_images,
@@ -602,9 +610,7 @@ async def _ingest_resume_images(
     )
 
     _require_image_loop(loop or agent.loop or ReActLoop(), loop_method)
-    record = await state_store.get_run(run_id)
-    if record is None:
-        raise RunNotFoundError(run_id)
+    record = record or await read_resume_image_run(state_store, run_id)
     allowed = (
         RESUME_RESULTS_STATUS_VALUES if tool_results is not None else RESUME_INPUT_STATUS_VALUES
     )

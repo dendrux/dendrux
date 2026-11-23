@@ -753,20 +753,18 @@ async def test_fanout_bind_refuses_a_stopped_parent_without_writes(
     await _absent(store, request)
 
 
-# ---------------------------------------------------------------------------------------------
-# K7, the status projection
-# ---------------------------------------------------------------------------------------------
-
-
 @fanout
-async def test_managed_children_projection_is_scoped_ordered_and_bounded(
-    dendrux_kit: Kit,
-) -> None:
+async def test_managed_children_projection_is_scoped_ordered_and_bounded(dendrux_kit: Kit) -> None:
     store = dendrux_kit.store
     parent, calls = await _parent(dendrux_kit, 3)
-    request = _request(
-        parent, calls, child=lambda i: {"child_meta": {GOVERNANCE_KEY: {"digest": calls[i]}}}
-    )
+
+    def policy(i: int) -> dict[str, Any]:
+        return {
+            "child_meta": {GOVERNANCE_KEY: {"digest": calls[i]}},
+            "child_loop_state": {"loop": "react", "skills": {"pins": {"kit": calls[i]}}},
+        }
+
+    request = _request(parent, calls, child=policy)
     await store.bind_managed_children(request)
     c1, c2, c3 = (c.child_run_id for c in request.children)
     other, _ = await _parent(dendrux_kit, 2)
@@ -775,8 +773,12 @@ async def test_managed_children_projection_is_scoped_ordered_and_bounded(
     for row, child in zip(rows, (request.children[2], *request.children[:2]), strict=True):
         assert row.parent_run_id == parent
         assert (row.tenant_id, row.status) == ("t", RunStatus.RUNNING.value)
-        projected = getattr(row, "governance", _UNPROJECTED)
-        assert projected in (_UNPROJECTED, {"digest": child.tool_call_id})
+        for field, expected in (
+            ("governance", {"digest": child.tool_call_id}),
+            ("skill_pins", {"kit": child.tool_call_id}),
+            ("agent_name", child.child_agent_name),
+        ):
+            assert getattr(row, field, _UNPROJECTED) in (_UNPROJECTED, expected)
         assert ManagedHeader.from_dict(row.header, run_id=row.run_id) == ManagedHeader(
             parent, ("reviewer",), parent, child.tool_call_id
         )

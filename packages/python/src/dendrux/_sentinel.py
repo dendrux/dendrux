@@ -44,6 +44,10 @@ class _UnsetType:
         return "<UNSET>"
 
 
+_UNPROJECTED = _UnsetType()
+"""A persisted field was omitted from a managed child projection."""
+
+
 class _OmittedType:
     """Type of ``_OMITTED``: the caller did not pass ``tenant_id`` at all.
 
