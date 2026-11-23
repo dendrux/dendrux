@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.8.0 - unreleased
+## 0.8.0 - 2026-11-24
 
 See [Upgrading to 0.8.0](../../docs/upgrading-to-0.8.0.mdx) for the upgrade steps and what
 custom-store authors and code that reads error text must do. No schema migration is needed.
