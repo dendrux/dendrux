@@ -27,7 +27,7 @@ There is one method on `Agent` for cancellation, and its behavior depends on wha
 
 ### Cancelling around `on_started`
 
-The `on_started=` callback of `run()` and `retry()` receives the run id before the first model call, so a cancel can arrive before, during or after it. The callback is called even if a cancel is already pending. When it returns, the run reads its control state again: a pending cancel (from `Agent.cancel_run`, `dendrux.cancel_run` or `task.cancel()`) finalizes the run as `cancelled`; a run that `sweep()` or `reclaim()` took over stops without model or tool work.
+The `on_started=` callback of `run()` and `retry()` receives the run id before the first model call, so a cancel can arrive before, during or after it. The callback is called even if a durable cancel request is already pending; a same-instance `Agent.cancel_run` or `task.cancel()` that interrupts startup before the callback boundary can prevent the call. When it returns, the run reads its control state again: a pending cancel (from `Agent.cancel_run`, `dendrux.cancel_run` or `task.cancel()`) finalizes the run as `cancelled`; a run that `sweep()` or `reclaim()` took over stops without model or tool work.
 
 If the callback raises, the outcome follows the same read. When the control read sees a pending request, the run ends `cancelled`. When the request commits after that read, the late `error` wins: the run ends `error` (code `on_started_failed`), the caller gets `OnStartedError`, and the terminal write clears `cancel_requested`. Either way there is exactly one terminal event. See [`on_started`](/docs/reference/agent#on_started).
 

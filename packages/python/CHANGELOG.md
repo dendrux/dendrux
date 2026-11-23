@@ -34,7 +34,7 @@ custom-store authors and code that reads error text must take. No schema migrati
     leaf can make one more unchecked provider call before it observes a breach.
   - `Limits.max_parallel_subagents` and `MAX_PARALLEL_SUBAGENTS`.
 - **`waiting_for`.** `RunSummary`, `RunDetail` and `get_subtree` nodes report
-  `waiting_for="subagents"` for a run that is paused only because its subagents are working.
+  `waiting_for="subagents"` for a parent stored as paused on a managed wait. The label describes the parent only; a child may still need a person, so check `get_pendings(root)`.
   `RunStore.list_runs()` and `count_runs()` take `include_waiting=False` to leave those runs out
   (new `waiting_filter` store capability), and `dendrux runs --exclude-waiting` does the same.
   Stored statuses and existing filters are unchanged.
