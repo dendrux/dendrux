@@ -40,7 +40,11 @@ from dendrux.runtime import (
     _run_started,
     _run_tools,
 )
-from dendrux.runtime._entry_checks import resolve_runner_tenant, runner_entry_checks
+from dendrux.runtime._entry_checks import (
+    check_on_started,
+    resolve_runner_tenant,
+    runner_entry_checks,
+)
 from dendrux.runtime._run_errors import (
     logger,
 )
@@ -393,6 +397,7 @@ async def retry(
         ValueError: If the source run is not terminal, if the source
             run was SingleCall, or if no traces exist.
     """
+    check_on_started(on_started)
     # 1. Validate source run is terminal. A missing run and another tenant's
     # run raise the same RunNotFoundError (B13), so retry is no existence oracle.
     tenant_explicit = _tenant_scope_chosen(tenant_id)
@@ -472,8 +477,6 @@ async def retry(
             run_id, state_store, getattr(agent, "_task_manager", None)
         )
 
-        seed_kwargs: dict[str, Any] = {}
-        run_guardrails = None
         try:
             try:
                 seed_kwargs, run_guardrails = await _run_entry._runtime_seeds(

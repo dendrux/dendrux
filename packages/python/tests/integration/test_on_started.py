@@ -7,8 +7,10 @@ import inspect
 from unittest.mock import AsyncMock
 
 import pytest
+from sqlalchemy import select
 
 from dendrux import Agent, cancel_run
+from dendrux.db.models import AgentRun, RunEvent
 from dendrux.llm.mock import MockLLM
 from dendrux.loops.base import BaseNotifier
 from dendrux.loops.react import ReActLoop
@@ -37,6 +39,37 @@ def test_explicit_keyword_only(entry):
 
 
 @pytest.mark.parametrize("entry", ["run", "retry"])
+@pytest.mark.parametrize("direct", [False, True], ids=["agent", "runner"])
+async def test_noncallable_on_started_leaves_no_run_or_event(
+    store, engine, entry, direct, monkeypatch
+):
+    agent, provider = make_agent(store)
+    source = await agent.run("source", tenant_id=None) if entry == "retry" else None
+
+    async def persisted_ids():
+        async with engine.connect() as conn:
+            runs = set(await conn.scalars(select(AgentRun.id)))
+            events = set(await conn.scalars(select(RunEvent.id)))
+        return runs, events
+
+    before = await persisted_ids()
+    resolve_store = AsyncMock(wraps=agent._resolve_state_store)
+    monkeypatch.setattr(agent, "_resolve_state_store", resolve_store)
+    options = dict(tenant_id=None, on_started="not callable")
+    if direct:
+        options.update(agent=agent, provider=provider, state_store=store)
+    entry_point = runner if direct else agent
+    with pytest.raises(ValueError, match="on_started"):
+        if source:
+            await entry_point.retry(source.run_id, **options)
+        else:
+            await entry_point.run(user_input="go", **options)
+    assert await persisted_ids() == before
+    resolve_store.assert_not_awaited()
+    assert provider.calls_made == int(source is not None)
+
+
+@pytest.mark.parametrize("entry", ["run", "retry"])
 async def test_async_callback_observes_claim_in_caller_before_model(store, entry):
     agent, provider = make_agent(store)
     source = await agent.run("hello", tenant_id=None) if entry == "retry" else None
@@ -58,6 +91,27 @@ async def test_async_callback_observes_claim_in_caller_before_model(store, entry
     assert result.status == RunStatus.SUCCESS
     assert seen == [result.run_id]
     assert result.run_id not in agent._task_manager._owned
+
+
+@pytest.mark.parametrize("entry", ["run_stream", "resume_stream"])
+@pytest.mark.parametrize("callback", [None, lambda run_id: None], ids=["none", "callable"])
+async def test_runner_stream_refuses_on_started_at_construction(store, engine, entry, callback):
+    agent, provider = make_agent(store)
+    resolver = AsyncMock(return_value=store)
+    options = dict(
+        agent=agent, provider=provider, state_store_resolver=resolver, on_started=callback
+    )
+    with pytest.raises(ValueError) as refused:
+        if entry == "run_stream":
+            runner.run_stream(user_input="go", tenant_id=None, **options)
+        else:
+            runner.resume_stream("01ARZ3NDEKTSV4RRFFQ69G5FAV", **options)
+    assert str(refused.value) == "on_started is only supported on run()/retry()."
+    resolver.assert_not_awaited()
+    assert provider.call_history == []
+    async with engine.connect() as conn:
+        assert (await conn.scalars(select(AgentRun.id))).first() is None
+        assert (await conn.scalars(select(RunEvent.id))).first() is None
 
 
 @pytest.mark.parametrize("entry", ["run", "retry"])

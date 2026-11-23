@@ -259,6 +259,12 @@ Missing or invalid codes remain unset. Category and HTTP status remain independe
 | `subagent_too_deep` | WARNING | `code`, `count`, `kind`, `limit`, `run_id`, `tenant_id` | An Agent is built with a subagent deeper than the delegation depth ceiling. | Flatten the tree or raise max_delegation_depth. |
 | `subagent_tree_too_large` | WARNING | `code`, `kind`, `limit`, `run_id`, `tenant_id` | An Agent is built with a subagent tree over the node bound. | Reduce the subagent tree; a reused agent counts once per path. |
 
+## Testing
+
+| Code | Level | Fields | Fires when | Do |
+| --- | --- | --- | --- | --- |
+| `fake_model_predicate_error` | WARNING | `code`, `kind`, `run_id` | A FakeModel when() predicate raises an exception. | Inspect the predicate for the agent and turn recorded by FakeModel.script_errors(). |
+
 ## Tool
 
 | Code | Level | Fields | Fires when | Do |

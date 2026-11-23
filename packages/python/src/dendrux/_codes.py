@@ -520,6 +520,14 @@ METADATA_TOO_LARGE = Code(
     "Metadata exceeds its byte bound.",
     "Reduce metadata or raise the bound.",
 )
+FAKE_MODEL_PREDICATE_ERROR = Code(
+    "fake_model_predicate_error",
+    logging.WARNING,
+    "testing",
+    frozenset({"code", "kind", "run_id"}),
+    "A FakeModel when() predicate raises an exception.",
+    "Inspect the predicate for the agent and turn recorded by FakeModel.script_errors().",
+)
 ON_STARTED_FAILED = Code(
     "on_started_failed",
     logging.ERROR,
@@ -2198,6 +2206,7 @@ REGISTRY = MappingProxyType(
             TENANT_SCOPE_REQUIRED,
             RESERVED_METADATA_KEY,
             METADATA_TOO_LARGE,
+            FAKE_MODEL_PREDICATE_ERROR,
             ON_STARTED_FAILED,
             RUN_FAILED,
             READ_ARGUMENT_INVALID,

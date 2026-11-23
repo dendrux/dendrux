@@ -27,7 +27,11 @@ from dendrux.runtime import (
     _run_tools,
 )
 from dendrux.runtime._capabilities import fanout_support
-from dendrux.runtime._entry_checks import resolve_runner_tenant, runner_entry_checks
+from dendrux.runtime._entry_checks import (
+    check_on_started,
+    resolve_runner_tenant,
+    runner_entry_checks,
+)
 from dendrux.runtime._managed_cancel import (
     ManagedRootStoppedError,
 )
@@ -210,7 +214,7 @@ async def run(
         tenant_id=tenant_id,
         metadata=metadata,
         extra_notifier=extra_notifier,
-        on_started=on_started,
+        on_started=check_on_started(on_started),
         max_delegation_depth=max_delegation_depth,
         idempotency_key=idempotency_key,
         output_type=output_type,

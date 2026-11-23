@@ -40,6 +40,7 @@ from dendrux.runtime import (
     _run_start,
     _run_tools,
 )
+from dendrux.runtime._entry_checks import reject_stream_on_started
 from dendrux.runtime._managed_cancel import (
     ManagedRootStoppedError,
 )
@@ -58,6 +59,7 @@ from dendrux.types import (
     PauseState,
     RunEventType,
     RunStatus,
+    RunStream,
     _usage_from_dict,
 )
 
@@ -77,7 +79,6 @@ if TYPE_CHECKING:
         ContentPart,
         RunEvent,
         RunResult,
-        RunStream,
         ToolResult,
     )
 
@@ -492,6 +493,7 @@ async def _initial_stream_images(
     return store, results, None, False
 
 
+@reject_stream_on_started
 def resume_stream(
     run_id: str,
     *,
@@ -526,7 +528,6 @@ def resume_stream(
     ``__anext__`` and leaves the run waiting.
     """
     from dendrux.types import RunEvent, RunResult
-    from dendrux.types import RunStream as _RunStream
 
     input_items: tuple[Any, ...] = ()
     if user_input is not None:
@@ -794,7 +795,7 @@ def resume_stream(
             )
         return None
 
-    return _RunStream(
+    return RunStream(
         run_id=run_id,
         generator=stream_context.wrap(_generate()),
         cleanup=lambda: _run_events._shielded_cleanup(_cleanup, run_id=run_id),

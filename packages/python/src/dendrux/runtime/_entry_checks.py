@@ -15,15 +15,19 @@ call time, so tests can monkeypatch their functions.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Literal, TypeAlias, TypeVar, cast
+from functools import wraps
+from typing import TYPE_CHECKING, Any, Literal, ParamSpec, TypeAlias, TypeVar, cast
 
 from dendrux import pricing
 from dendrux.runtime import _limit_checks, _tenant_checks
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from dendrux._sentinel import _OmittedType
     from dendrux.agent import Agent
     from dendrux.runtime.state import TenantScope
+    from dendrux.types import RunStream
 
 EntryPoint: TypeAlias = Literal[
     "run",
@@ -44,6 +48,8 @@ RunnerEntryPoint: TypeAlias = Literal["run", "stream", "retry"]
 _NEW_RUN_ENTRIES = frozenset({"run", "stream", "retry"})
 
 _T = TypeVar("_T", bound="TenantScope")
+_CallbackT = TypeVar("_CallbackT")
+_P = ParamSpec("_P")
 
 
 def entry_checks(
@@ -89,6 +95,25 @@ def runner_entry_checks(
     )
     _limit_checks.check_runner_entry(agent, entry, tenant_id=tenant_id, metadata=metadata, **fields)
     check_runner_budget(agent, fields.get("provider"), fields.get("provider_kwargs"))
+
+
+def check_on_started(value: _CallbackT) -> _CallbackT:
+    """Validate and return the start callback before run or retry performs any I/O."""
+    if value is not None and not callable(value):
+        raise ValueError("on_started must be callable or None")
+    return value
+
+
+def reject_stream_on_started(entry: Callable[_P, RunStream]) -> Callable[_P, RunStream]:
+    """Reject the reserved keyword before binding a stream constructor's arguments."""
+
+    @wraps(entry)
+    def checked(*args: _P.args, **kwargs: _P.kwargs) -> RunStream:
+        if "on_started" in kwargs:
+            raise ValueError("on_started is only supported on run()/retry().")
+        return entry(*args, **kwargs)
+
+    return checked
 
 
 def require_boolean(value: Any, field: str, *, optional: bool = False) -> None:

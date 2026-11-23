@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
+import logging
 
 import pytest
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -116,6 +118,41 @@ async def test_exhaustion_and_unmatched_when_are_recorded_without_text():
     assert fake.script_errors() == [("a", 1, "exhausted"), ("b", 0, "no_when_match")]
 
 
+def _predicate_or_raise(messages):
+    if messages[-1].content == "alpha":
+        return True
+    raise IndexError("SENTINEL-PREDICATE-73")
+
+
+@pytest.mark.parametrize("run_id", ["01ARZ3NDEKTSV4RRFFQ69G5FAV", "SENTINEL-NON-ULID"])
+async def test_predicate_exception_after_same_slot_succeeds(caplog, run_id):
+    fake = FakeModel({"a": [when(_predicate_or_raise, say("ok")), say("fallback")]})
+    provider = fake.provider("a")
+    assert (await provider.complete(history(text="alpha"))).text == "ok"
+    with pytest.raises(FakeModelScriptError) as caught:
+        await provider.complete(history(text="beta"), run_id=run_id)
+    assert caught.value.code == "predicate_error"
+    assert "SENTINEL-PREDICATE-73" not in _texts(caught.value) + caplog.text
+    (record,) = [r for r in caplog.records if r.name == "dendrux.testing.fake_model"]
+    assert record.code == "fake_model_predicate_error" and record.kind == "testing"
+    assert not hasattr(record, "retryable")
+    assert getattr(record, "run_id", None) == (None if run_id.startswith("SENTINEL") else run_id)
+    assert "SENTINEL" not in repr(record.__dict__)
+    assert fake.script_errors() == [("a", 0, "predicate_error")]
+    with pytest.raises(AssertionError, match="predicate_error"):
+        fake.assert_all_used()
+
+
+async def test_predicate_cancellation_propagates_without_a_script_error():
+    def cancel(messages):
+        raise asyncio.CancelledError
+
+    fake = FakeModel({"a": [when(cancel, say("unused"))]})
+    with pytest.raises(asyncio.CancelledError):
+        await fake.provider("a").complete(history())
+    assert fake.script_errors() == []
+
+
 def _fanout(tmp_path, fake, children, parent_calls):
     kids = [Agent(name=n, description="d", prompt="p", provider=fake.provider(n)) for n in children]
     return Agent(
@@ -170,6 +207,35 @@ async def test_fanout_missing_when_branch_fails_all_used(tmp_path, streaming):
     assert result.status == RunStatus.SUCCESS
     with pytest.raises(AssertionError, match=r"helper@0"):
         fake.assert_all_used()
+
+
+async def test_fanout_predicate_exception_after_same_slot_succeeds(tmp_path, caplog):
+    caplog.set_level(logging.DEBUG)
+    fake = FakeModel(
+        {
+            "parent": [
+                calls(call("helper", task="alpha"), call("helper", task="beta")),
+                say("done"),
+            ],
+            "helper": [when(_predicate_or_raise, say("ok"))],
+        }
+    )
+    parent = _fanout(tmp_path, fake, ["helper"], None)
+    try:
+        result = await parent.run("go", tenant_id="t")
+        assert result.status == RunStatus.SUCCESS
+        store = await parent._resolve_state_store()
+        ids = await store.get_children_page([result.run_id], after=None, limit=2, tenant_id="t")
+        children = [await store.get_run(run_id) for run_id in ids]
+        assert sorted(c.status for c in children) == ["error", "success"]
+        failed = next(c for c in children if c.status == "error")
+        events = await store.get_run_events(failed.id)
+        assert "SENTINEL-PREDICATE-73" not in str((failed.error, events, caplog.text))
+        assert fake.script_errors() == [("helper", 0, "predicate_error")]
+        with pytest.raises(AssertionError, match="predicate_error"):
+            fake.assert_all_used()
+    finally:
+        await parent.close()
 
 
 async def test_clean_run_passes_both_assertions():
