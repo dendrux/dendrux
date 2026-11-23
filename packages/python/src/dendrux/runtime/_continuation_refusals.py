@@ -6,34 +6,39 @@ from functools import wraps
 from typing import TYPE_CHECKING, Any, TypeVar
 
 from dendrux.errors import GovernanceMismatchError, RunNotReclaimableError, SkillContinuityError
-from dendrux.runtime import _managed_stream, _run_images
+from dendrux.runtime import _managed_route, _managed_stream, _refusal_view, _run_images
 from dendrux.skills._session import check_image_manifest
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
     from dendrux.agent import Agent
-    from dendrux.runtime.state import RunRecord, StateStore
+    from dendrux.runtime.state import RunRecord, StateStore, TenantScope
 
 T = TypeVar("T")
 DefinitionRefusal = GovernanceMismatchError | SkillContinuityError | ValueError
 
 
-def routed_open(open_first: Callable[..., Any], run_id: str) -> Callable[..., Any]:
+def routed_open(
+    open_first: Callable[..., Any], run_id: str, tenant_id: TenantScope
+) -> Callable[..., Any]:
     @wraps(open_first)
     async def open_checked(state: Any) -> Any:
-        try:
-            return await open_first(state)
-        except (GovernanceMismatchError, RunNotReclaimableError) as exc:
-            if isinstance(exc, RunNotReclaimableError) and exc.reason not in {
-                "skill_mismatch",
-                "agent_mismatch",
-            }:
-                raise
-            # Routing has admitted this tenant. A refusal owns no run, even if closed here.
-            state.root_active, state.root_run_id = True, run_id
-            event = await _managed_stream._stream_failure(state, exc, run_id)
-            return _managed_stream._Single(event), None
+        state.store = await state.root_agent._resolve_state_store()
+        root = await _managed_route._scoped_root(state.store, run_id, tenant_id)
+        with _refusal_view.admitted_root(state.store, root):
+            try:
+                return await open_first(state, root)
+            except (GovernanceMismatchError, RunNotReclaimableError) as exc:
+                if isinstance(exc, RunNotReclaimableError) and exc.reason not in {
+                    "skill_mismatch",
+                    "agent_mismatch",
+                }:
+                    raise
+                # Routing has admitted this tenant. A refusal owns no run, even if closed here.
+                state.root_active, state.root_run_id = True, run_id
+                event = await _managed_stream._stream_failure(state, exc, run_id)
+                return _managed_stream._Single(event), None
 
     return open_checked
 

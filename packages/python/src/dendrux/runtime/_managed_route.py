@@ -31,6 +31,7 @@ from dendrux.errors import (
 from dendrux.runtime import _managed_budget, _managed_cancel, _managed_definitions
 from dendrux.runtime._bounds import MAX_PAGE
 from dendrux.runtime._entry_checks import entry_checks
+from dendrux.runtime._managed_claim import scoped_run
 from dendrux.runtime._managed_fanout_store import _UNPROJECTED, checkpoint_skill_pins
 from dendrux.runtime._managed_limits import _saved_walk_limit
 from dendrux.runtime._managed_pending import (
@@ -40,7 +41,8 @@ from dendrux.runtime._managed_pending import (
     require_fanout,
 )
 from dendrux.runtime._managed_tree import LeafNode, WaitNode, WorkflowTree
-from dendrux.runtime._run_pending import _build_cached_result, attach_pendings
+from dendrux.runtime._refusal_view import root_reader
+from dendrux.runtime._run_pending import attach_pendings
 from dendrux.runtime.state import (
     MANAGED_BINDING_KEY,
     MANAGED_HEADER_KEY,
@@ -92,7 +94,7 @@ async def root_view(store: Any, root_run_id: str) -> RunResult:
     A root waiting on a subagent reports its active branch: the leaf's external
     pause, or RUNNING while a subagent runs or awaits adoption.
     """
-    return await _build_cached_result(store, root_run_id)
+    return await root_reader.get()(store, root_run_id)
 
 
 def _root_result(record: RunRecord, *, status: RunStatus, **fields: Any) -> RunResult:
@@ -167,15 +169,15 @@ class Route:
         return bool(self.waiting)
 
 
-async def walk(root_agent: Agent, store: Any, root_run_id: str) -> tuple[list[_Waiting], RunRecord]:
+async def walk(
+    root_agent: Agent, store: Any, root_run_id: str, tenant_id: TenantScope = UNSCOPED
+) -> tuple[list[_Waiting], RunRecord]:
     """Follow each v3 wait's exact child id, validating every hop; bounded.
 
     A v4 fan-out wait ends the branch as its leaf (callers read its view); on a store
     without fan-out it is refused (``fanout_capability``) before anything is claimed.
     """
-    record = await store.get_run(root_run_id)
-    if record is None:
-        raise RunNotFoundError(root_run_id)
+    record = await _scoped_root(store, root_run_id, tenant_id)
     waiting: list[_Waiting] = []
     agent: Agent = root_agent
     path: tuple[str, ...] = ()
@@ -541,8 +543,8 @@ async def walk_tree(
 
 
 async def _scoped_root(store: Any, run_id: str, tenant_id: Any) -> RunRecord:
-    record: RunRecord | None = await store.get_run(run_id)
-    if record is None or (tenant_id is not UNSCOPED and record.tenant_id != tenant_id):
+    record = await scoped_run(store, run_id, tenant_id)
+    if record is None:
         raise RunNotFoundError(run_id)
     return record
 

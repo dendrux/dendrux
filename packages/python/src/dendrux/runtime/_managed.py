@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 from dendrux import _codes
 from dendrux._lifecycle import TERMINAL_STATUSES, StoredEventType
-from dendrux.errors import ManagedStateError, RunNotFoundError
+from dendrux.errors import ManagedStateError
 from dendrux.runtime import (
     _continuation_refusals,
     _managed_adoption,
@@ -88,7 +88,7 @@ if TYPE_CHECKING:
 
     from dendrux.agent import Agent
     from dendrux.loops.base import LoopNotifier, LoopRecorder
-    from dendrux.runtime.state import StateStore
+    from dendrux.runtime.state import RunRecord, StateStore
     from dendrux.types import RunStream
 
 
@@ -638,20 +638,20 @@ async def complete_adoption(
 # ---------------------------------------------------------------------------
 
 
-async def route(root_agent: Agent, store: Any, run_id: str, *, tenant_id: Any) -> Route:
+async def route(
+    root_agent: Agent, store: Any, run_id: str, *, tenant_id: Any, admitted: RunRecord | None = None
+) -> Route:
     """Resolve the active leaf after validating tenant, root and registered path."""
     from dendrux.errors import ManagedChildControlError
-    from dendrux.runtime.state import UNSCOPED
 
-    record = await store.get_run(run_id)
-    if record is None or (tenant_id is not UNSCOPED and record.tenant_id != tenant_id):
-        raise RunNotFoundError(run_id)
+    record = admitted or await _managed_route._scoped_root(store, run_id, tenant_id)
+    tenant_id = record.tenant_id
     if await _managed_cancel.managed_child_header(store, record):
         raise ManagedChildControlError(run_id)
     await _managed_budget.route_checkpoint(root_agent, store, record)
-    waiting, leaf = await _managed_route.walk(root_agent, store, run_id)
+    waiting, leaf = await _managed_route.walk(root_agent, store, run_id, tenant_id)
     leaf_agent = waiting[-1].child if waiting else root_agent
-    return Route(run_id, record.tenant_id, tuple(waiting), leaf, leaf_agent)
+    return Route(run_id, tenant_id, tuple(waiting), leaf, leaf_agent)
 
 
 def require_leaf_pause(found: Route, expected_pause_id: str | None) -> None:
@@ -933,9 +933,9 @@ def routed_stream(
         "tenant_explicit": tenant_explicit,
     }
 
-    async def open_first(state: _StreamState) -> Any:
-        state.store = store = await root_agent._resolve_state_store()
-        found = await route(root_agent, store, run_id, tenant_id=tenant_id)
+    async def open_first(state: _StreamState, record: RunRecord) -> Any:
+        store = state.store
+        found = await route(root_agent, store, run_id, tenant_id=record.tenant_id, admitted=record)
         state.root_run_id, state.tenant_id = run_id, found.tenant_id
         if await _managed_route.reaches_fanout(store, found):  # a fan-out below (0.8)
             return await _managed_stream.open_fanout_leaf(state, root_agent, found, **leaf_kwargs)
@@ -974,7 +974,7 @@ def routed_stream(
             state, found.root_run_id, list(found.waiting), first, resumed
         )
 
-    checked = _continuation_refusals.routed_open(open_first, run_id)
+    checked = _continuation_refusals.routed_open(open_first, run_id, tenant_id)
     return workflow_stream(root_agent, checked, run_id=run_id, notifier=notifier)
 
 
