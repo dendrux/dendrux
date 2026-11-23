@@ -43,6 +43,7 @@ from dendrux.types import (
 )
 
 if TYPE_CHECKING:
+    import asyncio
     from collections.abc import (
         Callable,
     )
@@ -272,11 +273,12 @@ class _RunLifecycle(ManagedStopLifecycle):
 
     async def _cancelled(
         self,
+        cancellation: asyncio.CancelledError,
         result: RunResult | None,
         meta: dict[str, Any],
         recorder: LoopRecorder | None,
         notifier: LoopNotifier | None,
-    ) -> tuple[RunResult, bool]:
+    ) -> RunResult:
         manager = self.manager if self.registered else None
         interrupted, swallow = _run_events._take_task_interrupt(manager, self.run_id)
         cancelled = await _run_events._drain_task_cancellation(
@@ -290,7 +292,9 @@ class _RunLifecycle(ManagedStopLifecycle):
         _run_observers._attach_mcp_meta(cancelled, meta)
         if self.started:
             await self._cancel_finish(recorder, notifier, cancelled)
-        return cancelled, _run_events._may_swallow_cancellation(swallow)
+        if _run_events._may_swallow_cancellation(swallow):
+            return cancelled
+        raise cancellation
 
     def _release(self) -> None:
         if self.registered and self.manager is not None:

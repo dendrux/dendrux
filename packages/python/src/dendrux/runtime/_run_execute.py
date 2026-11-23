@@ -23,6 +23,7 @@ from dendrux.runtime import (
     _run_outcome,
     _run_pending,
     _run_start,
+    _run_started,
     _run_tools,
 )
 from dendrux.runtime._capabilities import fanout_support
@@ -54,6 +55,8 @@ from dendrux.types import (
 
 if TYPE_CHECKING:
     from collections.abc import (
+        Awaitable,
+        Callable,
         Sequence,
     )
 
@@ -96,6 +99,7 @@ async def run(
     tenant_id: str | None | _OmittedType = ...,
     metadata: dict[str, Any] | None = ...,
     extra_notifier: LoopNotifier | None = ...,
+    on_started: Callable[[str], Awaitable[None] | None] | None = ...,
     max_delegation_depth: int | None,
     idempotency_key: str | None = ...,
     output_type: type | None = ...,
@@ -121,6 +125,7 @@ async def run(
     tenant_id: str | None | _OmittedType = ...,
     metadata: dict[str, Any] | None = ...,
     extra_notifier: LoopNotifier | None = ...,
+    on_started: Callable[[str], Awaitable[None] | None] | None = ...,
     idempotency_key: str | None = ...,
     output_type: type | None = ...,
     **kwargs: Any,
@@ -144,16 +149,13 @@ async def run(
     tenant_id: str | None | _OmittedType = _OMITTED,
     metadata: dict[str, Any] | None = None,
     extra_notifier: LoopNotifier | None = None,
+    on_started: Callable[[str], Awaitable[None] | None] | None = None,
     max_delegation_depth: int | None | _UnsetType = _UNSET_DEPTH,
     idempotency_key: str | None = None,
     output_type: type | None = None,
     **kwargs: Any,
 ) -> RunResult:
     """Run an agent to completion.
-
-    This is the primary API for executing a Dendrux agent. It wires
-    together the agent definition, LLM provider, strategy, and loop,
-    then executes the loop until completion.
 
     Args:
         agent: Agent definition (model, tools, prompt, limits).
@@ -172,7 +174,8 @@ async def run(
             run tree. Default 10. None means unbounded. Propagated to
             all child runs via contextvar. Raises DelegationDepthExceededError
             if a child run would exceed this depth.
-        **kwargs: Reserved for future use.
+        on_started: Receives the new persisted root id before model or tool work.
+        **kwargs: Forwarded to the LLM provider.
 
     Returns:
         RunResult with status, answer, steps, and usage stats.
@@ -210,6 +213,7 @@ async def run(
         tenant_id=tenant_id,
         metadata=metadata,
         extra_notifier=extra_notifier,
+        on_started=on_started,
         max_delegation_depth=max_delegation_depth,
         idempotency_key=idempotency_key,
         output_type=output_type,
@@ -237,6 +241,7 @@ async def _run_once(
     tenant_id: str | None | _OmittedType = _OMITTED,
     metadata: dict[str, Any] | None = None,
     extra_notifier: LoopNotifier | None = None,
+    on_started: Callable[[str], Awaitable[None] | None] | None = None,
     max_delegation_depth: int | None | _UnsetType = _run_contracts._UNSET_DEPTH,
     idempotency_key: str | None = None,
     output_type: type | None = None,
@@ -461,11 +466,12 @@ async def _run_once(
                     loop=asyncio.get_running_loop(),
                 )
                 ctx_token = set_delegation_context(this_ctx)
+                result = await _run_started.notify_started(
+                    lifecycle, on_started, delegation_level, extra_notifier
+                )
+                if result is not None:
+                    return result
 
-                # Emit init governance events (skills + MCP) inside the try block
-                # so discovery failures flow through the error cleanup path.
-                # _MCPDiscoveryError is caught here, mcp.error emitted, then the
-                # original cause is re-raised for the outer except Exception.
                 await _run_tools._discover_runtime_tools(
                     agent, lifecycle.recorder, extra_notifier, run_id, resolved_loop, mcp_meta
                 )
@@ -547,22 +553,18 @@ async def _run_once(
 
                 result.meta = _run_errors._public_meta(result.meta)
 
-                return result
-
             except (ManagedRootStoppedError, RunFencedError) as stop:
-                return await lifecycle._stopped(stop, lifecycle.recorder, extra_notifier)
+                result = await lifecycle._stopped(stop, lifecycle.recorder, extra_notifier)
 
             except Exception as exc:
                 await lifecycle._failed(exc, mcp_meta, lifecycle.recorder, extra_notifier)
                 raise
 
-        except asyncio.CancelledError:
-            cancelled_result, swallow = await lifecycle._cancelled(
-                result, mcp_meta, lifecycle.recorder, extra_notifier
+            return result
+        except asyncio.CancelledError as cancellation:
+            return await lifecycle._cancelled(
+                cancellation, result, mcp_meta, lifecycle.recorder, extra_notifier
             )
-            if swallow:
-                return cancelled_result
-            raise
 
         finally:
             _run_images._release_memory_edges(image_runtime, state_store, run_id)
@@ -612,11 +614,8 @@ async def _run_preclaimed(frame: _PreclaimedChild, notifier: LoopNotifier | None
         except Exception as error:  # noqa: BLE001, RUF100 - the owned run lifecycle persists failure before branch isolation.
             await lifecycle._failed(error, {}, lifecycle.recorder, notifier)
             raise
-    except asyncio.CancelledError:
-        cancelled, swallow = await lifecycle._cancelled(None, {}, lifecycle.recorder, notifier)
-        if swallow:
-            return cancelled
-        raise
+    except asyncio.CancelledError as cancellation:
+        return await lifecycle._cancelled(cancellation, None, {}, lifecycle.recorder, notifier)
     finally:
         lifecycle._release()
 

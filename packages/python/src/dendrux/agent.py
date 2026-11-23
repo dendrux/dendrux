@@ -1351,6 +1351,7 @@ class Agent:
         tenant_id: str | None = ...,
         metadata: dict[str, Any] | None = ...,
         notifier: LoopNotifier | None = ...,
+        on_started: Callable[[str], Awaitable[None] | None] | None = ...,
         max_delegation_depth: int | None,
         idempotency_key: str | None = ...,
         output_type: type[BaseModel] | None = ...,
@@ -1371,6 +1372,7 @@ class Agent:
         tenant_id: str | None = ...,
         metadata: dict[str, Any] | None = ...,
         notifier: LoopNotifier | None = ...,
+        on_started: Callable[[str], Awaitable[None] | None] | None = ...,
         idempotency_key: str | None = ...,
         output_type: type[BaseModel] | None = ...,
         **kwargs: Any,
@@ -1389,15 +1391,13 @@ class Agent:
         tenant_id: str | None | _OmittedType = _OMITTED,
         metadata: dict[str, Any] | None = None,
         notifier: LoopNotifier | None = None,
+        on_started: Callable[[str], Awaitable[None] | None] | None = None,
         max_delegation_depth: int | None | _UnsetType = _UNSET,
         idempotency_key: str | None = None,
         output_type: type[BaseModel] | None | _UnsetType = _UNSET,
         **kwargs: Any,
     ) -> RunResult:
         """Start a new agent run.
-
-        Delegates to runner.run() with this agent's provider and persistence
-        config.
 
         Args:
             user_input: The user's input: a string, or a sequence of strings
@@ -1449,6 +1449,9 @@ class Agent:
             notifier: Optional notifier for lifecycle events (e.g. ConsoleNotifier
                 for terminal output, custom notifiers for Slack/Telegram/etc.).
                 Composed with PersistenceRecorder internally if persistence is enabled.
+            on_started: Receives the new persisted root id. Save the id and return promptly.
+                For child, ephemeral, and cached runs, read RunResult.run_id. For active
+                duplicates, read RunAlreadyActiveError.run_id.
             max_delegation_depth: Maximum allowed delegation depth for the run
                 tree. Default 10. None means unbounded. Child runs inherit
                 this limit automatically.
@@ -1457,9 +1460,8 @@ class Agent:
                 returned. If still active, RunAlreadyActiveError is raised. If the
                 same key is reused with different input, IdempotencyConflictError
                 is raised. Requires persistence (database_url or state_store).
-                The hash includes ``history``, ``context``
-                and the ``runs`` / ``replay_last`` / ``replay_reasoning`` knobs —
-                same input with a different prefix is a different request.
+                The hash includes ``history``, ``context``, ``runs``, ``replay_last``, and
+                ``replay_reasoning``. A different prefix makes a different request.
             **kwargs: Forwarded to the LLM provider. Pass ``model=`` to override
                 the provider's configured model for this call only (e.g.
                 ``model="claude-opus-4-1"``) — useful for per-turn model selection
@@ -1508,18 +1510,15 @@ class Agent:
         _validate_max_delegation_depth(max_delegation_depth)
         provider = self._require_provider()
 
-        # Resolve output_type: run-level overrides agent default
         resolved_output_type = (
             self._output_type if isinstance(output_type, _UnsetType) else output_type
         )
 
-        # Validate output_type + loop compatibility at call time
         if resolved_output_type is not None:
             from dendrux.loops.single import SingleCall
 
             effective_loop = self._loop
             if effective_loop is None:
-                # Runner will default to ReActLoop — that's not SingleCall
                 raise ValueError(
                     f"output_type={resolved_output_type.__name__} requires SingleCall loop. "
                     f"Set loop=SingleCall() on the Agent or remove output_type."
@@ -1559,6 +1558,7 @@ class Agent:
             tenant_id=requested_tenant_id,
             metadata=metadata,
             extra_notifier=notifier,
+            on_started=on_started,
             idempotency_key=idempotency_key,
             output_type=resolved_output_type,
             **run_kwargs,
@@ -1572,14 +1572,12 @@ class Agent:
         tenant_id: str | None | _OmittedType = _OMITTED,
         metadata: dict[str, Any] | None = None,
         notifier: LoopNotifier | None = None,
+        on_started: Callable[[str], Awaitable[None] | None] | None = None,
         **kwargs: Any,
     ) -> RunResult:
         """Retry a terminal run with approximate prior context.
 
-        Creates a fresh run seeded with the original run's conversation
-        history from persisted traces. The LLM sees the prior conversation
-        and can continue from context. This is NOT resume — it's a new
-        run with approximate context, fresh counters, fresh usage.
+        Seeds a new run from the source conversation with fresh counters and usage.
 
         Works for any terminal run (error, cancelled, max_iterations,
         success). Source run must have used a retry-capable loop (not
@@ -1590,6 +1588,7 @@ class Agent:
             tenant_id: Optional tenant ID for the retry run.
             metadata: Optional developer metadata for the retry run.
             notifier: Optional notifier for lifecycle events.
+            on_started: As in run(), receives the new retry run id.
             **kwargs: Forwarded to the LLM provider.
 
         Returns:
@@ -1633,6 +1632,7 @@ class Agent:
             tenant_id=requested_tenant_id,
             metadata=metadata,
             extra_notifier=notifier,
+            on_started=on_started,
             **kwargs,
         )
 
