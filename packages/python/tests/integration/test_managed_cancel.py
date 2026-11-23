@@ -6,6 +6,8 @@ import asyncio
 import time
 from collections import Counter
 from contextlib import AsyncExitStack
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from functools import partial, wraps
 from typing import TYPE_CHECKING, Any
@@ -594,75 +596,168 @@ RACE_OFFSETS_MS: tuple[float | str, ...] = (
 )
 
 
-def timed(spans: list[tuple[float, float]], method: Any) -> Any:
-    """Record the interval of a store-method call (not server-side SQL execution).
+_GATED_CALL: ContextVar[str | None] = ContextVar("gated_call", default=None)
 
-    The wrapper keeps the method's signature, which store capability checks inspect.
+# Backends blocking the opposing writers, following each blocker's own blockers.
+_BLOCKED_BY_FIRST = text(
+    "WITH RECURSIVE chain(pid) AS ("
+    " SELECT unnest(pg_blocking_pids(o.pid)) FROM unnest(CAST(:opposing AS integer[])) AS o(pid)"
+    " UNION SELECT unnest(pg_blocking_pids(chain.pid)) FROM chain"
+    ") SELECT count(*) FROM chain WHERE pid = CAST(:first AS integer)"
+)
+
+
+@dataclass
+class OrderGate:
+    """Make one racing iteration's write order certain, with real row-lock contention.
+
+    The first writer executes its UPDATE (taking the run's row lock) and then holds its
+    commit until Postgres reports that exact backend in ``pg_blocking_pids`` of the
+    designated opposing writer, directly or through a writer queued ahead of it on the
+    same row (Postgres reports the queue head, not the lock holder); only then does it
+    commit. ``cancel_first``: a canceller's
+    ``request_cancel`` is first and the owner's finalize must be blocked by it.
+    ``finalize_first``: the owner's finalize is first and a canceller's write must be
+    blocked by it. Each store has one pooled connection, so its backend PID identifies
+    its writer. Waits elsewhere in the database never count. If the opposing writer is
+    not blocked by the first while it is uncommitted (for example, writes serialized in
+    the client), ``contended`` stays False and the iteration fails.
     """
+
+    observer: Any
+    mode: str | None = None
+    delay: float = 0.0
+    owner_pids: tuple[int, ...] = ()
+    cancel_pids: tuple[int, ...] = ()
+    holding: asyncio.Event = field(default_factory=asyncio.Event)
+    contended: bool = False
+
+    def reset(self, mode: str | None) -> None:
+        self.mode, self.holding, self.contended = mode, asyncio.Event(), False
+
+    def first_writer(self, call: str | None) -> bool:
+        return (self.mode == "cancel_first" and call == "request_cancel") or (
+            self.mode == "finalize_first" and call == "finalize_with_event"
+        )
+
+    async def before_write(self, *, owner: bool) -> None:
+        """The second writer starts its statement only once the first holds the row lock."""
+        second = (self.mode == "cancel_first" and owner) or (
+            self.mode == "finalize_first" and not owner
+        )
+        if second:
+            await asyncio.wait_for(self.holding.wait(), 10)
+        await asyncio.sleep(self.delay)  # an injected slow database, for the speed proof
+
+    async def hold_commit(self, session: Any) -> None:
+        """Inside the first writer's transaction: wait until it blocks the opposing writer."""
+        first = int(await session.scalar(text("SELECT pg_backend_pid()")))
+        opposing = list(self.owner_pids if self.mode == "cancel_first" else self.cancel_pids)
+        self.holding.set()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            async with self.observer.connect() as conn:
+                blocked = await conn.scalar(
+                    _BLOCKED_BY_FIRST, {"opposing": opposing, "first": first}
+                )
+            if blocked:
+                self.contended = True
+                return
+            await asyncio.sleep(0.005)
+
+
+async def backend_pid(store: Any) -> int:
+    """The backend of a store's single pooled connection (``parallel_stores``)."""
+    async with store._engine.connect() as conn:
+        return int(await conn.scalar(text("SELECT pg_backend_pid()")))
+
+
+def gated_write(method: Any, gate: OrderGate, *, owner: bool) -> Any:
+    """Run a store write under the gate (signature kept for capability checks)."""
 
     @wraps(method)
     async def call(*args: Any, **kwargs: Any) -> Any:
-        begun = time.monotonic()
+        token = _GATED_CALL.set(method.__name__)
         try:
+            await gate.before_write(owner=owner)
             return await method(*args, **kwargs)
         finally:
-            spans.append((begun, time.monotonic()))
+            _GATED_CALL.reset(token)
 
     return call
 
 
+def gated_commit(write_tx: Any, gate: OrderGate) -> Any:
+    """Hold the first writer's commit (its row lock is held) until contention is seen."""
+
+    @wraps(write_tx)
+    async def call(session: Any, *args: Any, **kwargs: Any) -> Any:
+        if gate.first_writer(_GATED_CALL.get()):
+            await gate.hold_commit(session)
+        return await write_tx(session, *args, **kwargs)
+
+    return call
+
+
+@pytest.mark.parametrize("delay_ms", [0, 50])
 @pytest.mark.parametrize("script", ["final", "tool_then_final"])
 async def test_pg_module_cancels_race_owner_finalization(
-    store: Any, engine: Any, monkeypatch: Any, script: str
+    store: Any, engine: Any, monkeypatch: Any, script: str, delay_ms: int
 ) -> None:
     """Owner and cancellers are released together, so cancel writes race the owner's finalize.
 
     Either the request lands first (the owner then completes, or stops at a checkpoint) or the
-    owner's finalize wins (the canceller finds a terminal row). The racing (timed-offset)
-    iterations alone must show both orders and at least one overlap of a canceller's write
-    interval with the owner's finalize interval; the sequential anchors are checked on their
-    own and never count. No iteration may revive the run, change its epoch or write a second
-    terminal event. Racing passes repeat, up to a bound, until that evidence is seen.
+    owner's finalize wins (the canceller finds a terminal row). Each racing (timed-offset)
+    iteration is gated to one order, alternating, with the second writer's statement
+    observed waiting on the first writer's uncommitted row lock (see ``OrderGate``): so both
+    orders occur with real database contention on any machine (``delay_ms`` slows every
+    gated write to prove it). The sequential anchors are checked on their own and never
+    count. No iteration may revive the run, change its epoch or write a second terminal
+    event.
     """
     racing: Counter[str] = Counter()
-    overlaps = passes = 0
+    contended = 0
     async with AsyncExitStack() as stack:
         owner_store, *cancel_stores = await parallel_stores(engine, stack, count=3)
-        finalize_spans: list[tuple[float, float]] = []
-        request_spans: list[tuple[float, float]] = []
+        gate = OrderGate(
+            observer=engine,
+            delay=delay_ms / 1000,
+            owner_pids=(await backend_pid(owner_store),),
+            cancel_pids=tuple([await backend_pid(other) for other in cancel_stores]),
+        )
         monkeypatch.setattr(
             owner_store,
             "finalize_with_event",
-            timed(finalize_spans, owner_store.finalize_with_event),
+            gated_write(owner_store.finalize_with_event, gate, owner=True),
         )
+        for target in (owner_store, *cancel_stores):
+            monkeypatch.setattr(target, "_write_tx", gated_commit(target._write_tx, gate))
         for other in cancel_stores:
             for name in ("request_cancel", "mark_cancel_requested"):
-                monkeypatch.setattr(other, name, timed(request_spans, getattr(other, name)))
-        while passes < MAX_RACE_PASSES and not (overlaps and both_orders(racing)):
-            passes += 1
-            for offset in RACE_OFFSETS_MS:
-                finalize_spans.clear()
-                request_spans.clear()
-                order = await race_once(store, engine, owner_store, cancel_stores, offset, script)
-                if isinstance(offset, str):
-                    expected = "cancel_first" if offset == "before" else "finalize_first"
-                    assert order.startswith(expected), (offset, order)
-                    continue
-                racing[order] += 1
-                overlaps += any(
-                    begun < f_end and f_begun < end
-                    for begun, end in request_spans
-                    for f_begun, f_end in finalize_spans
-                )
+                wrapped = gated_write(getattr(other, name), gate, owner=False)
+                monkeypatch.setattr(other, name, wrapped)
+        racing_index = 0
+        for offset in RACE_OFFSETS_MS:
+            mode = None
+            if not isinstance(offset, str):
+                mode = ("cancel_first", "finalize_first")[racing_index % 2]
+                racing_index += 1
+            gate.reset(mode)
+            order = await race_once(store, engine, owner_store, cancel_stores, offset, script)
+            if mode is None:
+                expected = "cancel_first" if offset == "before" else "finalize_first"
+                assert order.startswith(expected), (offset, order)
+                continue
+            assert order.startswith(mode), (offset, mode, order)
+            assert gate.contended, f"no row-lock contention: {offset=} {mode=} {order=}"
+            racing[order] += 1
+            contended += 1
     print(
-        f"\nRACE {script}: passes={passes} racing_orders={dict(racing)} "
-        f"store_method_interval_overlaps={overlaps}"
+        f"\nRACE {script} delay={delay_ms}ms: racing_orders={dict(racing)} "
+        f"row_lock_contention={contended}"
     )
-    assert overlaps > 0, f"no racing iteration overlapped the owner's finalize: {dict(racing)}"
+    assert contended > 0, f"no racing iteration contended on the row lock: {dict(racing)}"
     assert both_orders(racing), f"racing iterations missed an order: {dict(racing)}"
-
-
-MAX_RACE_PASSES = 5
 
 
 def both_orders(orders: Counter[str]) -> bool:
