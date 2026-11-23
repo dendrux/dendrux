@@ -72,12 +72,13 @@ async def _persist_run_failure(
     payload: dict[str, Any] | None = None,
     finalize: dict[str, Any] | None = None,
     strict: bool = False,
+    optional_failure_reason: str | None = None,
 ) -> bool:
     """Finalize a running run as ERROR and write its ``run.error`` under one rule.
 
     Without ``payload``/``finalize`` both derive from ``exc``. A caller with its own
-    safe event data and terminal fields (a blocked-content stop) passes them and
-    ``exc=None``; ``strict`` then lets a failed finalize propagate.
+    safe event data and terminal fields passes them with ``exc=None``. With ``strict``
+    a failed finalize propagates. An optional reason is stored when the writer supports it.
     """
     try:
         # Deriving text from ``exc`` can itself raise; it fails like the write does.
@@ -88,6 +89,7 @@ async def _persist_run_failure(
             RunStatus.ERROR.value,
             StoredEventType.RUN_ERROR.value,
             payload,
+            optional_failure_reason=optional_failure_reason,
             **finalize,
         )
     except Exception:
