@@ -24,7 +24,7 @@ dependencies = [
     "pydantic>=2.0,<3.0",
     "typer>=0.12,<1.0",
     "rich>=13.0,<15.0",
-    "python-ulid>=2.0,<4.0",
+    "python-ulid>=2.0,<5.0",
     "pyyaml>=6.0,<7.0",
     # SQLAlchemy is the default (and currently only built-in) StateStore
     # backend. Imported at module load by runtime/state.py, so it must
