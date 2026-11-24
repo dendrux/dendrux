@@ -3,14 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+import time
+from collections import Counter
 from contextlib import AsyncExitStack
-from typing import Any
+from contextvars import ContextVar
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from functools import partial, wraps
+from typing import TYPE_CHECKING, Any
 
 import pytest
-from sqlalchemy import update
+from sqlalchemy import text, update
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from dendrux import Agent
+import dendrux
+from dendrux import Agent, sweep, tool
 from dendrux.db.models import AgentRun, TokenUsage, ToolCallRecord
 from dendrux.errors import ManagedChildControlError, RunCancelledError, RunControlError
 from dendrux.runtime import _managed, _managed_cancel
@@ -27,14 +34,20 @@ from dendrux.types import (
     generate_ulid,
 )
 from tests._helpers.recovery_checkpoint import expire
+from tests._helpers.scripted_provider import ScriptedLLM, tool_call
 from tests.integration.test_managed_adoption import (
     child_agent,
     crash_before_adoption,
     fresh_root,
     rows,
+    settle_all,
+    terminal_history,
 )
 from tests.integration.test_managed_bind import bind_request, managed_parent
 from tests.integration.test_managed_routing import ContextLLM, call, read_sheet
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
 
 TENANT = "t1"
 
@@ -48,6 +61,13 @@ def controller(store: Any, **kwargs: Any) -> Agent:
         strict_tenancy=False,
         **kwargs,
     )
+
+
+def cancel_via(kind: str, store: Any, run_id: str) -> Any:
+    """Cancel through an Agent or the standalone entry; both share one administrative service."""
+    if kind == "agent":
+        return controller(store).cancel_run(run_id)
+    return dendrux.cancel_run(run_id, tenant_id=TENANT, state_store=store)
 
 
 async def chain(store: Any) -> tuple[str, str, str]:
@@ -295,27 +315,51 @@ async def parallel_stores(engine: Any, stack: AsyncExitStack, count: int = 8) ->
     for _ in range(count):
         other = create_async_engine(engine.url, pool_size=1, max_overflow=0)
         stack.push_async_callback(other.dispose)
+        async with other.connect() as conn:  # warm the one pooled connection before the race
+            await conn.execute(text("SELECT 1"))
         stores.append(store_for_engine(other))
     return stores
 
 
+async def together(*calls: Callable[[], Awaitable[Any]]) -> list[Any]:
+    """Release every call through one barrier and join them all; return results or errors."""
+    ready = asyncio.Event()
+
+    async def gated(call: Callable[[], Awaitable[Any]]) -> Any:
+        await ready.wait()
+        return await call()
+
+    tasks = [asyncio.create_task(gated(call)) for call in calls]
+    await asyncio.sleep(0)  # every task is parked on the barrier
+    ready.set()
+    return await settle_all(*tasks)
+
+
+async def settled_histories(engine: Any, *run_ids: str) -> list[Any]:
+    return [await terminal_history(engine, run_id) for run_id in run_ids]
+
+
+async def later_cancel_changes_nothing(engine: Any, store: Any, root: str, *run_ids: str) -> None:
+    """A follow-up control attempt appends no event and revives no run."""
+    before = await settled_histories(engine, root, *run_ids)
+    statuses = [(await store.get_run(rid)).status for rid in (root, *run_ids)]
+    await dendrux.cancel_run(root, tenant_id=TENANT, state_store=store)
+    assert await settled_histories(engine, root, *run_ids) == before
+    assert [(await store.get_run(rid)).status for rid in (root, *run_ids)] == statuses
+
+
+@pytest.mark.parametrize("canceller", ["agent", "module"])
 @pytest.mark.parametrize("round_", range(3))
 async def test_pg_cancel_versus_eight_binders_has_no_orphans(
-    store: Any, engine: Any, round_: int
+    store: Any, engine: Any, round_: int, canceller: str
 ) -> None:
     async with AsyncExitStack() as stack:
-        stores = await parallel_stores(engine, stack)
+        *stores, cancel_store = await parallel_stores(engine, stack, count=9)
         root, call_id = await managed_parent(store)
-        ready = asyncio.Event()
-
-        async def bind(other: Any) -> Any:
-            await ready.wait()
-            return await other.bind_managed_child(bind_request(root, call_id))
-
-        tasks = [asyncio.create_task(bind(other)) for other in stores]
-        tasks.append(asyncio.create_task(controller(stores[0]).cancel_run(root)))
-        ready.set()
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        results = await together(
+            *(partial(other.bind_managed_child, bind_request(root, call_id)) for other in stores),
+            partial(cancel_via, canceller, cancel_store, root),
+        )
     for result in results:
         assert not isinstance(result, BaseException) or isinstance(result, RunCancelledError), (
             result
@@ -331,6 +375,33 @@ async def test_pg_cancel_versus_eight_binders_has_no_orphans(
         assert children[0].cancel_requested
 
 
+@pytest.mark.parametrize("canceller", ["agent", "module"])
+@pytest.mark.parametrize("first", ["cancel", "bind"])
+async def test_pg_cancel_and_bind_in_a_fixed_order(
+    store: Any, engine: Any, first: str, canceller: str
+) -> None:
+    """Both orders, made explicit: a marked parent refuses the bind; a bound child is marked."""
+    async with AsyncExitStack() as stack:
+        binder, cancel_store = await parallel_stores(engine, stack, count=2)
+        root, call_id = await managed_parent(store)
+        if first == "cancel":
+            await cancel_via(canceller, cancel_store, root)
+            with pytest.raises(RunCancelledError):
+                await binder.bind_managed_child(bind_request(root, call_id))
+        else:
+            bound = await binder.bind_managed_child(bind_request(root, call_id))
+            assert bound.outcome == "created"
+            await cancel_via(canceller, cancel_store, root)
+    children = await rows(engine, AgentRun, AgentRun.parent_run_id == root)
+    intents = await rows(engine, ToolCallRecord, ToolCallRecord.agent_run_id == root)
+    assert len(children) == len(intents) == (0 if first == "cancel" else 1)
+    root_row = await store.get_run(root)
+    assert root_row.cancel_requested or root_row.status == "cancelled"
+    if children:
+        assert intents[0].meta["managed"]["child_run_id"] == children[0].id
+        assert children[0].cancel_requested or children[0].status == "cancelled"
+
+
 def submission_root(store: Any) -> Agent:
     return Agent(
         name="lead",
@@ -341,24 +412,28 @@ def submission_root(store: Any) -> Agent:
     )
 
 
+@pytest.mark.parametrize("canceller", ["agent", "module"])
 @pytest.mark.parametrize("round_", range(3))
 async def test_pg_cancel_versus_eight_leaf_submissions(
-    store: Any, engine: Any, round_: int
+    store: Any, engine: Any, round_: int, canceller: str
 ) -> None:
     async with AsyncExitStack() as stack:
-        stores = await parallel_stores(engine, stack)
+        *stores, cancel_store = await parallel_stores(engine, stack, count=9)
         _, root, child, pending = await paused_workflow(store)
         agents = [submission_root(other) for other in stores]
         result = ToolResult(name="read_sheet", call_id=pending.tool_calls[0].id, payload='"ok"')
-        results = await asyncio.gather(
+        results = await together(
             *(
-                a.submit_tool_results(
-                    root, [result], tenant_id=TENANT, expected_pause_id=pending.pause_id
+                partial(
+                    a.submit_tool_results,
+                    root,
+                    [result],
+                    tenant_id=TENANT,
+                    expected_pause_id=pending.pause_id,
                 )
                 for a in agents
             ),
-            controller(stores[0]).cancel_run(root),
-            return_exceptions=True,
+            partial(cancel_via, canceller, cancel_store, root),
         )
     for outcome in results:
         assert not isinstance(outcome, BaseException) or isinstance(outcome, RunControlError), (
@@ -371,14 +446,20 @@ async def test_pg_cancel_versus_eight_leaf_submissions(
     assert len(await rows(engine, AgentRun)) == 2
     assert sum(a.subagents[0].provider.calls for a in agents) <= 1
     assert sum(a.provider.calls for a in agents) <= 1
+    calls = [(a.provider.calls, a.subagents[0].provider.calls) for a in agents]
+    await later_cancel_changes_nothing(engine, store, root, child)
+    assert [(a.provider.calls, a.subagents[0].provider.calls) for a in agents] == calls
 
 
+@pytest.mark.parametrize("canceller", ["agent", "module"])
 @pytest.mark.parametrize("round_", range(3))
-async def test_pg_cancel_versus_eight_reclaims(store: Any, engine: Any, round_: int) -> None:
+async def test_pg_cancel_versus_eight_reclaims(
+    store: Any, engine: Any, round_: int, canceller: str
+) -> None:
     from tests.integration.test_managed_recovery import _dead_child, lead, reviewer
 
     async with AsyncExitStack() as stack:
-        stores = await parallel_stores(engine, stack)
+        *stores, cancel_store = await parallel_stores(engine, stack, count=9)
         root, child = await _dead_child(store, engine)
         await expire(store, engine, child.id)
         before = await store.get_run(child.id)
@@ -390,10 +471,9 @@ async def test_pg_cancel_versus_eight_reclaims(store: Any, engine: Any, round_: 
             )
             for other in stores
         ]
-        results = await asyncio.gather(
-            *(a.reclaim(root, tenant_id=TENANT) for a in agents),
-            controller(stores[0]).cancel_run(root),
-            return_exceptions=True,
+        results = await together(
+            *(partial(a.reclaim, root, tenant_id=TENANT) for a in agents),
+            partial(cancel_via, canceller, cancel_store, root),
         )
     for outcome in results:
         assert not isinstance(outcome, BaseException) or isinstance(outcome, RunControlError), (
@@ -409,22 +489,25 @@ async def test_pg_cancel_versus_eight_reclaims(store: Any, engine: Any, round_: 
     assert len(await rows(engine, AgentRun)) == 2
     assert sum(a.subagents[0].provider.calls for a in agents) <= 1
     assert sum(a.provider.calls for a in agents) <= 1
+    calls = [(a.provider.calls, a.subagents[0].provider.calls) for a in agents]
+    await later_cancel_changes_nothing(engine, store, root, child.id)
+    assert [(a.provider.calls, a.subagents[0].provider.calls) for a in agents] == calls
 
 
+@pytest.mark.parametrize("canceller", ["agent", "module"])
 @pytest.mark.parametrize("round_", range(3))
 async def test_pg_cancel_versus_eight_adoptions(
-    store: Any, engine: Any, monkeypatch: Any, round_: int
+    store: Any, engine: Any, monkeypatch: Any, round_: int, canceller: str
 ) -> None:
     from dendrux.db.models import ReactTrace, RunEvent
 
     async with AsyncExitStack() as stack:
-        stores = await parallel_stores(engine, stack)
+        *stores, cancel_store = await parallel_stores(engine, stack, count=9)
         root, child = await crash_before_adoption(store, engine, monkeypatch)
         agents = [fresh_root(other, LLMResponse(text="done"))[0] for other in stores]
-        results = await asyncio.gather(
-            *(a.reclaim(root, tenant_id=TENANT) for a in agents),
-            controller(stores[0]).cancel_run(root),
-            return_exceptions=True,
+        results = await together(
+            *(partial(a.reclaim, root, tenant_id=TENANT) for a in agents),
+            partial(cancel_via, canceller, cancel_store, root),
         )
     for outcome in results:
         assert not isinstance(outcome, BaseException) or isinstance(outcome, RunControlError), (
@@ -444,6 +527,398 @@ async def test_pg_cancel_versus_eight_adoptions(
     assert len(await rows(engine, TokenUsage, TokenUsage.agent_run_id == child)) == 1
     assert sum(a.provider.calls for a in agents) <= 1
     assert sum(a.subagents[0].provider.calls for a in agents) == 0
+    calls = [(a.provider.calls, a.subagents[0].provider.calls) for a in agents]
+    await later_cancel_changes_nothing(engine, store, root, child)
+    assert [(a.provider.calls, a.subagents[0].provider.calls) for a in agents] == calls
+
+
+async def run_events(engine: Any, run_id: str) -> list[Any]:
+    from dendrux.db.models import RunEvent
+
+    events = await rows(engine, RunEvent, RunEvent.agent_run_id == run_id)
+    return sorted(events, key=lambda event: event.sequence_index)
+
+
+@tool()
+async def noop() -> str:
+    """Return at once."""
+    return "ok"
+
+
+@pytest.mark.parametrize(("gate_at", "expected"), [(0, "cancelled"), (1, "success")])
+async def test_pg_module_cancels_versus_live_running_owner(
+    store: Any, engine: Any, gate_at: int, expected: str
+) -> None:
+    """Checkpoint orders, made explicit: cancels finish while the owner waits in a model call."""
+    async with AsyncExitStack() as stack:
+        owner_store, *stores = await parallel_stores(engine, stack, count=5)
+        llm = ScriptedLLM([tool_call("noop", pid="n1"), LLMResponse(text="done")], gate_at=gate_at)
+        owner = Agent(name="owner", prompt="p", provider=llm, tools=[noop], state_store=owner_store)
+        task = asyncio.create_task(owner.run("go", tenant_id=TENANT))
+        cancels: list[asyncio.Task[Any]] = []
+        try:
+            await asyncio.wait_for(llm.entered.wait(), 10)
+            run_id = (await store.list_runs())[0].id
+            before = await store.get_run(run_id)
+            cancels = [
+                asyncio.create_task(dendrux.cancel_run(run_id, tenant_id=TENANT, state_store=s))
+                for s in stores
+            ]
+            results = await asyncio.gather(*cancels)
+            during = await store.get_run(run_id)
+        finally:
+            # Join every task on every path before the engines are disposed.
+            llm.gate.set()
+            *_, outcome = await settle_all(*cancels, task)
+    assert {(r.status, r.meta["cancel_requested"]) for r in results} == {(RunStatus.RUNNING, True)}
+    assert (during.status, during.claim_epoch) == ("running", before.claim_epoch)
+    if isinstance(outcome, BaseException):
+        raise outcome  # the owner's own failure, after every task was joined
+    assert outcome.status.value == expected
+    final = await store.get_run(run_id)
+    assert (final.status, final.claim_epoch) == (expected, before.claim_epoch)
+    events = [e.event_type for e in await run_events(engine, run_id)]
+    terminal = [e for e in events if e in {"run.cancelled", "run.completed"}]
+    assert terminal == [f"run.{'completed' if expected == 'success' else 'cancelled'}"]
+    assert events[-1] == terminal[0]
+    again = await dendrux.cancel_run(run_id, tenant_id=TENANT, state_store=store)
+    assert again.status.value == expected
+    assert [e.event_type for e in await run_events(engine, run_id)] == events
+
+
+# Canceller start relative to the owner's release, in ms (negative: owner released later).
+# Two anchors make each order certain even on a slow machine: "before" finishes every cancel
+# before the owner is released; "after" cancels only once the owner has finished.
+RACE_OFFSETS_MS: tuple[float | str, ...] = (
+    "before",
+    *(-6, -3, -2, -1, -0.5, 0, 0, 0, 0.5, 1, 2, 3, 4, 6, 9, 14, 20, 30, 45, 70, 100),
+    "after",
+)
+
+
+_GATED_CALL: ContextVar[str | None] = ContextVar("gated_call", default=None)
+
+# Backends blocking the opposing writers, following each blocker's own blockers.
+_BLOCKED_BY_FIRST = text(
+    "WITH RECURSIVE chain(pid) AS ("
+    " SELECT unnest(pg_blocking_pids(o.pid)) FROM unnest(CAST(:opposing AS integer[])) AS o(pid)"
+    " UNION SELECT unnest(pg_blocking_pids(chain.pid)) FROM chain"
+    ") SELECT count(*) FROM chain WHERE pid = CAST(:first AS integer)"
+)
+
+
+@dataclass
+class OrderGate:
+    """Make one racing iteration's write order certain, with real row-lock contention.
+
+    The first writer executes its UPDATE (taking the run's row lock) and then holds its
+    commit until Postgres reports that exact backend in ``pg_blocking_pids`` of the
+    designated opposing writer, directly or through a writer queued ahead of it on the
+    same row (Postgres reports the queue head, not the lock holder); only then does it
+    commit. ``cancel_first``: a canceller's
+    ``request_cancel`` is first and the owner's finalize must be blocked by it.
+    ``finalize_first``: the owner's finalize is first and a canceller's write must be
+    blocked by it. Each store has one pooled connection, so its backend PID identifies
+    its writer. Waits elsewhere in the database never count. If the opposing writer is
+    not blocked by the first while it is uncommitted (for example, writes serialized in
+    the client), ``contended`` stays False and the iteration fails.
+    """
+
+    observer: Any
+    mode: str | None = None
+    delay: float = 0.0
+    owner_pids: tuple[int, ...] = ()
+    cancel_pids: tuple[int, ...] = ()
+    holding: asyncio.Event = field(default_factory=asyncio.Event)
+    contended: bool = False
+
+    def reset(self, mode: str | None) -> None:
+        self.mode, self.holding, self.contended = mode, asyncio.Event(), False
+
+    def first_writer(self, call: str | None) -> bool:
+        return (self.mode == "cancel_first" and call == "request_cancel") or (
+            self.mode == "finalize_first" and call == "finalize_with_event"
+        )
+
+    async def before_write(self, *, owner: bool) -> None:
+        """The second writer starts its statement only once the first holds the row lock."""
+        second = (self.mode == "cancel_first" and owner) or (
+            self.mode == "finalize_first" and not owner
+        )
+        if second:
+            await asyncio.wait_for(self.holding.wait(), 10)
+        await asyncio.sleep(self.delay)  # an injected slow database, for the speed proof
+
+    async def hold_commit(self, session: Any) -> None:
+        """Inside the first writer's transaction: wait until it blocks the opposing writer."""
+        first = int(await session.scalar(text("SELECT pg_backend_pid()")))
+        opposing = list(self.owner_pids if self.mode == "cancel_first" else self.cancel_pids)
+        self.holding.set()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            async with self.observer.connect() as conn:
+                blocked = await conn.scalar(
+                    _BLOCKED_BY_FIRST, {"opposing": opposing, "first": first}
+                )
+            if blocked:
+                self.contended = True
+                return
+            await asyncio.sleep(0.005)
+
+
+async def backend_pid(store: Any) -> int:
+    """The backend of a store's single pooled connection (``parallel_stores``)."""
+    async with store._engine.connect() as conn:
+        return int(await conn.scalar(text("SELECT pg_backend_pid()")))
+
+
+def gated_write(method: Any, gate: OrderGate, *, owner: bool) -> Any:
+    """Run a store write under the gate (signature kept for capability checks)."""
+
+    @wraps(method)
+    async def call(*args: Any, **kwargs: Any) -> Any:
+        token = _GATED_CALL.set(method.__name__)
+        try:
+            await gate.before_write(owner=owner)
+            return await method(*args, **kwargs)
+        finally:
+            _GATED_CALL.reset(token)
+
+    return call
+
+
+def gated_commit(write_tx: Any, gate: OrderGate) -> Any:
+    """Hold the first writer's commit (its row lock is held) until contention is seen."""
+
+    @wraps(write_tx)
+    async def call(session: Any, *args: Any, **kwargs: Any) -> Any:
+        if gate.first_writer(_GATED_CALL.get()):
+            await gate.hold_commit(session)
+        return await write_tx(session, *args, **kwargs)
+
+    return call
+
+
+@pytest.mark.parametrize("delay_ms", [0, 50])
+@pytest.mark.parametrize("script", ["final", "tool_then_final"])
+async def test_pg_module_cancels_race_owner_finalization(
+    store: Any, engine: Any, monkeypatch: Any, script: str, delay_ms: int
+) -> None:
+    """Owner and cancellers are released together, so cancel writes race the owner's finalize.
+
+    Either the request lands first (the owner then completes, or stops at a checkpoint) or the
+    owner's finalize wins (the canceller finds a terminal row). Each racing (timed-offset)
+    iteration is gated to one order, alternating, with the second writer's statement
+    observed waiting on the first writer's uncommitted row lock (see ``OrderGate``): so both
+    orders occur with real database contention on any machine (``delay_ms`` slows every
+    gated write to prove it). The sequential anchors are checked on their own and never
+    count. No iteration may revive the run, change its epoch or write a second terminal
+    event.
+    """
+    racing: Counter[str] = Counter()
+    contended = 0
+    async with AsyncExitStack() as stack:
+        owner_store, *cancel_stores = await parallel_stores(engine, stack, count=3)
+        gate = OrderGate(
+            observer=engine,
+            delay=delay_ms / 1000,
+            owner_pids=(await backend_pid(owner_store),),
+            cancel_pids=tuple([await backend_pid(other) for other in cancel_stores]),
+        )
+        monkeypatch.setattr(
+            owner_store,
+            "finalize_with_event",
+            gated_write(owner_store.finalize_with_event, gate, owner=True),
+        )
+        for target in (owner_store, *cancel_stores):
+            monkeypatch.setattr(target, "_write_tx", gated_commit(target._write_tx, gate))
+        for other in cancel_stores:
+            for name in ("request_cancel", "mark_cancel_requested"):
+                wrapped = gated_write(getattr(other, name), gate, owner=False)
+                monkeypatch.setattr(other, name, wrapped)
+        racing_index = 0
+        for offset in RACE_OFFSETS_MS:
+            mode = None
+            if not isinstance(offset, str):
+                mode = ("cancel_first", "finalize_first")[racing_index % 2]
+                racing_index += 1
+            gate.reset(mode)
+            order = await race_once(store, engine, owner_store, cancel_stores, offset, script)
+            if mode is None:
+                expected = "cancel_first" if offset == "before" else "finalize_first"
+                assert order.startswith(expected), (offset, order)
+                continue
+            assert order.startswith(mode), (offset, mode, order)
+            assert gate.contended, f"no row-lock contention: {offset=} {mode=} {order=}"
+            racing[order] += 1
+            contended += 1
+    print(
+        f"\nRACE {script} delay={delay_ms}ms: racing_orders={dict(racing)} "
+        f"row_lock_contention={contended}"
+    )
+    assert contended > 0, f"no racing iteration contended on the row lock: {dict(racing)}"
+    assert both_orders(racing), f"racing iterations missed an order: {dict(racing)}"
+
+
+def both_orders(orders: Counter[str]) -> bool:
+    return {key.split(":")[0] for key in orders} == {"cancel_first", "finalize_first"}
+
+
+async def owner_entered(llm: Any, run_task: asyncio.Task[Any], timeout: float = 30) -> None:
+    """Wait for the owner's gated model call; if it never comes, say what the owner did."""
+    entered = asyncio.create_task(llm.entered.wait())
+    done, _ = await asyncio.wait(
+        {entered, run_task}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
+    )
+    if entered not in done:
+        entered.cancel()
+        detail = run_task.exception() if run_task.done() else "still starting"
+        raise AssertionError(f"owner never reached its model call: {detail!r}")
+
+
+async def race_once(
+    store: Any,
+    engine: Any,
+    owner_store: Any,
+    cancel_stores: list[Any],
+    offset: float | str,
+    script: str,
+) -> str:
+    responses = [LLMResponse(text="done")]
+    if script == "tool_then_final":
+        responses.insert(0, tool_call("noop", pid="n1"))
+    llm = ContextLLM(responses)
+    llm.gate_at = 0  # hold the owner in its first model call; both start from there
+    owner = Agent(name="owner", prompt="p", provider=llm, tools=[noop], state_store=owner_store)
+    start = asyncio.Event()
+    run_task = asyncio.create_task(owner.run("go", tenant_id=TENANT))
+    tasks: list[asyncio.Task[Any]] = []
+    try:
+        await owner_entered(llm, run_task)
+        run_id = llm.served[-1]
+        epoch = (await store.get_run(run_id)).claim_epoch
+
+        async def release(cancels: list[asyncio.Task[Any]]) -> None:
+            await start.wait()
+            if offset == "before":
+                await asyncio.wait(cancels)
+            elif isinstance(offset, float | int) and offset < 0:
+                await asyncio.sleep(-offset / 1000)
+            llm.gate.set()
+
+        async def cancel(other: Any) -> Any:
+            await start.wait()
+            if offset == "after":
+                await asyncio.wait([run_task])
+            elif isinstance(offset, float | int) and offset > 0:
+                await asyncio.sleep(offset / 1000)
+            return await dendrux.cancel_run(run_id, tenant_id=TENANT, state_store=other)
+
+        tasks = [asyncio.create_task(cancel(other)) for other in cancel_stores]
+        tasks.append(asyncio.create_task(release(list(tasks))))
+        start.set()
+        results = await asyncio.gather(*tasks[:-1])
+    finally:
+        llm.gate.set()
+        *_, outcome = await settle_all(*tasks, run_task)
+    if isinstance(outcome, BaseException):
+        raise outcome  # the owner's own failure, after every task was joined
+    outcomes = {item["outcome"] for r in results for item in r.meta["cascade"]}
+    assert outcomes <= {"terminal", "cancel_requested"}, outcomes
+    final = await store.get_run(run_id)
+    assert final.status == outcome.status.value
+    assert final.status in {"success", "cancelled"}
+    assert final.claim_epoch == epoch
+    history = await terminal_history(engine, run_id)
+    again = await dendrux.cancel_run(run_id, tenant_id=TENANT, state_store=store)
+    assert again.status.value == final.status
+    assert await terminal_history(engine, run_id) == history
+    # The request landed first if the owner stopped on it, or a canceller saw it RUNNING.
+    landed = final.status == "cancelled" or "cancel_requested" in outcomes
+    order = "cancel_first" if landed else "finalize_first"
+    return f"{order}:{final.status}"
+
+
+@pytest.mark.parametrize("callers", ["module", "mixed"])
+@pytest.mark.parametrize("round_", range(3))
+async def test_pg_concurrent_cancels_settle_each_run_once(
+    store: Any, engine: Any, callers: str, round_: int
+) -> None:
+    """Eight parallel cancellers: one CAS winner per run and one ordered run.cancelled event."""
+    async with AsyncExitStack() as stack:
+        stores = await parallel_stores(engine, stack)
+        _, root, child, _ = await paused_workflow(store)
+        kinds = ["module"] * 8 if callers == "module" else ["agent", "module"] * 4
+        ready = asyncio.Event()
+
+        async def cancel(kind: str, other: Any) -> Any:
+            await ready.wait()
+            return await cancel_via(kind, other, root)
+
+        tasks = [asyncio.create_task(cancel(k, o)) for k, o in zip(kinds, stores, strict=True)]
+        ready.set()
+        results = await asyncio.gather(*tasks)
+    assert {r.status for r in results} == {RunStatus.CANCELLED}
+    for run_id in (root, child):
+        winners = [
+            item
+            for r in results
+            for item in r.meta["cascade"]
+            if item == {"run_id": run_id, "outcome": "cancelled"}
+        ]
+        assert len(winners) == 1, (run_id, [r.meta["cascade"] for r in results])
+        assert (await store.get_run(run_id)).status == "cancelled"
+        events = await run_events(engine, run_id)
+        cancelled = [e for e in events if e.event_type == "run.cancelled"]
+        assert len(cancelled) == 1
+        assert events[-1] is cancelled[0]
+        # The leaf paused through run.paused; the root's managed wait is a bind, not an event.
+        if run_id == child:
+            assert any(e.event_type == "run.paused" for e in events[:-1])
+
+
+async def stale(engine: Any, run_id: str) -> None:
+    async with engine.begin() as conn:
+        await conn.execute(
+            update(AgentRun)
+            .where(AgentRun.id == run_id)
+            .values(last_progress_at=datetime.now(UTC) - timedelta(minutes=10))
+        )
+
+
+@pytest.mark.parametrize("canceller", ["agent", "module"])
+@pytest.mark.parametrize("shape", ["legacy", "managed"])
+async def test_pg_flagged_dead_owner_is_settled_cancelled_by_sweep(
+    store: Any, engine: Any, canceller: str, shape: str
+) -> None:
+    """A RUNNING owner died after the request; concurrent sweeps settle it CANCELLED once."""
+    from tests.integration.test_managed_recovery import _dead_child
+
+    async with AsyncExitStack() as stack:
+        stores = await parallel_stores(engine, stack, count=4)
+        if shape == "managed":
+            root, dead = await _dead_child(store, engine)
+            target = dead.id
+        else:
+            root = target = generate_ulid()
+            await store.create_run(root, "dead", tenant_id=TENANT)
+        await cancel_via(canceller, store, root)
+        flagged = await store.get_run(target)
+        assert (flagged.status, flagged.cancel_requested) == ("running", True)
+        await stale(engine, target)
+        results = await asyncio.gather(
+            *(sweep(state_store=s, stale_running=timedelta(minutes=1)) for s in stores)
+        )
+    settled = [r for result in results for r in result.stale_running if r.run_id == target]
+    assert len(settled) == 1, results
+    assert all(r.run_id != target for result in results for r in result.reclaimable)
+    final = await store.get_run(target)
+    assert final.status == "cancelled"
+    assert final.claim_epoch > flagged.claim_epoch
+    events = await run_events(engine, target)
+    assert [e.event_type for e in events].count("run.cancelled") == 1
+    assert events[-1].event_type == "run.cancelled"
+    assert (await store.get_run(root)).status == "cancelled"
 
 
 @pytest.mark.parametrize("entry", ["run", "stream", "resume", "resume_stream"])

@@ -201,6 +201,7 @@ Missing or invalid codes remain unset. Category and HTTP status remain independe
 | `managed_budget_exceeded` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | Managed execution or child admission reaches the aggregate root budget. | Raise the root allowance and resume through the root under the configured policy. |
 | `managed_budget_invalid` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | Managed definitions declare a child budget or a non-aggregate root budget. | Configure one aggregate budget on the root Agent. |
 | `managed_usage_unknown` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | Managed budget accounting is unavailable, invalid or incomplete. | Restore complete usage reads and resume through the root. |
+| `on_started_failed` | ERROR | `callback_outcome`, `code`, `kind`, `run_id`, `tenant_id` | The root run's on_started callback raises, before the owner checks cancellation or its claim. | Check the run status. If the caller receives OnStartedError, inspect its __cause__. |
 | `pause_data_not_jsonb` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | A stored pause is not a JSON object. | Inspect the stored pause format and writer versions. |
 | `pause_id_mismatch` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | A submission targets another pause generation. | Reload the pending pause and resubmit. |
 | `pending_limit` | WARNING | `code`, `count`, `kind`, `limit`, `run_id`, `tenant_id` | A model produces too many pending calls. | Reduce tool fanout or raise the pending call bound. |
@@ -238,9 +239,11 @@ Missing or invalid codes remain unset. Category and HTTP status remain independe
 
 | Code | Level | Fields | Fires when | Do |
 | --- | --- | --- | --- | --- |
-| `managed_batch_unsupported` | WARNING | `code`, `count`, `kind`, `run_id`, `tenant_id` | A model turn asks for two subagents, or a subagent together with a client tool. | Nothing in the batch ran; the model sees one error per call and may call them one by one. |
+| `managed_batch_unsupported` | WARNING | `code`, `count`, `kind`, `limit`, `reason`, `requested`, `run_id`, `tenant_id` | A model turn asks for an unsupported batch of subagent calls. | Nothing in the batch ran; the model sees one error per call and may call them one by one. |
 | `managed_child_cancelled` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | A subagent run was cancelled on its own while its parent waited. | The parent sees a failed tool result; read the child run for detail. |
 | `managed_child_failed` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | A subagent run ended with an error or at its iteration limit. | The parent sees a failed tool result; read the child run for detail. |
+| `managed_fanout_branch_error` | WARNING | `code`, `error_type`, `kind`, `run_id`, `tenant_id` | A managed fan-out branch raised an error collected by its owner. | Inspect the child error type; traceback diagnostics use separate log lines. |
+| `managed_fanout_limit` | WARNING | `code`, `kind`, `limit`, `requested`, `run_id`, `store_capability`, `tenant_id` | A subagent batch exceeds the turn limit or store capability. | Reduce the batch or use a store that supports managed fan-out. |
 | `managed_pause_id_required` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | A managed workflow continuation omits the subagent's pause token. | Send the pause_id from the root's pending as expected_pause_id. |
 | `managed_report_invalid` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | A subagent's saved answer does not match its declared output type. | The parent sees a failed tool result; check the child's output_type. |
 | `managed_report_too_large` | WARNING | `bytes`, `code`, `kind`, `limit`, `run_id`, `tenant_id` | A subagent's report is larger than the parent's max_tool_result_bytes. | Ask for a shorter report or raise the parent's Limits.max_tool_result_bytes. |
@@ -255,6 +258,12 @@ Missing or invalid codes remain unset. Category and HTTP status remain independe
 | `subagent_name_conflict` | WARNING | `code`, `kind`, `run_id`, `tenant_id` | An Agent is built with two subagents of one name, or a subagent named like a tool. | Rename the subagent or the tool. |
 | `subagent_too_deep` | WARNING | `code`, `count`, `kind`, `limit`, `run_id`, `tenant_id` | An Agent is built with a subagent deeper than the delegation depth ceiling. | Flatten the tree or raise max_delegation_depth. |
 | `subagent_tree_too_large` | WARNING | `code`, `kind`, `limit`, `run_id`, `tenant_id` | An Agent is built with a subagent tree over the node bound. | Reduce the subagent tree; a reused agent counts once per path. |
+
+## Testing
+
+| Code | Level | Fields | Fires when | Do |
+| --- | --- | --- | --- | --- |
+| `fake_model_predicate_error` | WARNING | `code`, `kind`, `run_id` | A FakeModel when() predicate raises an exception. | Inspect the predicate for the agent and turn recorded by FakeModel.script_errors(). |
 
 ## Tool
 

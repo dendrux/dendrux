@@ -1,0 +1,109 @@
+---
+title: Upgrading to 0.8.0
+description: What changes when you move from 0.7.x to 0.8.0 (parallel subagents, waiting_for, dendrux.cancel_run, on_started, FakeModel, error and SQLite fixes) and what custom-store authors and rolling upgrades must do.
+---
+
+# Upgrading to 0.8.0
+
+0.8.0 adds parallel subagents and four smaller features: the `waiting_for` label, `dendrux.cancel_run`, `Agent.run(on_started=...)` and `dendrux.testing.FakeModel`. It needs **no schema migration**: the migration head is unchanged from 0.7.0. Ordinary agents (no `subagents=`) keep working as before. See the [CHANGELOG](https://github.com/dendrux/dendrux/blob/main/packages/python/CHANGELOG.md) for the full list.
+
+## Do I need to do anything?
+
+| Your setup | Action |
+| --- | --- |
+| Built-in store, no subagents | Upgrade and run. Read [Behaviour changes](#behaviour-changes) once, and the [SQLite fix](#sqlite-fix-and-the-aiosqlite-floor) if you use a SQLite file. |
+| Using `Agent(subagents=...)` | A model can now call several subagents in one response, up to 4 by default. Read [Parallel subagents](/docs/guides/subagents#parallel-subagents) and [Several paused subagents](/docs/guides/subagents#several-paused-subagents). Upgrade every worker together (see [Upgrading](#upgrading-all-workers-at-once)). \|
+| Many workers on one database, with or without subagents | Upgrade all of them together; see [Upgrading all workers at once](#upgrading-all-workers-at-once). |
+| Code that filters on the `managed_batch_unsupported` code for an oversized batch | Read [Changed codes](#changed-codes). |
+| Handlers for `StructuredOutputValidationError` that read its text | Read [Structured-output errors](#structured-output-errors). |
+| A custom `StateStore` or `SQLStateStore` subclass | Run the store kit again. See [Custom stores](#custom-stores). |
+| `except RunControlError` around `run()` or `retry()` | Read [`on_started` and OnStartedError](#on_started-and-onstartederror). |
+
+## Behaviour changes
+
+| Area | 0.7.x | 0.8.0 | What to do |
+| --- | --- | --- | --- |
+| Subagent calls per response | One. Two were refused with `managed_batch_unsupported` | Up to `Limits.max_parallel_subagents` (default 4, 1 to 32) run in parallel | Keep Agent settings unchanged for runs that started before the upgrade; changing the limit on an Agent with paused runs strands them (see [Upgrading](#upgrading-all-workers-at-once)) |
+| An oversized subagent batch | Code `managed_batch_unsupported` | Code `managed_fanout_limit`, with the requested count and the limit in the tool result, events and logs. The whole batch is still refused | Change any filter on the old code. A subagent beside a client tool, and an `exclusive_subagents` conflict, keep `managed_batch_unsupported` |
+| Several paused subagents | Not possible | `result.pendings` lists every pause of a workflow of up to 257 active runs (see [pending read bound](/docs/guides/subagents#the-pending-read-bound)); each continuation through the root names its leaf with `expected_pause_id` | Loop `while result.pendings:`; see the [guide](/docs/guides/subagents#several-paused-subagents) |
+| A paused root that only waits for subagents | Looked like any paused run | `RunSummary.waiting_for == "subagents"` | See [waiting_for](#waiting_for) |
+| Stopping a run from a process with no `Agent` | Not possible | `dendrux.cancel_run(run_id, tenant_id=..., database_url= or state_store=)` | See [dendrux.cancel_run](#dendruxcancel_run) |
+| Learning a new run's id before it finishes | Not possible with `run()` | `on_started=` callback | See [on_started](#on_started-and-onstartederror) |
+| A `StructuredOutputValidationError` | The text held the model's answer and Pydantic's full report | Counts and error kinds only | See [Structured-output errors](#structured-output-errors) |
+| `TenantScopeRequiredError` | Constructor `(operation)` | `(operation, *, message=None)` | None; see [Errors](#errors) |
+| A v4 (fan-out) wait that does not match its children | Not applicable (0.7 cannot read it) | `ManagedStateError(reason="binding_conflict")` | Catch `PersistenceError` or `ManagedStateError`, not `RunControlError`; see [Errors](#errors) |
+| Blocked fan-out child calls | A single child persisted the raw call parameters | A fan-out child persists a safe projection `{"task": ...}` | None; less data is stored. See [Errors](#errors) |
+| `SingleCall` and a fence at the provider lease | A fence at `lease_scope` was recorded as `llm.failed` | The fence is raised directly and no `llm.failed` event is written | See [SingleCall](#singlecall-and-a-fence) |
+| A cancel that commits after the `on_started` control read | Not applicable | The error wins: the run ends `error`, and the flag is cleared | See [on_started](#on_started-and-onstartederror) |
+| Streams that recover | A recovering stream continuation counted as an explicit budget-resume acknowledgement | It no longer does; stream and batch recovery behave the same | None, unless you relied on a stream resume to accept a budget pause |
+| `resume(root)` with no token and no payload on a fan-out workflow | Not applicable | Reconnects, like `reclaim(root)`, when no leaf is externally paused; refused while any leaf is paused | See the [guide](/docs/guides/subagents#several-paused-subagents) |
+
+## waiting_for
+
+A parent that is only waiting for its running subagents is stored as `paused`, as in 0.7. Since 0.8, `RunSummary` and `RunDetail` carry `waiting_for`, and so does each `get_subtree` node's summary (`node.run.waiting_for`), which is `"subagents"` when the stored status is `paused` with a managed wait, and `None` otherwise. It describes the parent only: a child can still need an approval, a client tool or input, so use `get_pendings(root)` to decide whether a person must act. `RunStore.list_runs()` and `count_runs()` take `include_waiting=False` to leave those runs out, and `dendrux runs --exclude-waiting` does the same on the command line. Stored statuses, `RunStatus` and the existing `status=` filter are unchanged, and there is no migration. The exclusion filter is a store capability (`waiting_filter`) that reads pause data for every candidate row, so it can be slow on very large tables; a custom store without it raises `StoreCapabilityError` when you pass `include_waiting=False`. See [RunStore](/docs/reference/run-store#telling-a-persons-turn-from-a-subagent-wait).
+
+## dendrux.cancel_run
+
+`dendrux.cancel_run(run_id, *, tenant_id, database_url=None, state_store=None, cascade=True, max_nodes=None)` cancels a run and its subagents without building an `Agent` or loading a provider. `tenant_id` is a required keyword (`None` for an untenanted run); `UNSCOPED` is refused with `TenantScopeRequiredError`. Pass exactly one of `database_url` and `state_store`, and prefer a shared `state_store` in a server. `Agent.cancel_run` is unchanged. The function has no task registry: a run in another process stops at its next checkpoint. If a cascade fails partway, call it again. See [Cancel a run without an Agent](/docs/recipes/cancel-run#cancel-a-run-without-an-agent). It adds no index and no migration.
+
+## on_started and OnStartedError
+
+`Agent.run()` and `Agent.retry()` take `on_started=`, called with the new root run id after the row is saved and claimed and before the first model call. Save the id and return; keep it short. See [the reference](/docs/reference/agent#on_started) for when it is and is not called. It is not supported on `stream()`.
+
+If the callback raises an ordinary exception, the caller gets `dendrux.errors.OnStartedError` (a `RuntimeError`, with `run_id` and the original exception on `__cause__`) and the run is saved as `error` with code `on_started_failed`. `OnStartedError` is **not** a `RunControlError`: an `except RunControlError` clause does not catch it. Catch it explicitly, and use `error.run_id` to look the run up. The old import from `dendrux.runtime.runner` still works and is the same class. If a cancel was already requested at the control read, the run ends `cancelled`; a cancel that commits after that read loses to the error, and the terminal write clears `cancel_requested`.
+
+## Changed codes
+
+An oversized batch now reports `managed_fanout_limit` instead of `managed_batch_unsupported` in tool results, `RunEvent` data and logs (also in the recovery paths). The model sees how many calls it made, the limit and an instruction to call at most that many at once; the whole batch is still refused. If you route alerts on the old code, add the new one. The batch refusals for a subagent beside a client tool, and for a conflict with `exclusive_subagents`, keep `managed_batch_unsupported`.
+
+## Structured-output errors
+
+`StructuredOutputValidationError` no longer carries the model's answer in its text. `str(error)` and `error.validation_error` now give a count and built-in Pydantic error kinds only, for example `2 validation errors (int_parsing, missing)`. Field names, values and custom error kinds (shown as `custom_error`) are not included, and the wording is not a stable contract. `__cause__` is `None`. `error.raw_response` is still available on the exception object; revalidate it yourself if you need Pydantic's details. Code that parsed the old message text should read `output_type_name` and `validation_error` instead.
+
+## Errors
+
+- `TenantScopeRequiredError(operation, *, message=None)`: a non-empty `message` replaces the default text. Existing messages are byte-identical. `dendrux.cancel_run` uses it, because it has no Agent and no `strict_tenancy`.
+- `ManagedStateError(reason="binding_conflict")` is raised when a saved fan-out wait does not match its children. In 0.7 the equivalent refusal for a format a 0.7 worker could not read was `RunNotReclaimableError(reason="pause_format_unsupported")`. `ManagedStateError` is a `PersistenceError` (a `RuntimeError`), not a `RunControlError`. It is importable from `dendrux.errors` but not listed in its `__all__`.
+- `sweep(adoptable_after=...)`: `result.adoptable` may repeat a root across cursor pages. `reclaim` is idempotent, so call it for each id you see.
+- A fan-out child that is blocked persists `{"task": ...}`, a safe projection of its call parameters. The 0.7 single-child path still persists the raw parameters.
+- `OnStartedError` is new; see above. Its mapping in the suggested HTTP table is 500.
+
+## SingleCall and a fence
+
+A `SingleCall` agent that is fenced while entering the provider lease (`lease_scope`) now propagates that fence before it bills a call or retries an image, instead of recording `llm.failed`. If you counted `llm.failed` events to detect a lost lease, watch the fence log (`run_fenced`) instead.
+
+## SQLite fix and the aiosqlite floor
+
+Cancelling a write on a **file** SQLite database could leave the file locked for every later writer: a statement kept alive by a retained traceback held the closed connection's write lock, and later writes failed with `lock_timeout`. 0.7.0 and earlier are affected. Dendrux now closes a `sqlite+aiosqlite` connection's cursors and rolls back before the connection is closed, invalidated or garbage-collected, and the cleanup never waits on the database worker, so a cancelled caller still gets its `CancelledError` within the existing bound. Postgres, MySQL and MariaDB are unchanged. The store's reported `deployment` for six unusual SQLite URL forms (such as `x.db?mode=memory` without `uri=true`) now matches the database SQLite really opens.
+
+The fix needs `aiosqlite>=0.22.1`. Dendrux now requires it (the floor was `>=0.19`), so `pip install -U dendrux` upgrades it. On an older aiosqlite the garbage-collection path of the fix cannot run, so upgrade it if you pin it yourself.
+
+`RunStore.from_database_url(url).get_pending()` and `get_pendings()` on SQLite no longer raise `StoreCapabilityError` for a paused fan-out workflow. 0.7.0 is not affected.
+
+Live-update `flush()` and `close()` now handle cancellation this way. A cancellation already pending when the call starts is delivered before the transport is called. One that arrives during the send or close propagates as a cancellation, even if the transport's cleanup replaces it with another error. The caller's reason is preserved in the usual case; an adapter that swallows or replaces the cancellation can change it. A transport's own timeout or cancelled future counts as a failed send: it no longer cancels the caller or fan-out children that have already started.
+
+## Upgrading all workers at once
+
+**Running 0.7 and 0.8 workers on the same database at the same time is not supported.** 0.8 may write a parallel wait that 0.7 cannot read. A 0.7 process that meets one refuses to read, submit, resume or reclaim it with `ManagedStateError(reason="wait_invalid")` and changes nothing; its sweep, and the recovery guard for newer formats (`RunNotReclaimableError(reason="pause_format_unsupported")`), are separate cases and the stale-running `sweep()` is not covered by either. A mixed fleet can therefore stall workflows, and no per-Agent setting makes it safe: each Agent in a tree supplies its own limit, so even a limit of 1 on the root does not stop a child that was left at the default from writing a parallel wait.
+
+Upgrade like this:
+
+1. Stop the 0.7 workers, or let them drain. Stop 0.7 `sweep()` jobs too.
+2. Deploy 0.8 to **every** worker and every maintenance job.
+3. Start them again.
+
+Paused runs simply wait and continue on 0.8. Keep Agent settings unchanged for runs that started before the upgrade, and do not edit `Limits` on an Agent that has paused runs. An Agent's governance settings, including a non-default `Limits`, are fingerprinted when the run is created and compared on every later resume, submit or reclaim. With the default `on_governance_change="raise"`, a difference raises `GovernanceMismatchError` (`changed=("limits",)`). The default `max_parallel_subagents=4` is left out of the fingerprint, so a run paused by 0.7 continues on 0.8 with unchanged settings; setting the limit to 1 changes it.
+
+> **A mismatch is refused before anything is written.** What counts as a mismatch follows the governance policy you selected. With `on_governance_change="raise"` (the default), a continuation by an Agent whose governance settings differ from the saved ones raises `GovernanceMismatchError`; with `"warn"`, a changed setting such as a limit is reported but a direct approval still completes. For a direct (non-managed) continuation, skills refuse only when a saved manifest entry no longer matches (changed or missing content); adding an extra skill to a direct Agent with a saved manifest still completes. For a managed parent the full set of skill pins is compared, so any change to its skill set refuses. When a continuation is refused (`submit_*`, `resume`, the stream variants and `reclaim`), it is refused before any write: the pending approval or input stays pending and the same token is still valid, so retry the same call with the Agent configured as it was when the run paused. On a stream, the refusal arrives as the terminal `run_error` event, as in 0.7. Stale-running `reclaim` can raise `RunNotReclaimableError(reason="governance_changed")` for the same cause.
+
+Nesting multiplies concurrency; `Limits.max_managed_runs` (default 128) stays the overall bound. Never route a workflow that has written a parallel wait back to 0.7.
+
+## Custom stores
+
+A store written for 0.7 keeps working. `managed_fanout` (bind several children at once) and `waiting_filter` (the `include_waiting` filter) are two new optional capability flags, both false by default. Without `managed_fanout` the effective parallel limit is 1: a second subagent call in one response is refused with `managed_fanout_limit`. Without `waiting_filter`, `waiting_for` is `None` and `include_waiting=False` raises `StoreCapabilityError`. To opt in, implement the methods in [Capability matrix](/docs/reference/state-store#capability-matrix) and run the [store kit](/docs/guides/build-your-own-store); it checks both. Third-party stores need no change for the new optional fields on the internal read record.
+
+## Developer helpers
+
+- `dendrux.testing.FakeModel` scripts answers per agent and turn; see [Testing agents with FakeModel](/docs/recipes/testing-with-fake-model). `dendrux.testing` also exports `MockLLM`.
+- `RunResult.pendings`, `RunStore.get_pendings()` and a `pendings` list on `RunResult.to_dict()` are additive. A full stream can yield the non-terminal `RunEventType.SUBAGENT_PAUSED`: a consumer that raises on unknown event types needs a branch for it.
+- Subagent calls are not approval-gatable in 0.8: gate the child's tools instead.

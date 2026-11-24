@@ -29,6 +29,7 @@ def test_run_wire_allowlist_and_pii_redaction():
         "run_id",
         "status",
         "pending",
+        "pendings",
         "answer",
         "output",
         "error_info",

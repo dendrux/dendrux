@@ -29,7 +29,7 @@ layers =
     llm | guardrails
     chat
     pricing | context_blocks | strategies | media | db
-    types : _wire : _lifecycle
+    types : _wire : _lifecycle : _managed_wait
     errors | _sentinel | _redact | _meta_keys
     _codes | _warnings
 

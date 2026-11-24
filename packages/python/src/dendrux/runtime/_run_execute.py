@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, overload
 
 import dendrux.runtime.context as _context
 import dendrux.strategies.native as _native
 from dendrux._sentinel import _OMITTED, _OmittedType, _UnsetType
 from dendrux.errors import (
+    ManagedStateError,
     RunFencedError,
 )
 from dendrux.runtime import (
@@ -21,24 +23,29 @@ from dendrux.runtime import (
     _run_outcome,
     _run_pending,
     _run_start,
+    _run_started,
     _run_tools,
 )
-from dendrux.runtime._entry_checks import resolve_runner_tenant, runner_entry_checks
+from dendrux.runtime._capabilities import fanout_support
+from dendrux.runtime._entry_checks import (
+    check_on_started,
+    resolve_runner_tenant,
+    runner_entry_checks,
+)
 from dendrux.runtime._managed_cancel import (
     ManagedRootStoppedError,
 )
 from dendrux.runtime._run_contracts import (
     _UNSET_DEPTH,
 )
+from dendrux.runtime._subagents import _tighten
 from dendrux.runtime._tenant_checks import _tenant_scope_chosen
 from dendrux.runtime.context import (
     DelegationContext,
-    get_store_identity,
-    reset_delegation_context,
     resolve_child_tenant,
-    set_delegation_context,
     take_managed_invocation,
 )
+from dendrux.runtime.state import ClaimResult, claimed_store, unclaimed_store
 from dendrux.runtime.stores._limits_fit import ensure_agent_limits_fit
 from dendrux.skills._session import SkillSession
 from dendrux.types import (
@@ -49,6 +56,8 @@ from dendrux.types import (
 
 if TYPE_CHECKING:
     from collections.abc import (
+        Awaitable,
+        Callable,
         Sequence,
     )
 
@@ -60,6 +69,8 @@ if TYPE_CHECKING:
     from dendrux.llm.base import LLMProvider
     from dendrux.loops.base import Loop, LoopNotifier
     from dendrux.media._image import UserContent
+    from dendrux.runtime._managed import ManagedInvocation
+    from dendrux.runtime._run_entry import PreparedChild
     from dendrux.runtime.replay import (
         ReplayLast,
         ReplayPlan,
@@ -89,6 +100,7 @@ async def run(
     tenant_id: str | None | _OmittedType = ...,
     metadata: dict[str, Any] | None = ...,
     extra_notifier: LoopNotifier | None = ...,
+    on_started: Callable[[str], Awaitable[None] | None] | None = ...,
     max_delegation_depth: int | None,
     idempotency_key: str | None = ...,
     output_type: type | None = ...,
@@ -114,6 +126,7 @@ async def run(
     tenant_id: str | None | _OmittedType = ...,
     metadata: dict[str, Any] | None = ...,
     extra_notifier: LoopNotifier | None = ...,
+    on_started: Callable[[str], Awaitable[None] | None] | None = ...,
     idempotency_key: str | None = ...,
     output_type: type | None = ...,
     **kwargs: Any,
@@ -137,6 +150,7 @@ async def run(
     tenant_id: str | None | _OmittedType = _OMITTED,
     metadata: dict[str, Any] | None = None,
     extra_notifier: LoopNotifier | None = None,
+    on_started: Callable[[str], Awaitable[None] | None] | None = None,
     max_delegation_depth: int | None | _UnsetType = _UNSET_DEPTH,
     idempotency_key: str | None = None,
     output_type: type | None = None,
@@ -144,9 +158,8 @@ async def run(
 ) -> RunResult:
     """Run an agent to completion.
 
-    This is the primary API for executing a Dendrux agent. It wires
-    together the agent definition, LLM provider, strategy, and loop,
-    then executes the loop until completion.
+    This is the primary API for executing a Dendrux agent. It wires together the agent
+    definition, LLM provider, strategy, and loop, then executes the loop until completion.
 
     Args:
         agent: Agent definition (model, tools, prompt, limits).
@@ -154,18 +167,16 @@ async def run(
         user_input: The user's input to process.
         strategy: Communication strategy. Defaults to NativeToolCalling.
         loop: Execution loop. Defaults to ReActLoop.
-        state_store: Optional persistence backend. If provided, the run
-            is persisted to the database with full traces.
+        state_store: Optional persistence backend that saves the run with full traces.
         tenant_id: Optional tenant ID for multi-tenant isolation.
         metadata: Optional developer linking data (thread_id, user_id, etc.).
             Stored in agent_runs.meta — Dendrux stores it, never reads it.
-        extra_notifier: Optional additional LoopNotifier for best-effort
-            notifications (e.g. ConsoleNotifier).
-        max_delegation_depth: Maximum allowed delegation depth for the
-            run tree. Default 10. None means unbounded. Propagated to
-            all child runs via contextvar. Raises DelegationDepthExceededError
-            if a child run would exceed this depth.
-        **kwargs: Reserved for future use.
+        extra_notifier: Optional best-effort LoopNotifier (e.g. ConsoleNotifier).
+        max_delegation_depth: Depth limit for the run tree (default 10, None for unbounded).
+            Child runs inherit it via contextvar and raise DelegationDepthExceededError
+            if they would exceed it.
+        on_started: Receives the new persisted root id before model or tool work.
+        **kwargs: Forwarded to the LLM provider.
 
     Returns:
         RunResult with status, answer, steps, and usage stats.
@@ -203,13 +214,14 @@ async def run(
         tenant_id=tenant_id,
         metadata=metadata,
         extra_notifier=extra_notifier,
+        on_started=check_on_started(on_started),
         max_delegation_depth=max_delegation_depth,
         idempotency_key=idempotency_key,
         output_type=output_type,
         **kwargs,
     )
-    # A managed parent exits at its handoff; the driver runs the child in this
-    # same task and unwinds terminal outcomes back to the root (0.7).
+    # A managed parent exits at its handoff; the driver runs N=1 inline and
+    # joins fan-out owners before unwinding terminal outcomes to the root.
     return await _managed.drive(result, notifier=extra_notifier)
 
 
@@ -230,12 +242,16 @@ async def _run_once(
     tenant_id: str | None | _OmittedType = _OMITTED,
     metadata: dict[str, Any] | None = None,
     extra_notifier: LoopNotifier | None = None,
+    on_started: Callable[[str], Awaitable[None] | None] | None = None,
     max_delegation_depth: int | None | _UnsetType = _run_contracts._UNSET_DEPTH,
     idempotency_key: str | None = None,
     output_type: type | None = None,
+    _preclaimed: _PreclaimedChild | None = None,
     **kwargs: Any,
 ) -> RunResult:
     """One run frame: a new run, or a managed child created by its atomic bind."""
+    if _preclaimed is not None:
+        return await _run_preclaimed(_preclaimed, extra_notifier)
     invocation = take_managed_invocation()
     tenant_explicit = _tenant_scope_chosen(tenant_id)
     tenant_id = resolve_runner_tenant(agent, "run", tenant_id, state_store=state_store)
@@ -245,11 +261,6 @@ async def _run_once(
         agent, loop=_run_entry._new_run_loop(agent, loop), explicit=activate_skills
     )
     with skill_session.bind():
-        # Validate + resolve depth early — before any side effects.
-        # _resolve_max_delegation_depth is a pure policy helper; side effect
-        # is limited to dedup warning state on parent_ctx.warned_mismatches.
-        # A managed child never inherits the caller's delegation context: its
-        # parent link, level and depth come from its bound invocation.
         parent_ctx = _managed.parent_context(invocation, _context.get_delegation_context)
         effective_max_depth = _run_entry._resolve_max_delegation_depth(
             max_delegation_depth, parent_ctx
@@ -342,7 +353,6 @@ async def _run_once(
         # --- Delegation context ---
         parent_run_id, delegation_level = _managed.parent_link(invocation, parent_ctx, state_store)
 
-        ctx_token = None
         mcp_meta: dict[str, Any] = {}
         result: RunResult | None = None
         lifecycle = _run_start._RunLifecycle(
@@ -441,22 +451,20 @@ async def _run_once(
                     {"agent_name": agent.name, "system_prompt": _system_prompt},
                 )
 
-                # Set delegation context for the duration of this run so nested
-                # agent.run() calls inside tools inherit the parent link.
-                this_ctx = DelegationContext(
-                    run_id=run_id,
+                _configure_fanout(lifecycle.recorder, state_store)
+                result = await _run_started.notify_then_bind_context(
+                    lifecycle,
+                    agent,
+                    on_started,
+                    extra_notifier,
                     trace_link=trace_link,
                     delegation_level=delegation_level,
-                    persisted=state_store is not None,
-                    store_identity=get_store_identity(state_store),
-                    max_delegation_depth=effective_max_depth,
+                    max_depth=effective_max_depth,
                     tenant_id=tenant_id,
                     tenant_explicit=tenant_explicit,
-                    state_store=state_store,
-                    lease_interval_s=agent.lease_interval.total_seconds(),
-                    loop=asyncio.get_running_loop(),
                 )
-                ctx_token = set_delegation_context(this_ctx)
+                if result is not None:
+                    return result
 
                 # Emit init governance events (skills + MCP) inside the try block
                 # so discovery failures flow through the error cleanup path.
@@ -529,10 +537,7 @@ async def _run_once(
                     **_run_images._image_loop_kwargs(resolved_loop.run, image_runtime, image_view),
                 )
 
-                if replay_plan is not None:
-                    result.replay = replay_plan.summary
-                _run_observers._attach_mcp_meta(result, mcp_meta)
-                _run_pending._ensure_pause_generation(result, provider_kwargs)
+                _attach_run_metadata(result, replay_plan, mcp_meta, provider_kwargs)
                 if state_store is not None:
                     result = await _run_outcome._persist_loop_outcome(
                         recorder=lifecycle.recorder,
@@ -546,28 +551,162 @@ async def _run_once(
 
                 result.meta = _run_errors._public_meta(result.meta)
 
-                return result
-
             except (ManagedRootStoppedError, RunFencedError) as stop:
-                return await lifecycle._stopped(stop, lifecycle.recorder, extra_notifier)
+                result = await lifecycle._stopped(stop, lifecycle.recorder, extra_notifier)
 
             except Exception as exc:
                 await lifecycle._failed(exc, mcp_meta, lifecycle.recorder, extra_notifier)
                 raise
 
-        except asyncio.CancelledError:
-            cancelled_result, swallow = await lifecycle._cancelled(
-                result, mcp_meta, lifecycle.recorder, extra_notifier
+            return result
+        except asyncio.CancelledError as cancellation:
+            return await lifecycle._cancelled(
+                cancellation, result, mcp_meta, lifecycle.recorder, extra_notifier
             )
-            if swallow:
-                return cancelled_result
-            raise
 
         finally:
             _run_images._release_memory_edges(image_runtime, state_store, run_id)
             lifecycle._release()
-            if ctx_token is not None:
-                reset_delegation_context(ctx_token)
 
 
 run.__module__ = "dendrux.runtime.runner"
+
+
+@dataclass(frozen=True)
+class _PreclaimedChild:
+    branch: ManagedInvocation
+    prepared: PreparedChild
+    claim: ClaimResult
+
+
+def _configure_fanout(recorder: Any, store: StateStore | None) -> None:
+    if recorder is not None:
+        # Runtime-owned optional per-frame flag, outside the recorder hook Protocol.
+        recorder._managed_fanout_capable = (
+            store is not None and fanout_support(unclaimed_store(store)).capable
+        )
+
+
+async def _run_preclaimed(frame: _PreclaimedChild, notifier: LoopNotifier | None) -> RunResult:
+    branch, prepared, claim = frame.branch, frame.prepared, frame.claim
+
+    lifecycle = _run_start._RunLifecycle(
+        branch.child_run_id,
+        claimed_store(branch.store, branch.child_run_id, claim),
+        branch.child._task_manager,
+        owned=True,
+    )
+    if lifecycle.manager is not None:
+        lifecycle.manager.register_current(branch.child_run_id)
+        lifecycle.registered = True
+    try:
+        try:
+            return await _execute_preclaimed(lifecycle, branch, prepared, notifier)
+        except (ManagedRootStoppedError, RunFencedError) as stop:
+            result = await lifecycle._stopped(stop, lifecycle.recorder, notifier)
+            if isinstance(stop, RunFencedError):
+                result.meta[_managed.NOT_OWNER_KEY] = True
+            return result
+        except Exception as error:  # noqa: BLE001, RUF100 - the owned run lifecycle persists failure before branch isolation.
+            await lifecycle._failed(error, {}, lifecycle.recorder, notifier)
+            raise
+    except asyncio.CancelledError as cancellation:
+        return await lifecycle._cancelled(cancellation, None, {}, lifecycle.recorder, notifier)
+    finally:
+        lifecycle._release()
+
+
+async def _execute_preclaimed(
+    lifecycle: _run_start._RunLifecycle,
+    branch: ManagedInvocation,
+    prepared: PreparedChild,
+    notifier: LoopNotifier | None,
+) -> RunResult:
+
+    child, run_id = branch.child, branch.child_run_id
+    provider = child._require_provider()
+    loop = _run_entry._new_run_loop(child, None)
+    session = SkillSession.prepare(child, loop=loop)
+    if lifecycle.store is None:
+        raise ManagedStateError(reason="binding_conflict", run_id=run_id)
+    with session.bind():
+        await _run_entry._verify_projected_creation(
+            prepared.projection.error is not None, lifecycle.store, run_id
+        )
+        link, notifier = await _run_start._start_new_run(
+            lifecycle,
+            child,
+            provider,
+            branch.tenant_id,
+            {"seed_traces": prepared.spec.child_seed_traces},
+            prepared.projection.engine,
+            notifier,
+            None,
+            {"agent_name": child.name},
+        )
+        _configure_fanout(lifecycle.recorder, branch.store)
+        token = _context.set_delegation_context(_bound_context(branch, lifecycle.store, link))
+        try:
+            mcp_meta: dict[str, object] = {}
+            await _run_tools._discover_runtime_tools(
+                child, lifecycle.recorder, notifier, run_id, loop, mcp_meta
+            )
+            result = await _run_entry._run_projected_loop(
+                prepared.projection,
+                loop,
+                None,
+                agent=child,
+                provider=provider,
+                strategy=_native.NativeToolCalling(),
+                user_input=str((prepared.spec.child_input_data or {}).get("input", "")),
+                run_id=run_id,
+                recorder=lifecycle.recorder,
+                notifier=notifier,
+                initial_history=None,
+                provider_kwargs=None,
+                output_type=child.output_type,
+                state_store=lifecycle.store,
+            )
+            _attach_run_metadata(result, None, mcp_meta, None)
+            result = await _run_outcome._persist_loop_outcome(
+                state_store=lifecycle.store,
+                run_id=run_id,
+                result=result,
+                recorder=lifecycle.recorder,
+            )
+            await lifecycle._finish(lifecycle.recorder, notifier, result)
+            result.meta = _run_errors._public_meta(result.meta)
+            return result
+        finally:
+            _context.reset_delegation_context(token)
+
+
+def _bound_context(
+    branch: ManagedInvocation, store: StateStore, link: str | None
+) -> DelegationContext:
+
+    return DelegationContext(
+        run_id=branch.child_run_id,
+        trace_link=link,
+        delegation_level=branch.parent_level + 1,
+        persisted=True,
+        store_identity=_context.get_store_identity(store),
+        max_delegation_depth=_tighten(branch.max_depth, branch.child.max_delegation_depth),
+        tenant_id=branch.tenant_id,
+        tenant_explicit=True,
+        state_store=store,
+        lease_interval_s=branch.child.lease_interval.total_seconds(),
+        loop=asyncio.get_running_loop(),
+    )
+
+
+def _attach_run_metadata(
+    result: RunResult,
+    replay_plan: ReplayPlan | None,
+    mcp_meta: dict[str, Any],
+    provider_kwargs: dict[str, Any] | None,
+) -> None:
+    if replay_plan is not None:
+        result.replay = replay_plan.summary
+    _run_observers._attach_mcp_meta(result, mcp_meta)
+    _run_pending._ensure_pause_generation(result, provider_kwargs)

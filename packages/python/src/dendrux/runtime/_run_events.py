@@ -25,6 +25,7 @@ from dendrux.runtime import (
 from dendrux.runtime._run_errors import (
     logger,
 )
+from dendrux.runtime.state import unclaimed_store
 from dendrux.types import (
     ErrorInfo,
     RunStatus,
@@ -57,10 +58,12 @@ async def _finalize_running_event(
     event_data: dict[str, Any],
     *,
     emit_event: bool = True,
+    optional_failure_reason: str | None = None,
     **kwargs: Any,
 ) -> tuple[bool, bool]:
     atomic = getattr(store, "finalize_with_event", None)
     if atomic is not None and emit_event:
+        _add_failure_reason(store, "finalize_with_event", optional_failure_reason, kwargs)
         kwargs.pop("error_info", None)  # Carried by the atomic lifecycle event.
         seq = await atomic(
             run_id,
@@ -71,6 +74,7 @@ async def _finalize_running_event(
             **kwargs,
         )
         return seq is not None, False
+    _add_failure_reason(store, "finalize_run", optional_failure_reason, kwargs)
     won = await store.finalize_run(
         run_id, status=status, expected_current_status=RunStatus.RUNNING.value, **kwargs
     )
@@ -206,6 +210,16 @@ async def _pause_request_message(state_store: StateStore, run_id: str) -> str | 
     return reason if isinstance(reason, str) else None
 
 
+def _add_failure_reason(
+    store: StateStore, method: str, reason: str | None, fields: dict[str, Any]
+) -> None:
+    if reason is None:
+        return
+    # The claim wrapper accepts **kwargs to inject the epoch. Inspect the actual writer.
+    if _run_contracts._accepts_kwarg(getattr(unclaimed_store(store), method), "failure_reason"):
+        fields["failure_reason"] = reason
+
+
 async def _transition_with_event(
     state_store: StateStore,
     run_id: str,
@@ -223,12 +237,9 @@ async def _transition_with_event(
     ``failure_reason``; the transition event still carries the reason.
     """
     atomic = getattr(state_store, "finalize_with_event", None)
-    # Stores predating a keyword (e.g. failure_reason) cannot persist it;
-    # the transition and its event (which carries the reason) still happen.
-    if finalize_kwargs.get("failure_reason") is None or not _run_contracts._accepts_kwarg(
-        atomic or state_store.finalize_run_if_status_in, "failure_reason"
-    ):
-        finalize_kwargs.pop("failure_reason", None)
+    reason = finalize_kwargs.pop("failure_reason", None)
+    method = "finalize_with_event" if atomic is not None else "finalize_run_if_status_in"
+    _add_failure_reason(state_store, method, reason, finalize_kwargs)
     if atomic is not None:
         seq = await atomic(
             run_id,

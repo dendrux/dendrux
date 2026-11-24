@@ -281,3 +281,17 @@ def test_trace_command_uses_public_rows_and_positions(tmp_path, monkeypatch, sto
     assert "[0] user" in result.output and "visible input" in result.output
     assert "visible answer" not in result.output
     assert "more traces not shown" in result.output
+
+
+def test_runs_command_called_from_python_includes_waiting_runs(monkeypatch):
+    """Omitting exclude_waiting must not turn the Typer default object into True."""
+    from dendrux.cli import runs
+
+    seen = {}
+
+    async def fake(*args, include_waiting=True, **kwargs):
+        seen["include_waiting"] = include_waiting
+
+    monkeypatch.setattr(runs, "_list_runs", fake)
+    runs.list_runs(10, 0, "paused", "acme", None)
+    assert seen["include_waiting"] is True

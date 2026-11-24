@@ -74,6 +74,7 @@ EXPECTED_MRO = {
     "SQLStateStore": [
         "SQLStateStore",
         "_SqlRuns",
+        "_SqlFanout",
         "_SqlManaged",
         "_SqlTree",
         "_SqlPause",
@@ -94,6 +95,7 @@ EXPECTED_MRO = {
         "SQLiteStateStore",
         "SQLStateStore",
         "_SqlRuns",
+        "_SqlFanout",
         "_SqlManaged",
         "_SqlTree",
         "_SqlPause",
@@ -114,6 +116,7 @@ EXPECTED_MRO = {
         "PostgresStateStore",
         "SQLStateStore",
         "_SqlRuns",
+        "_SqlFanout",
         "_SqlManaged",
         "_SqlTree",
         "_SqlPause",
@@ -134,6 +137,7 @@ EXPECTED_MRO = {
         "MySQLStateStore",
         "SQLStateStore",
         "_SqlRuns",
+        "_SqlFanout",
         "_SqlManaged",
         "_SqlTree",
         "_SqlPause",
@@ -154,12 +158,15 @@ EXPECTED_MRO = {
 
 # Original member snapshots plus the reviewed _parent_run_query hook: inherited
 # from SQLStateStore on SQLite/Postgres, overridden on MySQL. No other member changed.
+# 0.8 (T3): the _SqlFanout mixin adds bind_managed_children and get_managed_children (two
+# more wrapped public members) and its private batch-bind helpers; _bind_child takes the
+# keyword-only trusted ``blocked`` evidence of a batch child.
 # Readable snapshots are retained in the task evidence, not loaded by this test.
 BASELINE = {
-    "SQLStateStore": (104, "cbc48d017b771b4f6ad88c4a9237b5e43652bf833a86d9c133f4fb186cb73f8a"),
-    "SQLiteStateStore": (103, "ecdff91bc8169e0df0e724377b6768354916274e231b00e2f34b003065acf695"),
-    "PostgresStateStore": (104, "19ec2821b54cee9bc7b0b28a88d18fbd3351a8e7619de104935bd032cdca975f"),
-    "MySQLStateStore": (103, "87e8210e771e1fbb60532363c3171d57200b87c4563662e96539b40e84cb92b0"),
+    "SQLStateStore": (106, "3cce8c685f7013262e17f0e68c579ca2487c7b6cf60a179f869b450f57468821"),
+    "SQLiteStateStore": (105, "781aa7f7fc25badf805b95c7bbce74692037ec45cf892404e8f2763940646662"),
+    "PostgresStateStore": (106, "b8b243254ef4fe7cd36ace4455c0287257d752850ba6c1a43aa6f81906e9c39c"),
+    "MySQLStateStore": (105, "f67c47e67b1ed2379447bda73e86ecd2142976c5e2d9dc09d0c54889dc11c9a2"),
 }
 
 
@@ -843,11 +850,41 @@ SWEEP_RELOCATIONS = {
 }
 
 
+def _canonical_waiting_reads(members):
+    # F6 changes observation APIs only. Keep the original hash for every other member.
+    optional = {
+        "list_runs": ", include_waiting: 'bool' = True",
+        "count_runs": ", include_waiting: 'bool' = True",
+    }
+    for name, addition in optional.items():
+        assert members[name]["signature"].count(addition) == 1, name
+        members[name]["signature"] = members[name]["signature"].replace(addition, "")
+    assert members.get("get_waiting_for") == {
+        "kind": "function",
+        "signature": (
+            "(self, run_id: 'str', *, tenant_id: 'TenantScope' = UNSCOPED) -> 'str | None'"
+        ),
+        "layers": [
+            ("durability.py", "call"),
+            ("durability.py", "call"),
+            ("_sql_reads.py", "get_waiting_for"),
+        ],
+        "owner": "SQLStateStore",
+    }
+    del members["get_waiting_for"]
+    assert members["_waiting_labels_by_run"]["signature"] == (
+        "(self, session: 'AsyncSession', rows: 'list[tuple[AgentRun, int]]')"
+        " -> 'dict[str, str | None]'"
+    ), "_waiting_labels_by_run"
+    del members["_waiting_labels_by_run"]
+
+
 def _canonical_writes_snapshot(snapshot, cls):
     import copy
 
     assert snapshot["mro"] == EXPECTED_MRO[cls.__name__]
     result = copy.deepcopy(snapshot)
+    _canonical_waiting_reads(result["members"])
     for name, (old_owner, new_owner) in WRITES_RELOCATIONS[cls.__name__].items():
         assert name in result["members"]
         member = result["members"][name]
@@ -1137,6 +1174,10 @@ async def test_explicit_private_wrapper_and_sanitized_database_failures(cls, nam
         "kind",
         "missing-member",
         "extra-member",
+        "waiting-reader-signature",
+        "waiting-reader-wrappers",
+        "waiting-list-default",
+        "waiting-subtree-default",
     ],
 )
 def test_proposed_exact_write_relocation_still_refuses_unplanned_snapshot_changes(cls, change):
@@ -1200,6 +1241,16 @@ def test_proposed_exact_write_relocation_still_refuses_unplanned_snapshot_change
         layers[0], layers[-2] = layers[-2], layers[0]
     elif change == "signature":
         raw["members"]["update_many"]["signature"] += " changed"
+    elif change == "waiting-reader-signature":
+        raw["members"]["get_waiting_for"]["signature"] += " changed"
+    elif change == "waiting-reader-wrappers":
+        raw["members"]["get_waiting_for"]["layers"].pop(0)
+    elif change == "waiting-list-default":
+        raw["members"]["list_runs"]["signature"] = raw["members"]["list_runs"]["signature"].replace(
+            "include_waiting: 'bool' = True", "include_waiting: 'bool' = False"
+        )
+    elif change == "waiting-subtree-default":
+        raw["members"]["_waiting_labels_by_run"]["signature"] += " changed"
     elif change == "kind":
         raw["members"]["update_many"]["kind"] = "staticmethod"
     elif change == "missing-member":

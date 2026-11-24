@@ -245,15 +245,36 @@ async def completed_fault(store: Any, run_id: str, child_id: str, report: Any) -
     state = await store.get_loop_state(child_id)
     if state is None:
         raise ManagedStateError(reason="child_missing", run_id=run_id)
+    record = None
+    if not (state.get(UNKNOWN) or report.success):
+        record = await store.get_run(child_id)
+        if record is None:
+            raise ManagedStateError(reason="child_missing", run_id=run_id)
+    return child_fault(state, record, report, child_id)
+
+
+def child_fault(state: dict[str, Any], record: Any, report: Any, child_id: str) -> tuple[Any, int]:
+    """A terminal child's fault provenance and accepted unpriced count, from reads already made.
+
+    ``record`` (the child's run) is read only for an unsuccessful report without a
+    checkpointed fault; it may be None otherwise.
+    """
     accepted = accepted_count(state.get(UNPRICED_ACCEPTED))
     if state.get(UNKNOWN) or report.success:
         return state.get(UNKNOWN), accepted
-    child = await store.get_run(child_id)
-    if child is None:
-        raise ManagedStateError(reason="child_missing", run_id=run_id)
-    info = (child.meta or {}).get(ERROR_INFO_META_KEY) or {}
+    info = (record.meta or {}).get(ERROR_INFO_META_KEY) or {}
     persistence_error = info.get("category") == "persistence_error"
     return (usage_fault(True, child_id) if persistence_error else None), accepted
+
+
+def carry_fault(state: dict[str, Any], fault: Any, accepted: int, child_id: str) -> dict[str, Any]:
+    """The adopting parent's state with one child's provenance: counts only rise, a fault sticks."""
+    carried = dict(state)
+    carried[UNPRICED_ACCEPTED] = max(accepted_count(carried.get(UNPRICED_ACCEPTED)), accepted)
+    if fault:
+        carried[UNKNOWN] = usage_fault(fault, child_id)
+        carried.pop(ACCEPTED, None)
+    return carried
 
 
 def propagate_fault(
@@ -266,11 +287,7 @@ def propagate_fault(
         child_id = fields["child_run_id"]
         fault, accepted = await completed_fault(store, run_id, child_id, fields["report"])
         claim = fields["claim"]
-        state = dict(claim.loop_state or {})
-        state[UNPRICED_ACCEPTED] = max(accepted_count(state.get(UNPRICED_ACCEPTED)), accepted)
-        if fault:
-            state[UNKNOWN] = usage_fault(fault, child_id)
-            state.pop(ACCEPTED, None)
+        state = carry_fault(dict(claim.loop_state or {}), fault, accepted, child_id)
         fields["claim"] = _AdoptionClaim(claim.claim_epoch, state)
         return await complete(store, run_id, **fields)
 
@@ -284,9 +301,24 @@ def adoption_patch(state: dict[str, Any], call_id: str) -> LoopStatePatch:
     )
 
 
+def progress_patch(state: dict[str, Any], call_id: str) -> LoopStatePatch:
+    """A fan-out completion before the last: consume the call and persist provenance so far.
+
+    The wait, the admitted calls and the adoption marker stay until the last
+    completion (:func:`adoption_patch`), so recovery still recognizes the adoption.
+    """
+    return LoopStatePatch(remove_pending=(call_id,), set_fields=_provenance_fields(state))
+
+
 def adoption_fields(state: dict[str, Any]) -> dict[str, Any]:
     """Preserve fault provenance when clearing the consumed managed binding."""
     fields: dict[str, Any] = {"managed_wait": None, "submission": None, "managed_admitted": None}
+    fields.update(_provenance_fields(state))
+    return fields
+
+
+def _provenance_fields(state: dict[str, Any]) -> dict[str, Any]:
+    fields: dict[str, Any] = {}
     if UNPRICED_ACCEPTED in state:
         fields[UNPRICED_ACCEPTED] = state[UNPRICED_ACCEPTED]
     if state.get(UNKNOWN):

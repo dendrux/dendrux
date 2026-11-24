@@ -3662,10 +3662,15 @@
   "digest": "d88a23efdc42"
  },
  "src/dendrux/errors.py::TenantScopeRequiredError.__init__": {
-  "complexity": 1,
+  "complexity": 2,
   "coverage": 1.0,
-  "crap": 1.0,
-  "digest": "5e7a83b50d67"
+  "crap": 2.0,
+  "digest": "24fc20c3d554",
+  "waived": {
+   "date": "2026-11-23",
+   "reason": "owner 2026-11-23: approved 1->2 for the optional message branch used by dendrux.cancel_run (fully covered)",
+   "rule": "worse"
+  }
  },
  "src/dendrux/errors.py::UnsupportedModalityError.__init__": {
   "complexity": 1,
@@ -8398,10 +8403,15 @@
   "digest": "7c500aa8f3b5"
  },
  "src/dendrux/loops/single.py::_single_batch_call": {
-  "complexity": 7,
+  "complexity": 8,
   "coverage": 1.0,
-  "crap": 7.0,
-  "digest": "3068852bb18f"
+  "crap": 8.0,
+  "digest": "2d37388bc0ef",
+  "waived": {
+   "date": "2026-11-23",
+   "reason": "owner 2026-11-23: approved +1 for one new fully tested on_started branch (F7)",
+   "rule": "worse"
+  }
  },
  "src/dendrux/loops/single.py::_single_call_budget": {
   "complexity": 2,
@@ -14679,10 +14689,15 @@
   "digest": "34d94a32e8cc"
  },
  "src/dendrux/runtime/_run_start.py::_RunLifecycle._cancelled": {
-  "complexity": 8,
+  "complexity": 9,
   "coverage": 1.0,
-  "crap": 8.0,
-  "digest": "0713228f36eb"
+  "crap": 9.0,
+  "digest": "6b37b5ecb289",
+  "waived": {
+   "date": "2026-11-23",
+   "reason": "owner 2026-11-23: approved +1 for one new fully tested on_started branch (F7)",
+   "rule": "worse"
+  }
  },
  "src/dendrux/runtime/_run_start.py::_RunLifecycle._claim": {
   "complexity": 3,
@@ -14697,10 +14712,15 @@
   "digest": "0b2389296432"
  },
  "src/dendrux/runtime/_run_start.py::_RunLifecycle._failed": {
-  "complexity": 6,
+  "complexity": 7,
   "coverage": 1.0,
-  "crap": 6.0,
-  "digest": "4a87c6f79a3d"
+  "crap": 7.0,
+  "digest": "403bf08a9ea1",
+  "waived": {
+   "date": "2026-11-23",
+   "reason": "owner 2026-11-23: approved +1 for one new fully tested on_started branch (F7)",
+   "rule": "worse"
+  }
  },
  "src/dendrux/runtime/_run_start.py::_RunLifecycle._fenced": {
   "complexity": 5,
@@ -14715,10 +14735,15 @@
   "digest": "7a9ad5e2ae2f"
  },
  "src/dendrux/runtime/_run_start.py::_RunLifecycle._release": {
-  "complexity": 3,
+  "complexity": 4,
   "coverage": 1.0,
-  "crap": 3.0,
-  "digest": "66b86010082a"
+  "crap": 4.0,
+  "digest": "2f500f8d14eb",
+  "waived": {
+   "date": "2026-11-23",
+   "reason": "owner 2026-11-23: approved +1 for one new fully tested on_started branch (F7)",
+   "rule": "worse"
+  }
  },
  "src/dendrux/runtime/_run_start.py::_persist_run_failure": {
   "complexity": 5,
@@ -17408,10 +17433,15 @@
   "digest": "b375119ec2cb"
  },
  "src/dendrux/runtime/stores/sql/_sql_reads.py::_SqlReads.count_runs": {
-  "complexity": 1,
+  "complexity": 2,
   "coverage": 1.0,
-  "crap": 1.0,
-  "digest": "da2bea5d3b50"
+  "crap": 2.0,
+  "digest": "ef90f70b757b",
+  "waived": {
+   "date": "2026-11-22",
+   "reason": "owner 2026-11-22: accepted rises of up to 2 from the waiting_for option (include_waiting branch, paused-detail label lookup)",
+   "rule": "worse"
+  }
  },
  "src/dendrux/runtime/stores/sql/_sql_reads.py::_SqlReads.get_llm_interactions": {
   "complexity": 7,
@@ -17486,10 +17516,15 @@
   "digest": "edd26b78b6bd"
  },
  "src/dendrux/runtime/stores/sql/_sql_reads.py::_SqlReads.list_runs": {
-  "complexity": 2,
+  "complexity": 3,
   "coverage": 1.0,
-  "crap": 2.0,
-  "digest": "f1ccb86be217"
+  "crap": 3.0,
+  "digest": "1cda26ed3121",
+  "waived": {
+   "date": "2026-11-22",
+   "reason": "owner 2026-11-22: accepted rises of up to 2 from the waiting_for option (include_waiting branch, paused-detail label lookup)",
+   "rule": "worse"
+  }
  },
  "src/dendrux/runtime/stores/sql/_sql_runs.py::_SqlRuns._check_idempotency": {
   "complexity": 5,
@@ -19950,10 +19985,15 @@
   "digest": "d5e6cbb537e3"
  },
  "src/dendrux/store/__init__.py::RunStore.get_run": {
-  "complexity": 2,
+  "complexity": 4,
   "coverage": 1.0,
-  "crap": 2.0,
-  "digest": "176a53e971e6"
+  "crap": 4.0,
+  "digest": "3961616ed30d",
+  "waived": {
+   "date": "2026-11-22",
+   "reason": "owner 2026-11-22: accepted rises of up to 2 from the waiting_for option (include_waiting branch, paused-detail label lookup)",
+   "rule": "worse"
+  }
  },
  "src/dendrux/store/__init__.py::RunStore.get_subtree": {
   "complexity": 3,

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal
 
 import dendrux.chat as _chat
@@ -33,12 +33,20 @@ from dendrux.context_blocks import (
     render_band,
     validate_context,
 )
+from dendrux.errors import ManagedStateError
 from dendrux.loops.react import ReActLoop
+from dendrux.loops.single import SingleCall
 from dendrux.runtime import (
     _run_events,
     _run_images,
+    _run_tools,
 )
+from dendrux.runtime._entry_checks import resolve_runner_tenant, runner_entry_checks
+from dendrux.runtime._entry_guardrails import _entry_projection, _EntryProjection
+from dendrux.runtime._managed_fanout_store import ManagedChildSpec
 from dendrux.runtime._run_errors import logger
+from dendrux.runtime._subagents import _tighten
+from dendrux.runtime.context import resolve_child_tenant
 from dendrux.runtime.replay import (
     LoadedReplay,
     ReplayLast,
@@ -55,12 +63,14 @@ from dendrux.runtime.state import (
     ClaimResult,
     unclaimed_store,
 )
+from dendrux.runtime.stores._limits_fit import ensure_agent_limits_fit
 from dendrux.runtime.submit import (
     GOVERNANCE_KEY,
     governance_snapshot,
 )
 from dendrux.skills._session import META_KEY, SkillSession
 from dendrux.skills._session import current as current_skill_session
+from dendrux.strategies.native import NativeToolCalling
 from dendrux.types import (
     GovernanceEventType,
     ImageViewState,
@@ -68,6 +78,7 @@ from dendrux.types import (
     Role,
     RunStatus,
     compute_idempotency_fingerprint,
+    generate_ulid,
 )
 
 if TYPE_CHECKING:
@@ -81,6 +92,7 @@ if TYPE_CHECKING:
     from dendrux.loops.base import Loop, LoopNotifier, LoopRecorder
     from dendrux.media._image import UserContent
     from dendrux.media._runtime import ImageRuntime
+    from dendrux.runtime._managed import ManagedInvocation
     from dendrux.runtime.context import DelegationContext
     from dendrux.runtime.state import StateStore
     from dendrux.strategies.base import Strategy
@@ -331,14 +343,140 @@ async def _entry_replay(
 
 
 def _recovery_loop_name(loop: Loop) -> str | None:
-    from dendrux.loops.react import ReActLoop
-    from dendrux.loops.single import SingleCall
-
     if isinstance(loop, ReActLoop):
         return "ReActLoop"
     if isinstance(loop, SingleCall):
         return "SingleCall"
     return None
+
+
+def _projected_creation_fields(blocked: bool, create: dict[str, Any]) -> dict[str, Any]:
+    fields = dict(create)
+    if blocked:
+        fields["meta"] = {**(fields.get("meta") or {}), BLOCKED_META_KEY: True}
+    return fields
+
+
+@dataclass(frozen=True)
+class PreparedChild:
+    """Detached bind data and the caller-prepared projection transferred to one owner.
+
+    The projection's mutable engine has one owner; reuse it without rescanning.
+    It is omitted from repr because its PII mapping is execution-private.
+    """
+
+    spec: ManagedChildSpec
+    projection: _EntryProjection = field(repr=False)
+
+
+async def prepare_child_creation(child: Agent, branch: ManagedInvocation) -> PreparedChild:
+    """Prepare a detached child creation in the caller task without durable writes.
+
+    ``branch`` supplies the same inherited fields as a single-child invocation.
+    Detectors and skill rendering run here, before bind takes any database lock.
+    Blocked projection remains a creation, with safe seeds and block evidence.
+    """
+    if child is not branch.child:
+        raise ManagedStateError(reason="child_mismatch", run_id=branch.child_run_id)
+    tenant_id = resolve_runner_tenant(child, "run", branch.tenant_id, state_store=branch.store)
+    _require_idempotency_store(branch.store, None)
+    await ensure_agent_limits_fit(child, branch.store)
+    loop = _new_run_loop(child, None)
+    provider = child._require_provider()
+    strategy = NativeToolCalling()
+    session = SkillSession.prepare(child, loop=loop)
+    depth = _resolve_max_delegation_depth(
+        _tighten(branch.max_depth, child.max_delegation_depth), None
+    )
+    tenant_id = resolve_child_tenant(None, tenant_id)
+    # Match _managed._task's coercion; importing that driver here creates an entry cycle.
+    text = str((branch.call.params or {}).get("task", ""))
+    runner_entry_checks(
+        child,
+        "run",
+        tenant_id=tenant_id,
+        metadata=None,
+        user_input=text,
+        history=None,
+        context=None,
+        provider_kwargs={},
+        idempotency_key=None,
+        provider=provider,
+    )
+    _run_tools._validate_loop_skill_compat(child, loop)
+    projection = _entry_projection(child, branch.child_run_id)
+    with session.bind():
+        system = await projection.project(Message(Role.SYSTEM, child.get_system_prompt(loop)), 0)
+        history, _, context, text, parts = await projection.prepare([], None, text, None, session)
+        seeds, _ = await _runtime_seeds(
+            branch.store,
+            child,
+            provider,
+            loop,
+            strategy,
+            {},
+            history,
+            user_input=text,
+            run_id=branch.child_run_id,
+            tenant_id=tenant_id,
+            context=context,
+            user_parts=parts,
+            engine=projection.engine,
+            system_prompt=system.content,
+        )
+        metadata, _ = _new_run_metadata(
+            child,
+            loop,
+            session,
+            None,
+            depth,
+            user_input=text,
+            output_type=child.output_type,
+        )
+        create = _projected_creation_fields(
+            projection.error is not None,
+            {
+                "input_data": _run_images._input_data(text, parts),
+                "model": provider.model,
+                "strategy": type(strategy).__name__,
+                "meta": metadata,
+                **seeds,
+            },
+        )
+    if projection.error is not None:
+        # The generated call has one task field; retain only its safe rejected projection.
+        branch = replace(branch, call=replace(branch.call, params={"task": text}))
+    spec = _prepared_child_spec(branch, loop, create, child_blocked=projection.error is not None)
+    return PreparedChild(spec, projection)
+
+
+def _prepared_child_spec(
+    branch: ManagedInvocation, loop: Loop, create: dict[str, Any], *, child_blocked: bool
+) -> ManagedChildSpec:
+    # Cycle: _managed imports runner, which re-exports this entry module.
+    from dendrux.runtime import _managed, _managed_budget
+
+    return ManagedChildSpec(
+        tool_call_id=branch.call.id,
+        row_id=generate_ulid(),
+        provider_tool_call_id=branch.call.provider_tool_call_id,
+        tool_name=branch.call.name,
+        params=branch.call.params or None,
+        child_run_id=branch.child_run_id,
+        child_agent_name=branch.child.name,
+        child_path=branch.child_path,
+        child_input_data=create.get("input_data"),
+        child_loop_state=_managed_budget.child_state(
+            _state._initial_loop_state(_recovery_loop_name(loop)), branch.unpriced_accepted
+        ),
+        intent_event=_managed.intent_event(branch, branch.child_run_id),
+        child_seed_traces=tuple(create.get("seed_traces") or ()),
+        child_model=create.get("model"),
+        child_strategy=create.get("strategy"),
+        child_meta=create.get("meta"),
+        child_pii_mapping=create.get("pii_mapping"),
+        child_blocked=child_blocked,
+    ).detached()
 
 
 async def _create_projected_run(
@@ -351,12 +489,10 @@ async def _create_projected_run(
     invocation: Any = None,
     **kwargs: Any,
 ) -> Any:
-    from dendrux._meta_keys import BLOCKED_META_KEY
     from dendrux.runtime._blocked_content import _blocked_write, _native_blocked_store
 
     native = _native_blocked_store(store) is not None
-    if blocked and not native:
-        kwargs["meta"] = {**(kwargs.get("meta") or {}), BLOCKED_META_KEY: True}
+    kwargs = _projected_creation_fields(blocked and not native, kwargs)
     scope = _blocked_write(store, run_id) if blocked and native else nullcontext()
     with scope:
         if invocation is not None:

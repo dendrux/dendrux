@@ -256,9 +256,14 @@ def test_registry_metadata_is_complete_and_immutable():
         and c.fires_when
         and c.do
         and c.kind
-        and {"run_id", "tenant_id", "code", "kind"} <= c.fields
+        and {"run_id", "code", "kind"} <= c.fields
         for name, c in module.REGISTRY.items()
     )
+    for code in module.REGISTRY.values():
+        if code.name == "fake_model_predicate_error":
+            assert code.fields == {"code", "kind", "run_id"}
+        else:
+            assert "tenant_id" in code.fields
     with pytest.raises(TypeError):
         module.REGISTRY["injected"] = module.REGISTRY["run_fenced"]
 

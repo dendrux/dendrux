@@ -56,6 +56,38 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
+## Cancel a run without an Agent
+
+An admin route, a CLI or a job runner often needs to stop a run but has no `Agent` built, and building one means loading its tools, subagents and provider keys. Use `dendrux.cancel_run`. It needs only the database.
+
+[//]: # "docs-test: skip - fragment: relies on `store` and `current_tenant`, defined by setup shown elsewhere"
+
+```python
+import dendrux
+
+result = await dendrux.cancel_run(
+    run_id,
+    tenant_id=current_tenant,   # required; None for an untenanted run; UNSCOPED is refused
+    state_store=store,          # or database_url="postgresql+asyncpg://..."
+)
+if result.status.value == "cancelled":
+    ...  # the run was paused and is now cancelled
+elif result.meta.get("cancel_requested"):
+    ...  # the run is working; it stops at its next checkpoint
+```
+
+- Pass exactly one of `state_store=` and `database_url=`. A `state_store` stays yours and is never closed. A `database_url` store is opened and disposed inside the call, which costs an engine per call. Pass the right URL: a SQLite path that does not exist yet (a typo, say) is created as an empty database with the Dendrux schema, and the call then raises `RunNotFoundError`. For a route that cancels often, create one store at startup and pass it.
+- The operation is the one `Agent.cancel_run` performs: a paused run (a paused root included) is cancelled at once; a running run, including a root that is itself running a slow tool, gets a durable request and stops at its next checkpoint, in whichever process owns it; a finished run is left as it is. Subagents of a managed workflow are always included, deepest first and the root last. `cascade=True` (the default here) also includes legacy delegated descendants. The result has the same shape as `Agent.cancel_run`, including `meta["cascade"]`.
+- `max_nodes=` bounds the traversal (default 10,000, the root included). There is no cursor, so the same bound visits the same runs. If the traversal was cut at the bound (`meta["cascade_truncated"]` is true and the cascade list shows runs not reached), call again with a larger `max_nodes`. The flag is also set when every node was visited but the outcome summary reached its 1,000-entry cap, or when a malformed child was skipped; a larger bound does not help there. Read the cascade entries, and for a skipped child fix the cause and repeat the call.
+- A managed subagent id is refused with `ManagedChildControlError`: cancel its root.
+- Storage cost: the `max_nodes` bound limits how many runs are affected, not always how much the store reads. A legacy custom store without the frontier-marking methods loads and sorts the whole subtree before applying `max_nodes`. On the managed-only paged path, legacy delegated children are filtered after they are fetched, so a root with very many of them can read every page even with `max_nodes=1`. The built-in SQL stores use the paged path.
+- `meta["cascade"]` items hold only `run_id` and `outcome`; join them with `RunStore.get_subtree` when you need agent names.
+- A paused root is cancelled at once. A root that is itself running gets a durable request and stops at its next checkpoint, after its in-flight model or tool call; and the `run()` call that is working in its owner process returns only after the slowest in-flight tool call finishes (a 6 second tool means about 6 seconds).
+- It has no task registry. A run working in another process, or in this one, is not interrupted mid-call; it stops at its next checkpoint, after the in-flight model or tool call finishes. For the faster same-process stop, call `Agent.cancel_run` on the instance that runs it.
+- It returns a receipt, like the Agent method. Confirm with the `run.cancelled` event or `RunStore.get_run`.
+
+> **Repeat a cascade that failed.** If a cascade stops partway with an error, or you cancelled a workflow whose owner process died, call `cancel_run` again. Running runs still stop at their checkpoints, but a run that is paused stays paused, with its cancel request set, until a later `cancel_run` settles it. Dendrux starts no background process to do this.
+
 ## What happens, by state
 
 `cancel_run` looks at the run's current persisted status and picks one of four paths.
@@ -210,7 +242,7 @@ print(result.meta["cascade"])    # [{'run_id': ..., 'outcome': 'cancelled' | 'ca
 
 The built-in store marks cancellation requests on each level of the run tree before reading the next level in pages of at most 500. It then finalizes paused descendants deepest first, with the root last. New admission under a marked parent is refused; a creator already past the parent check commits before that parent's scan. On SQLite, delegated creation briefly acquires the writer lock before checking the parent. Running descendants remain cooperative across processes; the terminal event or status confirms that they stopped.
 
-Traversal stays inside the root's actual tenant, including untenanted runs, even for an explicit `UNSCOPED` call. Finished rows keep their cancellation flags. `Budget.max_subtree_nodes` bounds traversal (default 10,000, including the root). A `cascade_truncated` warning means remaining branches need explicit attention. `meta["cascade"]` is separately capped at 1,000 outcomes, and `meta["cascade_truncated"]` can also mean the summary was shortened. Cancelling a mid-tree run leaves its ancestors and their other branches running. See [Cancellation](/docs/architecture/cancellation#cascade).
+Traversal stays inside the root's actual tenant, including untenanted runs, even for an explicit `UNSCOPED` call. The tenant is checked when the call starts; scoping every later write and read to that tenant is planned for a later release. Finished rows keep their cancellation flags. `Budget.max_subtree_nodes` bounds traversal (default 10,000, including the root). A `cascade_truncated` warning means remaining branches need explicit attention. `meta["cascade"]` is separately capped at 1,000 outcomes, and `meta["cascade_truncated"]` can also mean the summary was shortened. Cancelling a mid-tree run leaves its ancestors and their other branches running. See [Cancellation](/docs/architecture/cancellation#cascade).
 
 ## Notes
 
@@ -223,4 +255,4 @@ Traversal stays inside the root's actual tenant, including untenanted runs, even
 ## Where this fits
 
 - Architecture: [Cancellation](/docs/architecture/cancellation), [Pause and resume](/docs/architecture/pause-resume), [Event ordering](/docs/architecture/event-ordering).
-- Reference: [HTTP API surface](/docs/reference/http-api) (`cancel_run` semantics and the cancel write route).
+- Reference: [`dendrux.cancel_run`](/docs/reference/agent#cancel_run), [HTTP API surface](/docs/reference/http-api) (`cancel_run` semantics and the cancel write route).

@@ -1,6 +1,6 @@
 [project]
 name = "dendrux"
-version = "0.7.0"
+version = "0.8.0"
 description = "The runtime for agents that act in the real world."
 readme = "README.md"
 license = {text = "Apache-2.0"}
@@ -30,7 +30,7 @@ dependencies = [
     # backend. Imported at module load by runtime/state.py, so it must
     # be a hard dependency until/unless we ship a non-SQLAlchemy backend.
     "sqlalchemy[asyncio]>=2.0,<3.0",
-    "aiosqlite>=0.19,<1.0",
+    "aiosqlite>=0.22.1,<1.0",
     "alembic>=1.13,<2.0",
     # httpx is imported at module load on the core import path
     # (llm/_retry_telemetry.py, pulled in via loops). It must be a hard

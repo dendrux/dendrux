@@ -6,14 +6,23 @@ import inspect
 import logging
 import warnings
 import weakref
-from typing import Any, NoReturn
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, NoReturn, cast
 
 from dendrux import _codes
 from dendrux._warnings import _developer_stacklevel
 from dendrux.errors import StoreCapabilityError
 from dendrux.runtime.state import StoreCapabilities
 
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
 _REQUIREMENTS: dict[str, dict[str, tuple[str, ...]]] = {
+    "waiting_filter": {
+        "list_runs": ("include_waiting",),
+        "count_runs": ("include_waiting",),
+        "get_waiting_for": ("tenant_id",),
+    },
     "fenced_writes": {
         name: ("claim_epoch",)
         for name in (
@@ -67,6 +76,11 @@ _REQUIREMENTS: dict[str, dict[str, tuple[str, ...]]] = {
         "mark_cancel_requested": (),
         "get_children_page": (),
     },
+    # 0.8: batch bind of 2..32 children and their status read; requires managed_subagents.
+    "managed_fanout": {
+        "bind_managed_children": (),
+        "get_managed_children": ("tenant_id",),
+    },
 }
 # Managed subagents need every durability promise the bind and adoption rely on.
 _MANAGED_PREREQUISITES = (
@@ -80,8 +94,15 @@ _CACHE: dict[int, tuple[weakref.ReferenceType[Any], StoreCapabilities]] = {}
 logger = logging.getLogger(__name__)
 
 
+def _capability_target(store: Any) -> Any:
+    # RunStore's init wrapper exposes its store for inspection only. Calls must
+    # still go through the wrapper so initialization and closed checks run.
+    return inspect.getattr_static(store, "_capability_store", store)
+
+
 def validate_capabilities(store: Any) -> StoreCapabilities:
     """Validate each declared capability once per live store object."""
+    store = _capability_target(store)
     key = id(store)
     cached = _CACHE.get(key)
     if cached is not None and cached[0]() is store:
@@ -147,6 +168,37 @@ def require_managed_subagents(store: Any) -> StoreCapabilities:
     return caps
 
 
+@dataclass(frozen=True)
+class FanoutSupport:
+    """Whether a store can bind a fan-out of 2..32 managed children (0.8)."""
+
+    capable: bool
+
+
+def fanout_support(store: Any) -> FanoutSupport:
+    """The one fan-out discovery: read the store's declaration, never its methods.
+
+    Capable only when the store declares ``managed_fanout`` and is managed-capable
+    (``managed_subagents`` with every prerequisite). A store that is not capable keeps the
+    0.7 single-child behaviour (effective fan-out limit 1).
+    """
+    validate_capabilities(store)
+    caps = capabilities(store)
+    return FanoutSupport(
+        capable=caps.managed_fanout
+        and caps.managed_subagents
+        and all(getattr(caps, name) for name in _MANAGED_PREREQUISITES)
+    )
+
+
+def require_managed_fanout(store: Any) -> StoreCapabilities:
+    """Refuse before any fan-out write unless :func:`fanout_support` says capable."""
+    caps = require_managed_subagents(store)
+    if not fanout_support(store).capable:
+        _refuse(store, "managed_fanout", "bind_managed_children", ("bind_managed_children",))
+    return caps
+
+
 def _refuse(store: Any, capability: str, method: str, missing: tuple[str, ...]) -> NoReturn:
     _codes.log_code(logger, _codes.STORE_CAPABILITY, run_id=None)
     raise StoreCapabilityError(type(store).__name__, capability, method, missing)
@@ -154,7 +206,29 @@ def _refuse(store: Any, capability: str, method: str, missing: tuple[str, ...]) 
 
 def capabilities(store: Any) -> StoreCapabilities:
     """Read a declaration; absent means legacy regardless of method signatures."""
+    store = _capability_target(store)
     declared = inspect.getattr_static(store, "capabilities", None)
     if isinstance(declared, property):
         declared = declared.__get__(store, type(store))
     return declared if isinstance(declared, StoreCapabilities) else StoreCapabilities()
+
+
+def waiting_filter_options(store: Any, *, include_waiting: bool) -> dict[str, Any]:
+    """Discover the optional filter; preserve legacy signatures for default reads."""
+    if not isinstance(include_waiting, bool):
+        raise TypeError("include_waiting must be a bool")
+    if include_waiting:
+        return {}
+    if waiting_filter_reader(store) is None:
+        _refuse(store, "waiting_filter", "list_runs/count_runs", ("include_waiting",))
+    # Dynamic kwargs belong to this optional extension, outside the legacy StateStore protocol.
+    return {"include_waiting": False}
+
+
+def waiting_filter_reader(store: Any) -> Callable[..., Awaitable[str | None]] | None:
+    """Discover the declared waiting reader; legacy stores need no extra detail read."""
+    if not capabilities(store).waiting_filter:
+        return None
+    validate_capabilities(store)
+    # Signature validation covers this optional method outside the required StateStore protocol.
+    return cast("Callable[..., Awaitable[str | None]]", store.get_waiting_for)

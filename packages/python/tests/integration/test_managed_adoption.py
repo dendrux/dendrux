@@ -19,6 +19,7 @@ from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
+import dendrux
 from dendrux import Agent, tool
 from dendrux.db.models import AgentRun, ReactTrace, RunEvent, TokenUsage, ToolCallRecord
 from dendrux.errors import (
@@ -166,7 +167,7 @@ async def test_crash_after_adoption_claim_is_consumed_through_tool_completion_on
     store: Any, engine: Any, monkeypatch: Any
 ) -> None:
     """Cut 2: the report is durably accepted, the tool row is not yet completed."""
-    from dendrux.runtime import persistence
+    from dendrux.runtime import _managed_persistence
 
     root_id, child_id = await crash_before_adoption(store, engine, monkeypatch)
     root, _, _ = fresh_root(store)
@@ -175,7 +176,7 @@ async def test_crash_after_adoption_claim_is_consumed_through_tool_completion_on
         raise CrashError
 
     with monkeypatch.context() as patch:
-        patch.setattr(persistence, "adopt_managed_result", die)
+        patch.setattr(_managed_persistence, "adopt_managed_result", die)
         with pytest.raises(CrashError):
             await root.reclaim(root_id, tenant_id=TENANT)
     row = (await rows(engine, AgentRun, AgentRun.id == root_id))[0]
@@ -277,6 +278,70 @@ def _postgres(engine: Any) -> None:
         pytest.skip("independent-session contenders run on Postgres")
 
 
+TERMINAL_EVENTS = {"run.completed": "success", "run.error": "error", "run.cancelled": "cancelled"}
+
+
+async def settle_all(*tasks: Any, timeout: float = 10, grace: float = 2) -> list[Any]:
+    """Join every task within a hard deadline; return each result or error, in order.
+
+    ``asyncio.wait`` never waits past its timeout. (``wait_for`` would: it waits for a
+    cancelled task to finish, and Dendrux drains shielded cleanup to completion.) Tasks
+    unfinished at ``timeout`` are cancelled and get ``grace`` seconds to stop; any still
+    running then fail the test by name instead of holding the join and the pool open.
+    """
+    if not tasks:
+        return []
+    _, pending = await asyncio.wait(tasks, timeout=timeout)
+    for task in pending:
+        task.cancel()
+    if pending:
+        _, pending = await asyncio.wait(pending, timeout=grace)
+    if pending:
+        names = sorted(repr(task) for task in pending)
+        raise AssertionError(f"tasks still pending after {timeout + grace}s: {names}")
+    return [
+        asyncio.CancelledError() if task.cancelled() else task.exception() or task.result()
+        for task in tasks
+    ]
+
+
+async def test_settle_all_is_a_hard_bound_even_for_shielded_cleanup() -> None:
+    """A task draining shielded cleanup cannot hold the join past its deadline."""
+    from dendrux.runtime.tasks import _drain_cleanup
+
+    gate = asyncio.Event()
+    stuck = asyncio.create_task(_drain_cleanup(gate.wait()))
+    quick = asyncio.create_task(asyncio.sleep(0, result="ok"))
+    join = asyncio.create_task(settle_all(stuck, quick, timeout=0.05, grace=0.05))
+    try:
+        done, _ = await asyncio.wait({join}, timeout=1)
+        assert join in done, "settle_all waited on a task that ignores cancellation"
+        with pytest.raises(AssertionError, match="still pending"):
+            join.result()
+    finally:
+        gate.set()
+        await asyncio.wait({stuck, join}, timeout=5)
+        assert stuck.done() and join.done()
+
+
+async def terminal_history(engine: Any, run_id: str) -> list[tuple[int, str]]:
+    """A settled run has exactly one terminal event, matching its status, as its last event."""
+    events = sorted(
+        await rows(engine, RunEvent, RunEvent.agent_run_id == run_id),
+        key=lambda event: event.sequence_index,
+    )
+    history = [(e.sequence_index, e.event_type) for e in events]
+    status = (await rows(engine, AgentRun, AgentRun.id == run_id))[0].status
+    terminal = [kind for _, kind in history if kind in TERMINAL_EVENTS]
+    if status in TERMINAL_EVENTS.values():
+        assert len(terminal) == 1, (run_id, status, history)
+        assert history[-1][1] == terminal[0], (run_id, status, history)
+        assert TERMINAL_EVENTS[terminal[0]] == status, (run_id, status, history)
+    else:
+        assert terminal == [], (run_id, status, history)
+    return history
+
+
 async def test_pg_adoption_contenders_and_stale_parent(
     store: Any, engine: Any, monkeypatch: Any
 ) -> None:
@@ -324,20 +389,31 @@ async def test_pg_adoption_contenders_and_stale_parent(
             await conn.execute(AgentRun.__table__.delete().where(AgentRun.agent_name == "lead"))
 
 
+def cancel_root(kind: str, store: Any, root_id: str) -> Any:
+    """Cancel through a separate Agent or the standalone entry point."""
+    if kind == "agent":
+        return fresh_root(store)[0].cancel_run(root_id, tenant_id=TENANT)
+    return dendrux.cancel_run(root_id, tenant_id=TENANT, state_store=store)
+
+
+@pytest.mark.parametrize("canceller", ["agent", "module"])
 async def test_pg_cancel_versus_adoption_claim_never_revives_the_root(
-    store: Any, engine: Any, monkeypatch: Any
+    store: Any, engine: Any, monkeypatch: Any, canceller: str
 ) -> None:
     _postgres(engine)
     outcomes = set()
     for _ in range(4):
         root_id, _ = await crash_before_adoption(store, engine, monkeypatch)
         root, root_llm, child_llm = fresh_root(store, LLMResponse(text="root done"))
-        canceller, _, _ = fresh_root(store)
-        results = await asyncio.gather(
-            root.reclaim(root_id, tenant_id=TENANT),
-            canceller.cancel_run(root_id, tenant_id=TENANT),
-            return_exceptions=True,
-        )
+        second = create_async_engine(engine.url, pool_size=1, max_overflow=0)
+        try:
+            results = await asyncio.gather(
+                root.reclaim(root_id, tenant_id=TENANT),
+                cancel_root(canceller, store_for_engine(second), root_id),
+                return_exceptions=True,
+            )
+        finally:
+            await second.dispose()
         for r in results:
             if isinstance(r, BaseException):
                 assert isinstance(r, (RunNotReclaimableError, RunCancelledError)), r
@@ -352,15 +428,61 @@ async def test_pg_cancel_versus_adoption_claim_never_revives_the_root(
         if final.status == "cancelled" and intent.outcome == "started":
             assert root_llm.calls == 0 and not await observations(engine, root_id)
         outcomes.add((final.status, intent.outcome))
+        history = await terminal_history(engine, root_id)
         # A cancelled root is never revived by a later adoption attempt.
         if final.status == "cancelled":
             again, again_llm, _ = fresh_root(store, LLMResponse(text="x"))
             await again.reclaim(root_id, tenant_id=TENANT)
             assert again_llm.calls == 0
             assert (await rows(engine, AgentRun, AgentRun.id == root_id))[0].status == "cancelled"
+        # A later cancel of either outcome changes nothing and appends nothing.
+        calls = (root_llm.calls, child_llm.calls)
+        await cancel_root(canceller, store, root_id)
+        assert await terminal_history(engine, root_id) == history
+        assert (root_llm.calls, child_llm.calls) == calls
         async with engine.begin() as conn:
             await conn.execute(AgentRun.__table__.delete().where(AgentRun.agent_name == "lead"))
     assert outcomes
+
+
+async def test_pg_claim_first_keeps_the_cancel_request_for_the_new_owner(
+    store: Any, engine: Any, monkeypatch: Any
+) -> None:
+    """The adoption claim wins; the module cancel loses its CAS but its request stops the owner."""
+    _postgres(engine)
+    root_id, child_id = await crash_before_adoption(store, engine, monkeypatch)
+    root, root_llm, child_llm = fresh_root(store, call("reviewer", {"task": BRIEF}, "r2"))
+    root_llm.gate_at = 0  # the new owner's first model call, after its adoption claim
+    owner = asyncio.create_task(root.reclaim(root_id, tenant_id=TENANT))
+    second = create_async_engine(engine.url, pool_size=1, max_overflow=0)
+    try:
+        await asyncio.wait_for(root_llm.entered.wait(), 10)
+        claimed = (await rows(engine, AgentRun, AgentRun.id == root_id))[0]
+        result = await dendrux.cancel_run(
+            root_id, tenant_id=TENANT, state_store=store_for_engine(second)
+        )
+        marked = (await rows(engine, AgentRun, AgentRun.id == root_id))[0]
+    finally:
+        # Join the owner on every path before its engine goes away; keep the first error.
+        root_llm.gate.set()
+        [settled] = await settle_all(owner)
+        await second.dispose()
+    assert claimed.status == "running"
+    assert (result.status, result.meta["cancel_requested"]) == (RunStatus.RUNNING, True)
+    assert (marked.status, marked.cancel_requested) == ("running", True)
+    assert marked.claim_epoch == claimed.claim_epoch
+    if isinstance(settled, BaseException):
+        assert isinstance(settled, RunCancelledError), settled
+    else:
+        assert settled.status == RunStatus.CANCELLED
+    final = (await rows(engine, AgentRun, AgentRun.id == root_id))[0]
+    assert final.status == "cancelled"
+    assert [c.id for c in await rows(engine, AgentRun, AgentRun.parent_run_id == root_id)] == [
+        child_id
+    ]
+    assert child_llm.calls == 0
+    history = await terminal_history(engine, root_id)
+    assert history[-1][1] == "run.cancelled"
 
 
 # ---------------------------------------------------------------------------
@@ -792,8 +914,15 @@ async def _crash_at(monkeypatch: Any, module: Any, name: str, run: Any) -> None:
             await run()
 
 
+@pytest.mark.parametrize(
+    "parallel_limit",
+    [
+        1,
+        4,
+    ],
+)
 async def test_recovered_unsupported_batch_is_refused_with_zero_effects(
-    store: Any, engine: Any, monkeypatch: Any
+    store: Any, engine: Any, monkeypatch: Any, parallel_limit: int
 ) -> None:
     """Crash at the assistant checkpoint (before live preflight), then recover."""
     from dendrux.loops import react
@@ -805,11 +934,14 @@ async def test_recovered_unsupported_batch_is_refused_with_zero_effects(
             ToolCall(name="fetch", params={"x": 1}, provider_tool_call_id="p3"),
         ]
     )
+    # Pin the single-child refusal path.
     first = _recovery_root(
         store,
         ContextLLM([batch]),
         _named("reviewer", ContextLLM([])),
         _named("auditor", ContextLLM([])),
+        limits=Limits(max_parallel_subagents=parallel_limit),
+        exclusive_subagents=["reviewer"] if parallel_limit == 4 else None,
     )
     await _crash_at(
         monkeypatch, react, "_refuse_managed_batch", lambda: first.run("go", tenant_id=TENANT)
@@ -820,7 +952,12 @@ async def test_recovered_unsupported_batch_is_refused_with_zero_effects(
     reviewer_llm, auditor_llm = ContextLLM([]), ContextLLM([])
     root_llm = ContextLLM([LLMResponse(text="regrouped")])
     fresh = _recovery_root(
-        store, root_llm, _named("reviewer", reviewer_llm), _named("auditor", auditor_llm)
+        store,
+        root_llm,
+        _named("reviewer", reviewer_llm),
+        _named("auditor", auditor_llm),
+        limits=Limits(max_parallel_subagents=parallel_limit),
+        exclusive_subagents=["reviewer"] if parallel_limit == 4 else None,
     )
     result = await fresh.reclaim(root_id, tenant_id=TENANT, item=item)
 
@@ -830,7 +967,11 @@ async def test_recovered_unsupported_batch_is_refused_with_zero_effects(
     seen = [json.loads(m.content) for m in root_llm.messages[0] if m.role.value == "tool"]
     assert len(seen) == 3 and all("subagent" in o["error"] for o in seen)
     tool_rows = await rows(engine, ToolCallRecord, ToolCallRecord.agent_run_id == root_id)
-    assert {r.meta.get("code") for r in tool_rows} == {"managed_batch_unsupported"}
+    if parallel_limit == 4:
+        assert all(r.meta.get("reason") == "exclusive" for r in tool_rows)
+    assert {r.meta.get("code") for r in tool_rows} == {
+        "managed_fanout_limit" if parallel_limit == 1 else "managed_batch_unsupported"
+    }
 
 
 async def test_recovered_pre_bind_handoff_binds_once_not_a_client_pause(
@@ -1007,7 +1148,7 @@ def _drop_confidential(ctx: Any) -> Any:
 async def test_parent_transform_shapes_the_accepted_report_once(
     store: Any, engine: Any, monkeypatch: Any, cut: str
 ) -> None:
-    from dendrux.runtime import persistence
+    from dendrux.runtime import _managed_persistence
 
     transform_calls.clear()
     child_llm = ContextLLM([LLMResponse(text=f"report {CONFIDENTIAL}")])
@@ -1020,7 +1161,7 @@ async def test_parent_transform_shapes_the_accepted_report_once(
         final_llm = root_llm
     else:
         target, name = (
-            (persistence, "adopt_managed_result")
+            (_managed_persistence, "adopt_managed_result")
             if cut == "after_claim"
             else (_reclaim, "continue_claimed")
         )
@@ -1082,7 +1223,7 @@ async def test_parent_block_policy_stops_the_parent_and_keeps_no_blocked_text(
 ) -> None:
     from dendrux._meta_keys import BLOCKED_META_KEY
     from dendrux.guardrails import SecretDetection
-    from dendrux.runtime import persistence
+    from dendrux.runtime import _managed_persistence
 
     child_llm = ContextLLM([LLMResponse(text=f"key {AWS_KEY}")])
     root_llm = ContextLLM([call("reviewer", {"task": BRIEF}, "r1"), LLMResponse(text="never")])
@@ -1096,7 +1237,7 @@ async def test_parent_block_policy_stops_the_parent_and_keeps_no_blocked_text(
         root_id = result.run_id
     else:
         target, name = (
-            (persistence, "adopt_managed_result")
+            (_managed_persistence, "adopt_managed_result")
             if cut == "after_claim"
             else (_reclaim, "continue_claimed")
         )
@@ -1245,8 +1386,9 @@ async def test_r4a_recorded_approval_gate_is_not_bound_on_recovery(
 
 
 @pytest.mark.parametrize("refused_before_crash", [1, 2])
+@pytest.mark.parametrize("parallel_limit", [1, 4])
 async def test_r4b_partial_batch_refusal_refuses_the_rest_on_recovery(
-    store: Any, engine: Any, monkeypatch: Any, refused_before_crash: int
+    store: Any, engine: Any, monkeypatch: Any, refused_before_crash: int, parallel_limit: int
 ) -> None:
     """Crash after each refusal, incl. the last managed one before the server call."""
     from dendrux.loops import react
@@ -1258,11 +1400,14 @@ async def test_r4b_partial_batch_refusal_refuses_the_rest_on_recovery(
             ToolCall(name="fetch", params={"x": 1}, provider_tool_call_id="p3"),
         ]
     )
+    # Pin the single-child refusal path.
     first = _recovery_root(
         store,
         ContextLLM([batch]),
         _named("reviewer", ContextLLM([])),
         _named("auditor", ContextLLM([])),
+        limits=Limits(max_parallel_subagents=parallel_limit),
+        exclusive_subagents=["reviewer"] if parallel_limit == 4 else None,
     )
     original = react._ToolBatch.reject
     done = {"n": 0}
@@ -1282,13 +1427,22 @@ async def test_r4b_partial_batch_refusal_refuses_the_rest_on_recovery(
     item = await expire(store, engine, root_id)
     root_llm = ContextLLM([LLMResponse(text="regrouped")])
     fresh = _recovery_root(
-        store, root_llm, _named("reviewer", ContextLLM([])), _named("auditor", ContextLLM([]))
+        store,
+        root_llm,
+        _named("reviewer", ContextLLM([])),
+        _named("auditor", ContextLLM([])),
+        limits=Limits(max_parallel_subagents=parallel_limit),
+        exclusive_subagents=["reviewer"] if parallel_limit == 4 else None,
     )
     result = await fresh.reclaim(root_id, tenant_id=TENANT, item=item)
     assert result.status == RunStatus.SUCCESS and effects == []
     tool_rows = await rows(engine, ToolCallRecord, ToolCallRecord.agent_run_id == root_id)
     assert len(tool_rows) == 3
-    assert {r.meta.get("code") for r in tool_rows} == {"managed_batch_unsupported"}
+    if parallel_limit == 4:
+        assert all(r.meta.get("reason") == "exclusive" for r in tool_rows)
+    assert {r.meta.get("code") for r in tool_rows} == {
+        "managed_fanout_limit" if parallel_limit == 1 else "managed_batch_unsupported"
+    }
     assert not await rows(engine, AgentRun, AgentRun.parent_run_id == root_id)
 
 

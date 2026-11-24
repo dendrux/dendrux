@@ -103,37 +103,100 @@ class _SqlSweep(_SqlWrites):
         max_runs: int,
         cursor: tuple[str, datetime, str] | None = None,
     ) -> tuple[list[SweptRun], tuple[str, datetime, str] | None]:
-        for name, value, ceiling in (
-            ("batch_size", batch_size, SWEEP_BATCH_MAX),
-            ("max_runs", max_runs, SWEEP_MAX_RUNS_MAX),
-        ):
-            if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= ceiling:
-                raise ValueError(f"{name} must be between 1 and {ceiling}")
-        _validate_sweep_age(older_than)
-        scan = _sql_sweep_scan._SweepScan(self, waiting=waiting, older_than=older_than)
-        swept: list[SweptRun] = []
-        visited = 0
-        statuses = list(PAUSE_STATUS_VALUES) if waiting else [RunStatus.RUNNING.value]
-        after = None
-        if cursor is not None:
-            statuses = statuses[statuses.index(cursor[0]) :]
-            after = cursor[1:]
-        for status_filter in statuses:
-            done, count, end = await scan.collect(
-                status_filter, after, batch_size, max_runs - visited
+        # The database-call decorator retains the core's tuple result.
+        return await _scan_runs_core(
+            self,
+            older_than,
+            waiting=waiting,
+            batch_size=batch_size,
+            max_runs=max_runs,
+            cursor=cursor,
+        )
+
+
+@_safe_database_call
+async def _collect_runs(
+    store: _SqlSweep,
+    older_than: timedelta | None,
+    *,
+    waiting: bool,
+    batch_size: int,
+    max_runs: int,
+    cursor: tuple[str, datetime, str] | None = None,
+    adoptable_after: timedelta | None = None,
+    adoptable: list[str] | None = None,
+) -> tuple[list[SweptRun], tuple[str, datetime, str] | None]:
+    return await _scan_runs_core(
+        store,
+        older_than,
+        waiting=waiting,
+        batch_size=batch_size,
+        max_runs=max_runs,
+        cursor=cursor,
+        adoptable_after=adoptable_after,
+        adoptable=adoptable,
+    )
+
+
+def _scan_window(
+    batch_size: int,
+    max_runs: int,
+    older_than: timedelta | None,
+    adoptable_after: timedelta | None,
+) -> timedelta:
+    """Validate the scan bounds and ages; return the youngest age the scan must read."""
+    for name, value, ceiling in (
+        ("batch_size", batch_size, SWEEP_BATCH_MAX),
+        ("max_runs", max_runs, SWEEP_MAX_RUNS_MAX),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= ceiling:
+            raise ValueError(f"{name} must be between 1 and {ceiling}")
+    ages = [age for age in (older_than, adoptable_after) if age is not None]
+    for age in ages:
+        _validate_sweep_age(age)
+    if not ages:
+        raise ValueError("sweep age must be a non-negative timedelta")
+    return min(ages)
+
+
+async def _scan_runs_core(
+    store: _SqlSweep,
+    older_than: timedelta | None,
+    *,
+    waiting: bool,
+    batch_size: int,
+    max_runs: int,
+    cursor: tuple[str, datetime, str] | None = None,
+    adoptable_after: timedelta | None = None,
+    adoptable: list[str] | None = None,
+) -> tuple[list[SweptRun], tuple[str, datetime, str] | None]:
+    window = _scan_window(batch_size, max_runs, older_than, adoptable_after)
+    scan = _sql_sweep_scan._SweepScan(store, waiting=waiting, older_than=window)
+    if adoptable_after is not None:
+        scan.configure_adoption(
+            abandoned_after=older_than, adoptable_after=adoptable_after, adoptable=adoptable
+        )
+    swept: list[SweptRun] = []
+    visited = 0
+    statuses = list(PAUSE_STATUS_VALUES) if waiting else [RunStatus.RUNNING.value]
+    after = None
+    if cursor is not None:
+        statuses = statuses[statuses.index(cursor[0]) :]
+        after = cursor[1:]
+    for status_filter in statuses:
+        done, count, end = await scan.collect(status_filter, after, batch_size, max_runs - visited)
+        swept.extend(done)
+        visited += count
+        if visited == max_runs:
+            _codes.log_code(
+                logger,
+                _codes.SWEEP_CAP_REACHED,
+                category=FailureReason.ABANDONED_WAITING.value
+                if waiting
+                else FailureReason.STALE_RUNNING.value,
+                cap=max_runs,
+                inspected=visited,
             )
-            swept.extend(done)
-            visited += count
-            if visited == max_runs:
-                _codes.log_code(
-                    logger,
-                    _codes.SWEEP_CAP_REACHED,
-                    category=FailureReason.ABANDONED_WAITING.value
-                    if waiting
-                    else FailureReason.STALE_RUNNING.value,
-                    cap=max_runs,
-                    inspected=visited,
-                )
-                return swept, (status_filter, *end) if waiting else None
-            after = None
-        return swept, None
+            return swept, (status_filter, *end) if waiting else None
+        after = None
+    return swept, None

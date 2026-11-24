@@ -40,13 +40,18 @@ from dendrux.runtime import (
     _run_entry,
     _run_errors,
     _run_events,
+    _run_execute,
     _run_images,
     _run_outcome,
     _run_pending,
     _run_start,
     _run_tools,
 )
-from dendrux.runtime._entry_checks import resolve_runner_tenant, runner_entry_checks
+from dendrux.runtime._entry_checks import (
+    reject_stream_on_started,
+    resolve_runner_tenant,
+    runner_entry_checks,
+)
 from dendrux.runtime._managed_cancel import (
     ManagedRootStoppedError,
 )
@@ -75,8 +80,11 @@ from dendrux.skills._session import SkillSession
 from dendrux.types import (
     IdempotencyConflictError,
     RunAlreadyActiveError,
+    RunEvent,
     RunEventType,
+    RunResult,
     RunStatus,
+    RunStream,
 )
 
 if TYPE_CHECKING:
@@ -98,15 +106,10 @@ if TYPE_CHECKING:
         ContentPart,
         CreateRunResult,
         Limits,
-        RunEvent,
-        RunResult,
-        RunStream,
     )
 
 
 def _cached_stream_event(cached: RunResult, run_id: str) -> RunEvent:
-    from dendrux.types import RunEvent
-
     event_type = {
         RunStatus.ERROR: RunEventType.RUN_ERROR,
         RunStatus.CANCELLED: RunEventType.RUN_CANCELLED,
@@ -118,6 +121,12 @@ def _cached_stream_event(cached: RunResult, run_id: str) -> RunEvent:
         error=cached.error if event_type == RunEventType.RUN_ERROR else None,
         phase="final_answer" if cached.status == RunStatus.SUCCESS else None,
     )
+
+
+def _fanout_frame(recorder: Any, store: StateStore | None) -> Any:
+    """Set the streamed frame's fan-out flag explicitly: on exactly when run() would be."""
+    _run_execute._configure_fanout(recorder, store)
+    return recorder
 
 
 def _stream_claim(
@@ -234,6 +243,7 @@ def run_stream(
 ) -> RunStream: ...
 
 
+@reject_stream_on_started
 def run_stream(
     agent: Agent,
     *,
@@ -301,9 +311,6 @@ def run_stream(
             f"max_delegation_depth must be a non-negative integer or None, "
             f"got {max_delegation_depth!r}"
         )
-
-    from dendrux.types import RunEvent, RunResult
-    from dendrux.types import RunStream as _RunStream
 
     # Validate input + chat history synchronously so TypeError / ValueError
     # surfaces to the caller immediately, not as a RUN_ERROR event. Image
@@ -561,7 +568,7 @@ def run_stream(
             # Lifecycle pair is now open. Stash recorder/notifier so the
             # cleanup callback can close it with a CANCELLED finish if the
             # consumer abandons the stream before a terminal event.
-            _shared["recorder"] = startup.recorder
+            _shared["recorder"] = _fanout_frame(startup.recorder, store)
             _shared["notifier"] = extra_notifier
 
             yield RunEvent(type=RunEventType.RUN_STARTED, run_id=run_id)
@@ -762,7 +769,7 @@ def run_stream(
             return cancelled_result
         return None
 
-    stream = _RunStream(
+    stream = RunStream(
         run_id=run_id,
         generator=stream_context.wrap(_generate()),
         cleanup=lambda: _run_events._shielded_cleanup(_cleanup, run_id=run_id),

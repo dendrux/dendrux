@@ -6,11 +6,11 @@ import inspect
 import logging
 import math
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, replace
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, cast
 
-from dendrux import _codes
+from dendrux import _codes, _wire
 from dendrux._lifecycle import PAUSE_STATUSES as PAUSE_STATUSES
 from dendrux._lifecycle import PENDING_KIND_BY_STATUS, StoredEventType
 from dendrux._lifecycle import PendingKind as PendingKind
@@ -21,16 +21,32 @@ from dendrux.runtime._bounds import MAX_PAGE
 from dendrux.types import RunStatus
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Awaitable, Callable, Mapping
 
-from dendrux.errors import RunNotFoundError
+from dendrux.errors import ManagedStateError, RunNotFoundError
+from dendrux.runtime._managed_pending import MAX_MANAGED_WALK as MAX_MANAGED_WALK
+from dendrux.runtime._managed_pending import (
+    FacingView,
+    ManagedHop,
+    _bound_child_id,
+    _checked_child,
+    is_managed_wait,
+    needs_approval_display,
+    read_pause_summaries,
+    read_workflow,
+    sql_leaf_data,
+)
+from dendrux.runtime._managed_pending import facing_status as facing_status
 from dendrux.runtime.state import (
-    PAUSE_SUMMARY_KEYS,
+    MANAGED_BINDING_KEY,
+    MANAGED_HEADER_KEY,
     UNSCOPED,
+    ManagedHeader,
     PauseSummary,
     TenantScope,
     _apply_tenant_scope,
     _Unscoped,
+    unclaimed_store,
 )
 
 _METADATA_FILTER_CHARS = 4096
@@ -139,6 +155,40 @@ class PendingPause:
         }
 
 
+@dataclass(frozen=True, slots=True, eq=False)
+class _ManagedPendingPause(PendingPause):
+    __hash__ = PendingPause.__hash__
+
+    _wire_display: dict[str, Any] | None = field(
+        default=None, kw_only=True, repr=False, compare=False
+    )
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, PendingPause):
+            return NotImplemented
+        return all(getattr(self, f.name) == getattr(other, f.name) for f in fields(PendingPause))
+
+    def addressed(
+        self,
+        root_id: str,
+        leaf: ManagedHop,
+        path: list[str],
+        *,
+        mapping: dict[str, str] | None,
+    ) -> _ManagedPendingPause:
+        pause = replace(
+            self,
+            run_id=root_id,
+            agent_name=leaf.agent_name,
+            agent_path=path,
+            origin_run_id=leaf.run_id,
+        )
+        if mapping and pause.kind != "client_tool":
+            # Keep the safe display, without attaching the child's audit mapping to a public read.
+            return replace(pause, _wire_display=_wire.project_pending(pause, mapping))
+        return pause
+
+
 def _pending_origin(pause: PendingPause) -> dict[str, Any]:
     if pause.origin_run_id is None:
         return {}
@@ -172,6 +222,7 @@ def _pending_from(
     kind: PendingKind,
     pause: dict[str, Any],
     last_step: dict[str, Any] | None,
+    pause_type: type[PendingPause] = PendingPause,
 ) -> PendingPause:
     targets = pause.get("pending_targets") or {}
     gates = pause.get("approval_gates") or {}
@@ -192,7 +243,7 @@ def _pending_from(
         )
     question, options = _clarification_fields(pause, last_step, kind)
     exceeded = pause.get("budget_exceeded")
-    return PendingPause(
+    return pause_type(
         run_id=run_id,
         status=status,
         kind=kind,
@@ -495,38 +546,8 @@ async def _whole_pause_summary(
     state: Any, run_id: str, tenant_id: TenantScope
 ) -> PauseSummary | None:
     """The summary from the whole ``pause_data`` document, decoded by the driver."""
-    from sqlalchemy import func, select
-
-    from dendrux.db.models import AgentRun, RunEvent
-
-    paused_seq = (
-        select(func.max(RunEvent.sequence_index))
-        .where(
-            RunEvent.agent_run_id == run_id, RunEvent.event_type == StoredEventType.RUN_PAUSED.value
-        )
-        .scalar_subquery()
-    )
-    stmt = _apply_tenant_scope(
-        select(AgentRun.status, paused_seq, AgentRun.pii_mapping, AgentRun.pause_data).where(
-            AgentRun.id == run_id
-        ),
-        tenant_id,
-    )
-    async with state._session_factory() as session:
-        row = (await session.execute(stmt)).first()
-    if row is None:
-        return None
-    status, seq, mapping, data = row
-    data = data if isinstance(data, dict) else {}
-    steps = data.get("steps")
-    last = steps[-1] if isinstance(steps, list) and steps else None
-    return PauseSummary(
-        str(status),
-        {k: data[k] for k in PAUSE_SUMMARY_KEYS if k in data and data[k] is not None},
-        last if isinstance(last, dict) else None,
-        seq,
-        dict(mapping) if isinstance(mapping, dict) else None,
-    )
+    summaries = await read_pause_summaries(state, [run_id], tenant_id, whole=True)
+    return summaries.get(run_id)
 
 
 def _accepts_tenant(method: Any) -> bool:
@@ -558,71 +579,26 @@ def _active_pause_from_events(rows: list[Any]) -> int | None:
 
 
 # ---------------------------------------------------------------------------
-# Managed subagents (0.7): the root-facing view of a workflow's active branch.
-# A parent waiting on a subagent is PAUSED with a private managed wait; what the
-# application sees is the leaf's external pause, addressed through the root.
+# Managed subagents: what a waiting run shows is its workflow's external pauses
+# (the walk lives in dendrux.runtime._managed_pending).
 # ---------------------------------------------------------------------------
-
-MANAGED_WAIT_REASON = "managed_wait"
-MAX_MANAGED_WALK = 257
-"""Bound on a root-to-leaf walk: the definition-node cap plus the root."""
-
-
-@dataclass(frozen=True)
-class ManagedHop:
-    """One run on a managed branch: projected columns and checkpoint keys, never history."""
-
-    run_id: str
-    status: str
-    tenant_id: str | None
-    parent_run_id: str | None
-    agent_name: str
-    header: Any
-    binding: Any
-
-    @property
-    def waiting(self) -> bool:
-        """A parent parked on one bound subagent."""
-        return self.status == RunStatus.PAUSED.value and isinstance(self.binding, dict)
-
-
-@dataclass(frozen=True)
-class FacingView:
-    """What a run looks like to its caller: root-facing for a managed workflow."""
-
-    status: str
-    pending: PendingPause | None
-    managed: bool = False
-
-
-def facing_status(status: str, view: FacingView | None) -> str:
-    """The status a caller sees: the stored one, unless this read classified a managed view.
-
-    A managed view (a root waiting on a subagent) carries the status the same
-    reads observed: the leaf's waiting status, or RUNNING while a subagent runs
-    or awaits adoption. Nothing is inferred from a missing pending: an ordinary
-    run keeps its stored status even when it moved on before its pending read.
-    """
-    if view is not None and view.managed:
-        return view.status
-    return status
-
-
-def is_managed_wait(status: str, pause: Mapping[str, Any]) -> bool:
-    """A parent waiting on a managed subagent (its own pause is private)."""
-    return status == RunStatus.PAUSED.value and pause.get("pause_reason") == MANAGED_WAIT_REASON
 
 
 class _HopReader:
-    """PK reads of managed hops in one session (one statement per hop on SQL stores)."""
+    """PK reads of managed hops in one session (one statement per hop on SQL stores).
 
-    def __init__(self, state: Any) -> None:
-        from dendrux.runtime.state import unclaimed_store
+    ``scoped_run`` reads a run record within a tenant scope; custom stores without the
+    SQL projection use it for the first hop.
+    """
 
+    def __init__(
+        self, state: Any, scoped_run: Callable[[str, TenantScope], Awaitable[Any]]
+    ) -> None:
         self._store: Any = unclaimed_store(state)
         factory = getattr(self._store, "_session_factory", None)
         self._sql = factory is not None and callable(getattr(self._store, "json_get", None))
         self._factory: Any = factory
+        self._scoped_run = scoped_run
         self._scope: Any = None
         self._session: Any = None
 
@@ -632,17 +608,17 @@ class _HopReader:
             self._session = await self._scope.__aenter__()
         return self
 
-    async def __aexit__(self, *exc: Any) -> None:
+    async def __aexit__(self, *exc: object) -> None:
         if self._scope is not None:
             await self._scope.__aexit__(*exc)
 
     async def read(self, run_id: str, tenant_id: TenantScope = UNSCOPED) -> ManagedHop | None:
+        """The run's hop projection within ``tenant_id``, or None."""
         if self._session is None:
             return await self._read_methods(run_id, tenant_id)
         from sqlalchemy import select
 
         from dendrux.db.models import AgentRun
-        from dendrux.runtime.state import MANAGED_BINDING_KEY, MANAGED_HEADER_KEY
 
         store = self._store
         stmt = _apply_tenant_scope(
@@ -661,9 +637,7 @@ class _HopReader:
         return None if row is None else ManagedHop(*row)
 
     async def _read_methods(self, run_id: str, tenant_id: TenantScope) -> ManagedHop | None:
-        from dendrux.runtime.state import MANAGED_BINDING_KEY, MANAGED_HEADER_KEY
-
-        record = await _PendingReader(self._store)._scoped_run(run_id, tenant_id)
+        record = await self._scoped_run(run_id, tenant_id)
         if record is None:
             return None
         state = await self._store.get_loop_state(run_id) or {}
@@ -678,43 +652,6 @@ class _HopReader:
         )
 
 
-def _bound_child_id(parent: ManagedHop) -> str:
-    from dendrux.errors import ManagedStateError
-    from dendrux.types import _ULID_PATTERN
-
-    child_id = parent.binding.get("child_run_id")
-    call_id = parent.binding.get("tool_call_id")
-    if (
-        not isinstance(child_id, str)
-        or not _ULID_PATTERN.fullmatch(child_id)
-        or not isinstance(call_id, str)
-    ):
-        raise ManagedStateError(reason="wait_invalid", run_id=parent.run_id)
-    return child_id
-
-
-def _checked_child(
-    parent: ManagedHop, child: ManagedHop | None, root_run_id: str, path: tuple[str, ...]
-) -> tuple[str, ...]:
-    """Validate one hop: parent link, tenant, root, invocation and path; return its path."""
-    from dendrux.errors import ManagedStateError
-    from dendrux.runtime.state import ManagedHeader
-
-    if child is None:
-        raise ManagedStateError(reason="child_missing", run_id=parent.run_id)
-    if child.parent_run_id != parent.run_id or child.tenant_id != parent.tenant_id:
-        raise ManagedStateError(reason="child_mismatch", run_id=parent.run_id)
-    header = ManagedHeader.from_dict(child.header, run_id=child.run_id)
-    if (
-        header.root_run_id != root_run_id
-        or header.parent_run_id != parent.run_id
-        or header.tool_call_id != parent.binding.get("tool_call_id")
-        or header.path[:-1] != path
-    ):
-        raise ManagedStateError(reason="child_mismatch", run_id=parent.run_id)
-    return header.path
-
-
 async def managed_branch(
     state: Any, run_id: str, tenant_id: TenantScope
 ) -> tuple[list[ManagedHop], tuple[str, ...], tuple[str, ...]]:
@@ -726,12 +663,10 @@ async def managed_branch(
     Follows each waiting parent's exact bound child id: one projected PK read per
     hop (no subtree scan, no history), validating every hop. ``tenant_id`` scopes
     the first read; every later hop must carry that run's actual tenant. Bounded
-    by :data:`MAX_MANAGED_WALK`; inconsistent rows raise ``ManagedStateError``.
+    by :data:`MAX_MANAGED_WALK`; inconsistent rows raise ``ManagedStateError``
+    (a v4 fan-out wait is not a branch: ``wait_invalid``).
     """
-    from dendrux.errors import ManagedStateError
-    from dendrux.runtime.state import ManagedHeader
-
-    async with _HopReader(state) as reader:
+    async with _HopReader(state, _PendingReader(state)._scoped_run) as reader:
         current = await reader.read(run_id, tenant_id)
         if current is None:
             raise RunNotFoundError(run_id)
@@ -745,11 +680,37 @@ async def managed_branch(
             if not current.waiting:
                 return hops, header.path, path
             child = await reader.read(_bound_child_id(current))
-            path = _checked_child(current, child, root_run_id, path)
-            assert child is not None
-            hops.append(child)
-            current = child
+            current, path = _checked_child(current, child, root_run_id, path)
+            hops.append(current)
     raise ManagedStateError(reason="binding_conflict", run_id=run_id)
+
+
+def _own_view(status: str, pending: PendingPause | None) -> FacingView:
+    """A run's own status and pause: its pendings are that one pause, or none."""
+    return FacingView(status, pending, pendings=(pending,) if pending is not None else ())
+
+
+def _display_pause(
+    summary: PauseSummary, params: dict[str, dict[str, Any]] | None
+) -> dict[str, Any]:
+    if not needs_approval_display(summary):
+        return summary.pause
+    calls = pause_display_calls({**summary.pause, "status": summary.status}, params)
+    return {**summary.pause, "pending_tool_calls": calls}
+
+
+def _managed_pause(
+    leaf: ManagedHop, summary: PauseSummary, params: dict[str, dict[str, Any]] | None
+) -> _ManagedPendingPause:
+    pending = _pending_from(
+        leaf.run_id,
+        summary.status,
+        _KIND_BY_STATUS[summary.status],
+        _display_pause(summary, params),
+        summary.last_step,
+        _ManagedPendingPause,
+    )
+    return cast("_ManagedPendingPause", pending)  # constructed with this type
 
 
 class _PendingReader:
@@ -761,52 +722,83 @@ class _PendingReader:
         """The view behind the last ``get_pending`` (status, pending and classification)."""
 
     async def facing(self, run_id: str, *, tenant_id: TenantScope) -> FacingView:
-        """The run's status and pending as its caller sees them.
+        """The run's status and pendings as its caller sees them.
 
-        For a managed parent waiting on a subagent this is the root-facing view
-        of the active branch: the leaf's external pause (status, token and
+        For a managed parent waiting on subagents this is the root-facing view of
+        its workflow: every leaf's external pause in stable order (status, token and
         calls, with ``agent_name``, ``agent_path`` and ``origin_run_id``), or
-        RUNNING with no pending while a subagent runs or awaits adoption.
+        RUNNING with none while subagents run or await adoption.
         Read-only; never drives or recovers anything.
         """
         check_run_id(run_id)
         check_read_scope(tenant_id)
-        status, pause, last_step = await self._summary(run_id, tenant_id)
-        if is_managed_wait(status, pause):
+        summary = await self._summary(run_id, tenant_id)
+        if is_managed_wait(summary.status, summary.pause):
             return await self._managed_view(run_id, tenant_id)
-        return FacingView(
-            status, await self._pending_of(run_id, tenant_id, status, pause, last_step)
-        )
+        return _own_view(summary.status, await self._pending_of(run_id, tenant_id, summary))
 
     async def _managed_view(self, run_id: str, tenant_id: TenantScope) -> FacingView:
-        hops, start_path, path = await managed_branch(self._state, run_id, tenant_id)
-        start, leaf = hops[0], hops[-1]
-        if len(hops) == 1:  # moved on since the summary read: report what it is now
-            status, pause, last = await self._summary(run_id, tenant_id)
-            if is_managed_wait(status, pause):
+        workflow = await read_workflow(self._state, run_id, tenant_id, read_hop=self._read_hop)
+        if workflow is None:  # moved on since the summary read
+            summary = await self._summary(run_id, tenant_id)
+            if is_managed_wait(summary.status, summary.pause):
                 return FacingView(RunStatus.RUNNING.value, None, managed=True)
-            return FacingView(
-                status, await self._pending_of(run_id, tenant_id, status, pause, last)
-            )
-        running = FacingView(RunStatus.RUNNING.value, None, managed=True)
-        if leaf.status not in PAUSE_STATUSES or leaf.waiting:
-            return running  # a subagent runs, or its outcome awaits adoption
-        status, pause, last = await self._summary(leaf.run_id, leaf.tenant_id)
-        if status != leaf.status or is_managed_wait(status, pause):
-            return running  # the leaf moved on after the walk read it
-        pending = await self._pending_of(leaf.run_id, leaf.tenant_id, status, pause, last)
-        if pending is None:
-            return running
-        from dataclasses import replace
-
-        pending = replace(
-            pending,
-            run_id=run_id,
-            agent_name=leaf.agent_name,
-            agent_path=[start.agent_name, *path[len(start_path) :]],
-            origin_run_id=leaf.run_id,
+            return _own_view(summary.status, await self._pending_of(run_id, tenant_id, summary))
+        leaves = workflow.paused()
+        projected = await self._leaf_pendings(
+            [leaf for leaf, _ in leaves], workflow.start.tenant_id
         )
-        return FacingView(status, pending, managed=True)
+        pendings = []
+        for leaf, path in leaves:
+            own = projected.get(leaf.run_id)
+            if own is None:
+                continue
+            pending, mapping = own
+            pendings.append(
+                pending.addressed(
+                    run_id,
+                    leaf,
+                    workflow.agent_path(path),
+                    mapping=mapping,
+                )
+            )
+        if not pendings:  # subagents run, or their outcomes await adoption
+            return FacingView(RunStatus.RUNNING.value, None, managed=True)
+        return FacingView(pendings[0].status, pendings[0], managed=True, pendings=tuple(pendings))
+
+    async def _read_hop(self, run_id: str, tenant_id: TenantScope) -> ManagedHop | None:
+        """One run's managed hop projection, in its own short read."""
+        async with _HopReader(self._state, self._scoped_run) as reader:
+            return await reader.read(run_id, tenant_id)
+
+    async def _leaf_pendings(
+        self, leaves: list[ManagedHop], tenant: str | None
+    ) -> dict[str, tuple[_ManagedPendingPause, dict[str, str] | None]]:
+        if not leaves:
+            return {}
+        store = unclaimed_store(self._state)
+        if callable(getattr(store, "pause_projection", None)):
+            summaries, params = await sql_leaf_data(store, [leaf.run_id for leaf in leaves], tenant)
+        else:
+            summaries = {
+                leaf.run_id: await self._custom_leaf_summary(leaf.run_id, tenant) for leaf in leaves
+            }
+            params = {
+                run_id: await self._display_params(run_id, tenant, summary)
+                for run_id, summary in summaries.items()
+                if needs_approval_display(summary)
+            }
+        result = {}
+        for leaf in leaves:
+            summary = summaries.get(leaf.run_id)
+            if summary is None:
+                raise RunNotFoundError(leaf.run_id)
+            if summary.status == leaf.status and not is_managed_wait(summary.status, summary.pause):
+                result[leaf.run_id] = (
+                    _managed_pause(leaf, summary, params.get(leaf.run_id)),
+                    summary.pii_mapping,
+                )
+        return result
 
     async def get_pending(self, run_id: str, *, tenant_id: TenantScope) -> PendingPause | None:
         """What the run is waiting for now, or None when it is not paused.
@@ -825,51 +817,64 @@ class _PendingReader:
         self.last_view = view = await self.facing(run_id, tenant_id=tenant_id)
         return view.pending
 
+    async def get_pendings(self, run_id: str, *, tenant_id: TenantScope) -> list[PendingPause]:
+        """Every external pause the run or its workflow waits on, in stable order (0.8).
+
+        Depth-first, siblings in their parent batch's call order; the first is what
+        :meth:`get_pending` returns. Same scope rules and errors as :meth:`get_pending`.
+        """
+        pending = await self.get_pending(run_id, tenant_id=tenant_id)  # one read; keeps the view
+        if self.last_view is not None:
+            return list(self.last_view.pendings)
+        return [pending] if pending is not None else []
+
+    async def _display_params(
+        self, run_id: str, tenant_id: TenantScope, summary: PauseSummary
+    ) -> dict[str, dict[str, Any]]:
+        if not needs_approval_display(summary):
+            return {}
+        seq = await self._active_pause_sequence(run_id, tenant_id)
+        if summary.paused_event_sequence is not None and seq != summary.paused_event_sequence:
+            return {}
+        return await self._approval_params(run_id, seq, tenant_id)
+
     async def _pending_of(
-        self,
-        run_id: str,
-        tenant_id: TenantScope,
-        status: str,
-        pause: dict[str, Any],
-        last_step: dict[str, Any] | None,
+        self, run_id: str, tenant_id: TenantScope, summary: PauseSummary
     ) -> PendingPause | None:
-        kind = _KIND_BY_STATUS.get(status)
+        kind = _KIND_BY_STATUS.get(summary.status)
         if kind is None:
             return None
-        targets = pause.get("pending_targets") or {}
-        gates = pause.get("approval_gates") or {}
-        paused_server_calls = kind == "paused" and any(
-            isinstance(call, dict)
-            and (targets.get(call.get("id")) != "client" or call.get("id") in gates)
-            for call in pause.get("pending_tool_calls") or ()
+        params = await self._display_params(run_id, tenant_id, summary)
+        return _pending_from(
+            run_id, summary.status, kind, _display_pause(summary, params), summary.last_step
         )
-        if kind in ("approval", "input") or paused_server_calls:
-            seq = await self._active_pause_sequence(run_id, tenant_id)
-            params = await self._approval_params(run_id, seq, tenant_id)
-            pause = {
-                **pause,
-                "pending_tool_calls": pause_display_calls({**pause, "status": status}, params),
-            }
-        return _pending_from(run_id, status, kind, pause, last_step)
 
-    async def _summary(
-        self, run_id: str, tenant_id: TenantScope
-    ) -> tuple[str, dict[str, Any], dict[str, Any] | None]:
-        """Status, pause keys and last step; raises RunNotFoundError when out of scope."""
-        getter = getattr(self._state, "get_pending_pause_summary", None) or getattr(
+    async def _custom_leaf_summary(self, run_id: str, tenant: str | None) -> PauseSummary:
+        summary = await self._summary(run_id, tenant)
+        if summary.pii_mapping is None and callable(getattr(self._state, "get_pii_mapping", None)):
+            mapping = await self.get_pii_mapping(run_id, tenant_id=tenant)
+            return replace(summary, pii_mapping=mapping)
+        return summary
+
+    def _summary_method(self) -> Any:
+        return getattr(self._state, "get_pending_pause_summary", None) or getattr(
             self._state, "get_pause_summary", None
         )
+
+    async def _summary(self, run_id: str, tenant_id: TenantScope) -> PauseSummary:
+        """Read the pause and its origin mapping in the same tenant scope."""
+        getter = self._summary_method()
         if getter is None:  # custom store: scope by lookup, then the full pause state
             record = await self._scoped_run(run_id, tenant_id)
             if record is None:
                 raise RunNotFoundError(run_id)
             full = await self._state.get_pause_state(run_id) or {}
             steps = full.get("steps") or []
-            return record.status, dict(full), steps[-1] if steps else None
+            return PauseSummary(record.status, dict(full), steps[-1] if steps else None)
         summary = await getter(run_id, tenant_id=tenant_id)
         if summary is None:
             raise RunNotFoundError(run_id)
-        return summary.status, summary.pause, summary.last_step
+        return cast("PauseSummary", summary)
 
     async def _status(self, run_id: str, tenant_id: TenantScope = UNSCOPED) -> str | None:
         check_run_id(run_id)

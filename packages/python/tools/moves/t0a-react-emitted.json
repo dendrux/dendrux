@@ -1,0 +1,20 @@
+{
+ "dendrux.loops.react": {
+  "MANAGED_BATCH_UNSUPPORTED": "dendrux.loops._managed_batch",
+  "MANAGED_BRIEF_TOO_LARGE": "dendrux.loops._managed_batch",
+  "MANAGED_HANDOFF_KEY": "dendrux.loops._managed_batch",
+  "ManagedHandoff": "dendrux.loops._managed_batch",
+  "SubagentTool": "dendrux.loops._managed_batch",
+  "_MANAGED_BATCH_MESSAGE": "dendrux.loops._managed_batch",
+  "_admit_managed_briefs": "dendrux.loops._managed_batch",
+  "_brief_too_large": "dendrux.loops._managed_batch",
+  "_build_pause": "dendrux.loops._pause_shared",
+  "_commentary": "dendrux.loops._pause_shared",
+  "_is_managed": "dendrux.loops._managed_batch",
+  "_managed_batch_result": "dendrux.loops._managed_batch",
+  "_managed_batch_unsupported": "dendrux.loops._managed_batch",
+  "_managed_handoff": "dendrux.loops._managed_batch",
+  "_pause_result": "dendrux.loops._pause_shared",
+  "_snapshot_usage": "dendrux.loops._pause_shared"
+ }
+}

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar
+from urllib.parse import unquote
 
 from sqlalchemy.engine import URL, make_url
 
@@ -13,8 +15,13 @@ POOL_PRE_PING = True
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from sqlalchemy.ext.asyncio import AsyncEngine
+
 _MYSQL_DRIVER = "mysql+asyncmy"
 _MYSQL_UTC_INIT = "SET time_zone='+00:00'"
+_SQLITE_MEMORY = ":memory:"
+# Plain name=value URI options only; anything else (such as %00) is unclear.
+_PLAIN_URI_QUERY = re.compile(r"\w+=\w+(?:&\w+=\w+)*", re.ASCII)
 _T = TypeVar("_T")
 
 
@@ -68,6 +75,50 @@ def mysql_engine_options(supplied: dict[str, Any]) -> dict[str, Any]:
     options["connect_args"] = connect
     options["hide_parameters"] = True
     return options
+
+
+def is_memory_sqlite(engine: AsyncEngine) -> bool:
+    """True only when ``engine`` clearly opens an in-memory SQLite database.
+
+    Reads the filename and ``uri`` flag the dialect passes to ``sqlite3`` and
+    accepts an allow-list of clear forms, without copying SQLite's URI grammar:
+
+    - the filename is exactly ``:memory:``, whatever the ``uri`` flag says;
+    - with ``uri``: ``file:`` plus a path that percent-decodes to ``:memory:``
+      (SQLite drops any ``#`` fragment first);
+    - with ``uri``: ``file:<name>?<query>`` where the query is only plain
+      ``name=value`` options of ASCII letters, digits and underscores, joined by
+      ``&``, with at least one ``mode`` option and every ``mode`` equal to ``memory``.
+
+    Anything unclear counts as a file, so the close guard stays on: percent-encoding
+    or any other character in the query, a missing ``file:`` scheme, or no ``uri``
+    flag. Options passed through ``connect_args`` or a custom ``creator`` are not
+    visible here.
+    """
+    if engine.dialect.name != "sqlite":
+        return False
+    args, options = engine.dialect.create_connect_args(engine.url)
+    if not args:
+        return False
+    if args[0] == _SQLITE_MEMORY:
+        return True
+    return bool(options.get("uri")) and _is_memory_uri(args[0])
+
+
+def _is_memory_uri(filename: str) -> bool:
+    if not filename.startswith("file:"):
+        return False  # SQLite opens a URI without the file: scheme as a plain name
+    path, _, query = filename.removeprefix("file:").partition("#")[0].partition("?")
+    if unquote(path) == _SQLITE_MEMORY:
+        return True
+    if not _PLAIN_URI_QUERY.fullmatch(query):
+        return False
+    modes = [
+        value
+        for name, value in (option.split("=") for option in query.split("&"))
+        if name == "mode"
+    ]
+    return bool(modes) and all(mode == "memory" for mode in modes)
 
 
 def normalized_url(url: str | URL) -> URL:

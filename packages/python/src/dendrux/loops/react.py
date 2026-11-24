@@ -1,20 +1,6 @@
-"""ReAct loop — think, act, observe, repeat.
+"""ReAct orchestration: provider turns, tool dispatch, checkpoints and observations.
 
-The core agent execution loop. Orchestrates the cycle of:
-  1. Strategy builds messages
-  2. Provider calls the LLM
-  3. Strategy parses the response into an AgentStep
-  4. If ToolCall → execute → format result → append → repeat
-  5. If Finish → return RunResult
-  6. If max_iterations → return RunResult with MAX_ITERATIONS
-
-The loop never touches provider-specific APIs or prompt formatting.
-It operates entirely on Dendrux's universal types.
-
-Notifier hooks fire at three kinds of points:
-  - After each history.append() → on_message_appended
-  - After provider.complete() → on_llm_call_completed
-  - After _execute_tool() → on_tool_completed
+Persistence and capability discovery stay in runtime; each run owns its context.
 """
 
 from __future__ import annotations
@@ -48,6 +34,7 @@ from dendrux.llm._evidence import (
     persistable_call,
 )
 from dendrux.llm._retry_telemetry import telemetry_context
+from dendrux.loops import _managed_batch
 from dendrux.loops._budget import BudgetBreach, BudgetCarry, BudgetTracker, breach_payload
 from dendrux.loops._helpers import (
     _BlockedObservationError,
@@ -82,6 +69,22 @@ from dendrux.loops._images import (
     tool_result_images_dropped,
 )
 from dendrux.loops._llm_call import EventRelay, ProviderCallSite, StreamCall, stream_call_events
+from dendrux.loops._managed_batch import _MANAGED_BATCH_MESSAGE as _MANAGED_BATCH_MESSAGE
+from dendrux.loops._managed_batch import MANAGED_BATCH_UNSUPPORTED as MANAGED_BATCH_UNSUPPORTED
+from dendrux.loops._managed_batch import MANAGED_BRIEF_TOO_LARGE as MANAGED_BRIEF_TOO_LARGE
+from dendrux.loops._managed_batch import MANAGED_HANDOFF_KEY as MANAGED_HANDOFF_KEY
+from dendrux.loops._managed_batch import ManagedHandoff as ManagedHandoff
+from dendrux.loops._managed_batch import SubagentTool as SubagentTool
+from dendrux.loops._managed_batch import _admit_managed_briefs as _admit_managed_briefs
+from dendrux.loops._managed_batch import _brief_too_large as _brief_too_large
+from dendrux.loops._managed_batch import _is_managed as _is_managed
+from dendrux.loops._managed_batch import _managed_batch_result as _managed_batch_result
+from dendrux.loops._managed_batch import _managed_batch_unsupported as _managed_batch_unsupported
+from dendrux.loops._managed_batch import _managed_handoff as _managed_handoff
+from dendrux.loops._pause_shared import _build_pause as _build_pause
+from dendrux.loops._pause_shared import _commentary as _commentary
+from dendrux.loops._pause_shared import _pause_result as _pause_result
+from dendrux.loops._pause_shared import _snapshot_usage as _snapshot_usage
 from dendrux.loops._policy_context import initial_call_counts, static_denial, tool_call_context
 from dendrux.loops.base import Loop
 from dendrux.media._ids import IMAGE_ID_RE
@@ -159,6 +162,7 @@ if TYPE_CHECKING:
     from dendrux.tools._lookups import ToolLookups
     from dendrux.types import BeforeToolHook, StreamEvent, ToolDef, ToolResultTransform
 
+
 logger = logging.getLogger(__name__)
 
 
@@ -230,110 +234,8 @@ class _ToolCallOutcome(NamedTuple):
 
 # --- Managed subagents (0.7) -------------------------------------------------
 
-MANAGED_HANDOFF_KEY = "managed_handoff"
-"""``RunResult.meta`` key of an in-memory managed handoff (never persisted)."""
-MANAGED_BATCH_UNSUPPORTED = "managed_batch_unsupported"
-_MANAGED_BATCH_MESSAGE = (
-    "Call one subagent per turn, and not together with client tools. "
-    "No tool in this batch ran; call them again in separate turns."
-)
 
-
-class SubagentTool:
-    """The lookup entry of a generated subagent call: a marker, never executed.
-
-    Only these entries make an ``agent``-target call managed; a call is never
-    inferred to be managed from its target or name alone.
-    """
-
-    __slots__ = ("agent",)
-
-    def __init__(self, agent: Agent) -> None:
-        self.agent = agent
-
-    def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        raise RuntimeError("A subagent call is never executed as a tool")
-
-
-@dataclass(frozen=True)
-class ManagedHandoff:
-    """In-memory loop outcome: one admitted subagent call for the runner to bind."""
-
-    call: ToolCall
-    child: Agent
-    parent: Agent
-
-
-def _is_managed(name: str, lookups: ToolLookups) -> bool:
-    return isinstance(lookups.fn.get(name), SubagentTool)
-
-
-def _managed_batch_unsupported(calls: Sequence[ToolCall], lookups: ToolLookups) -> bool:
-    """Two managed calls, or one with another non-server pending target, in one batch."""
-    managed = sum(1 for tc in calls if _is_managed(tc.name, lookups))
-    if managed == 0:
-        return False
-    return managed > 1 or any(
-        not _is_managed(tc.name, lookups)
-        and lookups.target.get(tc.name, ToolTarget.SERVER) != ToolTarget.SERVER
-        for tc in calls
-    )
-
-
-def _managed_batch_result(tc: ToolCall) -> ToolResult:
-    return ToolResult(
-        name=tc.name,
-        call_id=tc.id,
-        payload=json.dumps({"error": _MANAGED_BATCH_MESSAGE}),
-        success=False,
-        error=_MANAGED_BATCH_MESSAGE,
-        meta={"code": MANAGED_BATCH_UNSUPPORTED},
-    )
-
-
-async def _refuse_managed_batch(calls: Sequence[ToolCall], batch: _ToolBatch) -> None:
-    """Answer every call of an unsupported batch before any hook, approval or effect."""
-    _codes.log_code(logger, _codes.MANAGED_BATCH_UNSUPPORTED, run_id=batch.run_id, count=len(calls))
-    mark = getattr(batch.recorder, "mark_managed_refusal", None)
-    if mark is not None:
-        await mark([tc.id for tc in calls])  # durable for the whole batch, before any refusal
-    for tc in calls:
-        await batch.reject(tc, _managed_batch_result(tc))
-
-
-MANAGED_BRIEF_TOO_LARGE = "managed_brief_too_large"
-
-
-async def _admit_managed_briefs(
-    pending: list[ToolCall], lookups: ToolLookups, batch: _ToolBatch
-) -> list[ToolCall]:
-    """Refuse a brief over the child's ``Limits.max_input_bytes`` before any bind."""
-    kept: list[ToolCall] = []
-    for tc in pending:
-        entry = lookups.fn.get(tc.name)
-        if isinstance(entry, SubagentTool):
-            size = len(str((tc.params or {}).get("task", "")).encode("utf-8"))
-            limit = entry.agent._limits.max_input_bytes
-            if size > limit:
-                _codes.log_code(
-                    logger, _codes.INPUT_SIZE_LIMIT, run_id=batch.run_id, bytes=size, limit=limit
-                )
-                await batch.reject(tc, _brief_too_large(tc, size, limit))
-                continue
-        kept.append(tc)
-    return kept
-
-
-def _brief_too_large(tc: ToolCall, size: int, limit: int) -> ToolResult:
-    message = "The task for this subagent is larger than its input limit."
-    return ToolResult(
-        name=tc.name,
-        call_id=tc.id,
-        payload=json.dumps({"error": message, "bytes": size, "limit": limit}),
-        success=False,
-        error=message,
-        meta={"code": MANAGED_BRIEF_TOO_LARGE},
-    )
+_refuse_managed_batch = _managed_batch.refuse_managed_batch  # patch seam for recovery tests
 
 
 def managed_tool_defs(lookups: ToolLookups) -> list[ToolDef]:
@@ -449,15 +351,6 @@ def _format_result(strategy: Strategy, result: ToolResult) -> Message:
     return msg
 
 
-def _commentary(steps: list[AgentStep]) -> list[str]:
-    """Non-empty assistant text from steps that ended in tool calls, in order."""
-    return [
-        s.raw_response
-        for s in steps
-        if isinstance(s.action, ToolCall) and s.raw_response and s.raw_response.strip()
-    ]
-
-
 def _pending_limit_result(
     *,
     agent: Agent,
@@ -486,57 +379,6 @@ def _pending_limit_result(
         iteration_count=iteration,
         usage=usage,
         meta={**meta, "failure_reason": FailureReason.PENDING_LIMIT.value},
-    )
-
-
-def _snapshot_usage(usage: UsageStats) -> UsageStats:
-    """Create an independent copy of usage stats for pause state."""
-    return UsageStats(
-        input_tokens=usage.input_tokens,
-        output_tokens=usage.output_tokens,
-        total_tokens=usage.total_tokens,
-        cost_usd=usage.cost_usd,
-        cache_read_input_tokens=usage.cache_read_input_tokens,
-        cache_creation_input_tokens=usage.cache_creation_input_tokens,
-        reasoning_tokens=usage.reasoning_tokens,
-        cost_source=usage.cost_source,
-        usage_reported=usage.usage_reported,
-        cost_unknown=usage.cost_unknown,
-    )
-
-
-def _build_pause(
-    *,
-    agent_name: str,
-    pending_calls: list[ToolCall],
-    target_lookup: dict[str, ToolTarget],
-    history: list[Message],
-    steps: list[AgentStep],
-    iteration: int,
-    usage: UsageStats,
-    approval_gates: dict[str, dict[str, str | None]] | None = None,
-    budget: BudgetTracker | None = None,
-    image_view: ImageViewState | None = None,
-) -> PauseState:
-    """Build PauseState for client tool, approval or clarification pause."""
-    pending_targets = (
-        {tc.id: target_lookup.get(tc.name, ToolTarget.SERVER).value for tc in pending_calls}
-        if pending_calls
-        else {}
-    )
-
-    return PauseState(
-        agent_name=agent_name,
-        pending_tool_calls=pending_calls,
-        pending_targets=pending_targets,
-        history=list(history),
-        steps=list(steps),
-        iteration=iteration,
-        trace_order_offset=len(history),
-        usage=_snapshot_usage(usage),
-        approval_gates=approval_gates,
-        image_view=image_view,
-        **(budget.pause_fields() if budget is not None else {}),
     )
 
 
@@ -1413,6 +1255,7 @@ async def _process_tool_calls(
     before_tool: BeforeToolHook | None = None,
     tenant_id: str | None = None,
     image_runtime: ImageRuntime | None = None,
+    batch_policy: _managed_batch.BatchPolicy = _managed_batch.DEFAULT_POLICY,
 ) -> _ToolCallOutcome:
     """Execute tool calls: enforce limits, run server tools, update history.
 
@@ -1435,8 +1278,9 @@ async def _process_tool_calls(
         warnings=warnings,
     )
     all_calls = step.meta.get("all_tool_calls", [step.action])
-    if _managed_batch_unsupported(all_calls, lookups):
-        await _refuse_managed_batch(all_calls, batch)
+    decision = _managed_batch.classify_batch(all_calls, lookups, batch_policy)
+    if decision.action == "refuse":
+        await _refuse_managed_batch(all_calls, batch, decision, batch_policy)
         return _ToolCallOutcome(all_results=batch.all_results, pending_calls=[])
     calls, gates = await _prepare_tool_calls(
         all_calls,
@@ -1459,7 +1303,7 @@ async def _process_tool_calls(
             approval_gates=gates,
         )
     server_calls, pending_calls = _split_targets(calls, lookups)
-    pending_calls = await _admit_managed_briefs(pending_calls, lookups, batch)
+    pending_calls = await _managed_batch._admit_managed_briefs(pending_calls, lookups, batch)
     executed = await _dispatch_server_calls(
         server_calls, lookups, batch, tool_result_transform, image_runtime
     )
@@ -1828,6 +1672,7 @@ class _RunContext:
     hook_tenant_id: str | None
     calls: ProviderCallSite
     g_engine: GuardrailEngine | None = None
+    fanout_capable: bool = False
 
     def meta(self) -> dict[str, Any]:
         """Terminal result meta: the PII mapping (batch only) and notifier warnings."""
@@ -1871,7 +1716,6 @@ async def _start_run(
     image_view_state: ImageViewState | None,
     interrupt: asyncio.Event | None,
 ) -> _RunContext:
-    """Shared setup of ``run`` and ``run_stream``: ids, tools, loop state, images, budget, hook."""
     resolved_run_id = run_id or generate_ulid()
     pkw = provider_kwargs or {}
     cache_key_prefix = build_cache_key_prefix(agent)
@@ -1934,6 +1778,7 @@ async def _start_run(
         budget=budget,
         before_tool=before_tool,
         hook_tenant_id=hook_tenant_id,
+        fanout_capable=_managed_batch.loop_fanout_capable(recorder),
         calls=ProviderCallSite(
             images,
             agent=agent,
@@ -2294,39 +2139,6 @@ async def _finish_result(
     )
 
 
-def _pause_result(
-    ctx: _RunContext,
-    status: RunStatus,
-    iteration: int,
-    *,
-    pending_calls: list[ToolCall],
-    approval_gates: dict[str, dict[str, str | None]] | None = None,
-    answer: str | None = None,
-) -> RunResult:
-    pause = _build_pause(
-        agent_name=ctx.agent.name,
-        pending_calls=pending_calls,
-        target_lookup=ctx.lookups.target,
-        history=ctx.state.history,
-        steps=ctx.state.steps,
-        iteration=iteration,
-        usage=ctx.state.usage,
-        approval_gates=approval_gates,
-        budget=ctx.budget,
-        image_view=ctx.pause_view(),
-    )
-    return RunResult(
-        run_id=ctx.run_id,
-        status=status,
-        answer=answer,
-        steps=ctx.state.steps,
-        commentary=_commentary(ctx.state.steps),
-        iteration_count=iteration,
-        usage=ctx.state.usage,
-        meta={"pause_state": pause, **ctx.meta()},
-    )
-
-
 async def _clarification_result(
     ctx: _RunContext, response: LLMResponse, action: Clarification, iteration: int
 ) -> RunResult:
@@ -2368,6 +2180,7 @@ async def _run_tool_step(
         before_tool=ctx.before_tool,
         tenant_id=ctx.hook_tenant_id,
         image_runtime=ctx.image_runtime,
+        batch_policy=_managed_batch.batch_policy(ctx.agent, fanout_capable=ctx.fanout_capable),
     )
     return outcome, tool_history_start
 
@@ -2392,7 +2205,7 @@ def _after_tools(
 
 
 def _pending_tools_result(ctx: _RunContext, outcome: _ToolCallOutcome, iteration: int) -> RunResult:
-    handoff = _managed_handoff(ctx, outcome, iteration)
+    handoff = _managed_batch._managed_handoff(ctx, outcome, iteration)
     if handoff is not None:
         return handoff
     status = (
@@ -2405,27 +2218,6 @@ def _pending_tools_result(ctx: _RunContext, outcome: _ToolCallOutcome, iteration
         pending_calls=outcome.pending_calls,
         approval_gates=outcome.approval_gates,
     )
-
-
-def _managed_handoff(
-    ctx: _RunContext, outcome: _ToolCallOutcome, iteration: int
-) -> RunResult | None:
-    """The single admitted managed call, handed to the runner instead of a client pause.
-
-    Server calls of the batch have already finished and are durable. The result
-    stays RUNNING: only the runner's atomic bind parks this run.
-    """
-    pending = outcome.pending_calls
-    if outcome.pending_approval or len(pending) != 1:
-        return None
-    entry = ctx.lookups.fn.get(pending[0].name)
-    if not isinstance(entry, SubagentTool):
-        return None
-    result = _pause_result(ctx, RunStatus.RUNNING, iteration, pending_calls=pending)
-    result.meta[MANAGED_HANDOFF_KEY] = ManagedHandoff(
-        call=pending[0], child=entry.agent, parent=ctx.agent
-    )
-    return result
 
 
 def _max_iterations_result(ctx: _RunContext) -> RunResult:
@@ -3039,8 +2831,7 @@ class ReActLoop(Loop):
     ) -> AsyncGenerator[RunEvent, None]:
         """Stream the ReAct loop as RunEvents.
 
-        Same iteration logic as run() — shared helpers ensure consistency.
-        Swaps provider.complete() for complete_stream(), forwarding text
+        Shared helpers drive complete_stream(), forwarding text
         deltas live and yielding TOOL_RESULT events after execution.
         Terminal event is RUN_COMPLETED or RUN_PAUSED.
         """

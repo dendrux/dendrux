@@ -36,6 +36,7 @@ Agent(
     description: str = "",
     tools: list[Callable] = [],
     subagents: Sequence[Agent] | None = None,
+    exclusive_subagents: Sequence[str] | None = None,  # names that must be the only subagent call of a turn
     tool_sources: list[MCPToolView | MCPSource | MCPServer | MCPHost] | None = None,
     max_iterations: int = 10,
     max_delegation_depth: int | None = ...,  # omitted: ceiling 10; None: no ceiling
@@ -72,7 +73,7 @@ Agent(
 | `name` | Used for the run's owner and `cache_key_prefix`. Defaults to the class name. |
 | `description` | What this Agent does. Required and non-empty when registered as a subagent; shown to the parent's model as the tool description. Defaults to an empty string for standalone Agents. |
 | `tools` | List of `@tool`-decorated functions. Empty for a pure chatbot. |
-| `subagents` | Child Agent definitions exposed as blocking tools with one `task: str` argument. Each call starts a fresh child run. Requires managed-capable persistence and ReAct participants. One subagent call is allowed per model turn; ordinary server tools can run beside it. See [Managed subagents](/docs/guides/subagents) for store inheritance, root-id pause routing, streaming and current limits. |
+| `subagents` | Child Agent definitions exposed as blocking tools with one `task: str` argument. Each call starts a fresh child run. Requires managed-capable persistence and ReAct participants. A model may call several subagents in one response, up to `Limits.max_parallel_subagents` (default 4); ordinary server tools finish first. See [Managed subagents](/docs/guides/subagents) for store inheritance, root-id pause routing, streaming and current limits. |
 | `tool_sources` | MCP source declarations, compatibility servers, or shared hosts. See [MCP](/docs/architecture/mcp). |
 | `max_iterations` | ReAct safety cap on LLM turns. Default 10. |
 | `max_delegation_depth` | Delegation depth ceiling. The root is depth zero; omission uses 10, zero allows no children, and explicit `None` removes the ceiling. See [Managed subagents](/docs/guides/subagents#store-tenant-and-depth). |
@@ -115,6 +116,9 @@ An invalid `lease_interval` raises `ValueError`. Declared store capabilities are
 | `max_pending_calls` | 64 | One format-2 assistant call batch, before dispatch | Run ends `error` with `failure_reason="pending_limit"` |
 | `max_rebuild_bytes` | 16 MiB | Format-2 conversation reconstruction | `reclaim()` refuses with `history_too_large`; `resume()` raises `InputValidationError` (field `history`, code `history_too_large`) before claiming, so the run stays paused. A `submit_*` continuation has already claimed the run when it hits this limit: it releases the claim and restores the waiting status |
 | `max_pause_summary_bytes` | 64 KiB | Format-2 human-input display summary; UTF-8 JSON, supported range 128 bytes to 512 KiB | Question first, then options; excess text gets `[truncated]` and options that do not fit are omitted. Pause succeeds. Excluded from governance; reclaim uses the configured value |
+| `max_parallel_subagents` | 4 (1 to 32) | Subagent calls in one model response | The whole batch is refused with `managed_fanout_limit`; see [Parallel subagents](/docs/guides/subagents#parallel-subagents) |
+| `max_managed_runs` | 128 | Runs one subagent workflow may create, root included | Admission refused with `managed_run_limit` |
+| `max_subagent_definitions` | 256 | Expanded subagent definition nodes, root included | `SubagentTreeTooLargeError` (a subagent configuration error) |
 | `max_rebuild_rows` | 20,000 | Expanded conversation entries during reconstruction | Same refusal; history is never truncated to continue |
 
 [//]: # "docs-test: skip - fragment: relies on `provider`, defined by setup shown elsewhere"
@@ -174,6 +178,7 @@ async def run(
     notifier: LoopNotifier | None = None,
     idempotency_key: str | None = None,
     output_type: type[BaseModel] | None = None,
+    on_started: Callable[[str], Awaitable[None] | None] | None = None,
 ) -> RunResult
 ```
 
@@ -188,6 +193,23 @@ calls (narration such as "Let me look that up"); it is `[]` for `SingleCall`,
 for runs with no narration, and for idempotent cached results. Persisted traces
 carry the same split as `TraceEntry.phase`. A paused run may instead carry a
 clarification question.
+
+### `on_started`
+
+`on_started=` (also on `retry`) receives the new root run id as soon as the run is saved and claimed, before the first model or tool call. Use it to hand the id to a client or a job table while `run()` is still working, so a cancel or a crash has an id to act on. It can be a plain function or `async def`.
+
+[//]: # "docs-test: skip - fragment: relies on `agent` and `jobs`, defined by setup shown elsewhere"
+
+```python
+await agent.run("Review the draft", tenant_id="acme", on_started=lambda run_id: jobs.save(run_id))
+```
+
+- **Save the id and return; keep it short.** There is no timeout. The callback runs in the caller's task, outside any database transaction, and the run is not working while it runs. The run makes no progress while it runs, so a callback that blocks past the stale threshold lets `sweep()` and `reclaim()` take the run over; the stale owner then stops without any model or tool work.
+- It is called once, for the root only. It is not called for an idempotent hit, a cached terminal result, `RunAlreadyActiveError`, a delegated or managed child, or an ephemeral run with no saved row. Read the id from `result.run_id` or `RunAlreadyActiveError.run_id` in those cases. `retry` calls it with the new attempt's id.
+- It is called even when a durable cancel (`dendrux.cancel_run`, or `Agent.cancel_run` from another process) was requested before it was entered. A same-instance `Agent.cancel_run` or `task.cancel()` that interrupts startup before the callback boundary can stop it from being called. After it returns, the run checks its control state again: a pending cancel finalizes the run as `cancelled`, and a run that a sweep or reclaim took over stops without any model or tool work.
+- A run started inside the callback is an independent root with its own id and lifecycle.
+- If it raises an ordinary exception, the run is saved as `error` (code `on_started_failed`, a fixed safe message) and the caller gets [`OnStartedError`](/docs/reference/errors) with `run_id`; the callback's exception is on `__cause__` and its text is never stored or logged. A cancel that was already requested wins and the run ends `cancelled`; a cancel that commits after the control read loses and the run ends `error`. If a newer owner won, the run is left alone. `CancelledError` is not swallowed.
+- `stream()` and `resume_stream()` do not support it; `stream(on_started=...)` raises `ValueError`.
 
 ### Truncated answers
 
@@ -249,6 +271,7 @@ class RunResult:
     error_info: ErrorInfo | None
     pause_id: str | None
     pending: PendingPause | None
+    pendings: tuple[PendingPause, ...]
     recovery: RecoveryInfo | None
 
     @property
@@ -266,6 +289,7 @@ class RunResult:
 | `error_info` | An [`ErrorInfo`](/docs/reference/errors#provider-errors) when a provider failure ended the run (a database write that fails after the retries makes `agent.run` raise `PersistenceError` instead; a stream ends with a `run_error` event that carries the fixed message; see [When a write fails inside a run](/docs/reference/errors#when-a-write-fails-inside-a-run)): `category`, `retryable`, `safe_message`, `error_type`, `provider`, `model`, `status_code`, `provider_code` and `timeout_reason`. Every field is a code, number or name. A stale stream observing a live owner uses `category="run_fenced"` while preserving its current run status. A failed `resume_stream` attempt after claim release also carries failure information while preserving the observed pause or running status; otherwise `None` for other outcomes. |
 | `pause_id` | The id of the current pause of a paused run; pass it back as `expected_pause_id=`. |
 | `pending` | The active pause as a `PendingPause` (the same object `RunStore.get_pending` returns), or `None`. |
+| `pendings` | Every external pause of a subagent workflow, depth first, siblings in call order (`pending` is `pendings[0]`); `()` when nothing waits. On every result path, so `while result.pendings:` is a safe loop. See [Several paused subagents](/docs/guides/subagents#several-paused-subagents). |
 | `recovery` | Attempts since last progress, last reclaim time and bounded replayed-call ids. A successfully completed recovered run has count 0; `last_reclaimed_at` identifies recovery. `None` means never reclaimed, or an optional projection failed on a committed-outcome or `cancel_run` response. `get_result` propagates projection failures. See [Recovery](/docs/guides/recovery#inspect-a-recovered-run). |
 | `meta` | Run metadata such as `meta["undelivered_notes"]`, `meta["interrupted"]` and `meta["mcp_skipped_sources"]`. A fresh result from `run()` includes `meta["pii_mapping"]` (placeholder to real value) when guardrails redacted anything; treat it as sensitive and never return `meta` wholesale. It never contains the internal pause state. |
 
@@ -279,6 +303,7 @@ class RunResult:
 | `answer_omitted` | True when the wire display bound omits an answer; `answer` is then null. |
 | `run_id`, `status` | As on the result. |
 | `pending` | The active pause (`kind`, `pause_id`, `pending_tool_calls`, `question`, `options`, `reason`, `message`, `exceeded`), or `None`. A terminal result never shows a stale pause. |
+| `pendings` | A list of every pause in the same shape as `pending` (additive in 0.8; empty when nothing waits, one item for an ordinary pause). |
 | `answer` | The answer text, equal to `RunResult.answer` under your configured PII output policy. `None` while the run waits for approval or input. |
 | `output` | The configured `output_type` model as bounded JSON, or `None`. Arbitrary objects are never serialized. |
 | `error_info` | The safe `ErrorInfo` fields, or `None`. |
@@ -512,6 +537,8 @@ async def cancel_run(
 
 Request cancellation. Works for paused runs (atomic CAS to `cancelled`, including `paused`), running runs (cooperative flag), batch `run()` calls and streamed runs this instance owns (in-process interrupt: the in-flight model call or tool is abandoned; `run()` returns `CANCELLED` with `meta["interrupted"]`, a stream ends with `RUN_CANCELLED` carrying the partial `answer`), and terminal runs (no-op, never raises). Since 0.5.0 the same in-process interrupt also applies to a run that a `submit_*` or `resume` call is executing: that call returns a `CANCELLED` `RunResult` instead of raising `CancelledError`. Cancelling the task that is awaiting the call still raises. When the durable `cancelled` status could not be confirmed, `meta["dendrux.cancel_persisted"]` is `False`; check it before treating the cancellation as saved. Returns the persisted state at the time of the request; a non-terminal `status` with `meta["cancel_requested"] == True` means "requested, not yet stopped".
 
+To cancel from a process that has no `Agent` (an admin route, a CLI, a job runner), use the module function [`dendrux.cancel_run`](/docs/recipes/cancel-run#cancel-a-run-without-an-agent). It does the same two-phase cancel without building the Agent or loading a provider, but it has no task registry, so it cannot interrupt work in this process; a running run stops at its next checkpoint.
+
 `cascade=True` marks cancellation requests on each level of the run tree before reading the next level, then finalizes paused descendants deepest first, with the root last. Traversal stays inside the root tenant even for `UNSCOPED`, and is bounded by `Budget.max_subtree_nodes` (default 10,000). Per-run outcomes are in `meta["cascade"]` (at most 1,000). A `cascade_truncated` warning signals a traversal cut; `meta["cascade_truncated"]` can also signal summary truncation. Terminal rows retain their flags. `tenant_id=` must match the root or `RunNotFoundError` is raised. A cancel after the last checkpoint does not stop a run that completes successfully. Raises `RunNotFoundError` and `PersistenceNotConfiguredError`. See [Cancellation](/docs/architecture/cancellation).
 
 ## `request_pause`
@@ -568,7 +595,7 @@ Call it from inside a tool that waits a long time (a human, a slow job) to refre
 [//]: # "docs-test: skip - API signature listing, not runnable code"
 
 ```python
-async def retry(run_id: str, *, tenant_id=..., metadata=None, notifier=None, **kwargs) -> RunResult
+async def retry(run_id: str, *, tenant_id=..., metadata=None, notifier=None, on_started=None, **kwargs) -> RunResult
 ```
 
 Start a fresh run that reuses an existing terminal run's input and approximate prior context. Requires persistence. The source run must belong to `tenant_id`, otherwise `RunNotFoundError` is raised (the same error for a missing run and a foreign one; it was `ReplayRunError` or `ValueError` before 0.5.0). Skills the source run activated explicitly stay activated; if one is no longer attached, `retry` raises `ValueError` before creating a run.

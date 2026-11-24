@@ -3,9 +3,9 @@
 A generated subagent call (``ToolTarget.AGENT`` from ``Agent(subagents=...)``) never
 enters the parallel server group. Two managed calls, or a managed call plus a
 client pending target, are refused before any effect with one stable
-``managed_batch_unsupported`` observation per call. A supported batch keeps the
-ordinary approval gate; its server calls finish first, then the loop hands the
-single managed call to the runner (no client pause).
+``managed_fanout_limit`` or ``managed_batch_unsupported`` observation per call.
+A supported batch keeps the ordinary approval gate; its server calls finish
+first, then the loop hands the single managed call to the runner (no client pause).
 """
 
 from __future__ import annotations
@@ -181,11 +181,11 @@ async def test_unsupported_batch_refused_per_call_with_zero_effects(
     seen = _observations(llm, 1)
     assert len(seen) == len(batch)
     for observation in seen.values():
-        assert set(observation) == {"error"} and "subagent" in observation["error"]
+        assert {"error", "reason"} <= set(observation) and "subagent" in observation["error"]
     assert BRIEF not in json.dumps(seen)
 
 
-async def test_unsupported_batch_observations_carry_the_stable_code() -> None:
+async def test_over_limit_batch_observations_carry_the_stable_code() -> None:
     recorded: list[tuple[str, Any]] = []
 
     class Recorder(BaseRecorder):
@@ -213,7 +213,7 @@ async def test_unsupported_batch_observations_carry_the_stable_code() -> None:
     assert [name for name, _ in recorded] == ["reviewer", "auditor"]
     for _, result in recorded:
         assert result.success is False
-        assert result.meta["code"] == "managed_batch_unsupported"
+        assert result.meta["code"] == "managed_fanout_limit"
 
 
 async def test_approval_gate_still_stops_the_whole_supported_batch() -> None:

@@ -1,18 +1,25 @@
-"""Old workers must leave future managed waits intact, including crash cuts O1-O3."""
+"""Future or malformed managed waits refuse before claims or other mutations.
+
+Old-worker v4 behavior is covered by the coordinator's pinned 0.7.0 harness
+(spec §16.4, O1–O3), rather than this process's v4-capable decoder.
+"""
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+from dataclasses import fields, make_dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
 from sqlalchemy import event, select, update
 
-from dendrux import Agent, sweep
+from dendrux import Agent, sweep, tool
 from dendrux.db.models import AgentRun, Base
 from dendrux.errors import (
+    GovernanceMismatchError,
     ManagedStateError,
     PersistenceError,
     RunControlError,
@@ -21,17 +28,19 @@ from dendrux.errors import (
 )
 from dendrux.runtime import _reclaim
 from dendrux.runtime.state import EventWrite, ManagedHeader
-from dendrux.runtime.submit import claim_managed_adoption, governance_snapshot
+from dendrux.runtime.submit import GOVERNANCE_KEY, claim_managed_adoption, governance_snapshot
 from dendrux.types import (
+    Limits,
     LLMResponse,
     ManagedWait,
     PauseState,
+    RunStatus,
     ToolCall,
     ToolResult,
     UsageStats,
     generate_ulid,
 )
-from tests._helpers.scripted_provider import ScriptedLLM
+from tests._helpers.scripted_provider import ScriptedLLM, tool_call
 
 TENANT = "forward-compat"
 AGE = timedelta(hours=1)
@@ -55,11 +64,11 @@ async def _seed(
     engine: Any,
     agent: Agent,
     cut: str = "claimed",
-    version: int = 4,
+    version: int = 5,
     *,
     marked: bool = True,
 ) -> tuple[str, str, str]:
-    """Write the spec's future JSON through store primitives; no 0.8 encoder exists."""
+    """Seed managed records through store primitives for format-guard tests."""
     root, pause_id = generate_ulid(), generate_ulid()
     calls = [ToolCall(name="reviewer", params={}, id=generate_ulid()) for _ in range(2)]
     children = [generate_ulid(), generate_ulid()]
@@ -210,9 +219,15 @@ async def _snapshot(engine: Any) -> dict[str, list[Any]]:
         }
 
 
-@pytest.mark.parametrize("cut", ["parked", "claimed", "partial"])
-@pytest.mark.parametrize("version", [4, 5, 6])
-@pytest.mark.parametrize("registered", [False, True])
+@pytest.mark.parametrize(
+    ("registered", "version", "cut"),
+    [
+        (registered, version, cut)
+        for registered in (False, True)
+        for version in (5, 6)
+        for cut in ("parked", "claimed", "partial")
+    ],
+)
 async def test_reclaim_refuses_future_wait_before_claim(
     store: Any,
     engine: Any,
@@ -249,7 +264,7 @@ async def test_reclaim_refuses_future_wait_before_claim(
 )
 async def test_reclaim_checks_both_saved_formats(store: Any, engine: Any, marker: str) -> None:
     agent = _agent(store, False)
-    root, call, child = await _seed(store, engine, agent)
+    root, call, child = await _seed(store, engine, agent, version=4)
     state = await store.get_loop_state(root)
     raw = await store.get_pause_state(root)
     valid = {"tool_call_id": call, "child_run_id": child, "pause_id": raw["pause_id"]}
@@ -275,14 +290,32 @@ async def test_reclaim_checks_both_saved_formats(store: Any, engine: Any, marker
     with pytest.raises((RunControlError, PersistenceError)) as exc:
         await agent.reclaim(root, tenant_id=TENANT)
     assert await _snapshot(engine) == before
-    assert isinstance(exc.value, RunNotReclaimableError)
-    assert exc.value.reason == "pause_format_unsupported"
+    record = await store.get_run(root)
+    assert (record.claim_epoch, record.reclaim_attempts) == (7, 1)
+    if marker == "pause_only":
+        assert isinstance(exc.value, ManagedStateError)
+        assert exc.value.reason == "binding_conflict"
+    else:
+        assert isinstance(exc.value, RunNotReclaimableError)
+        assert exc.value.reason == "pause_format_unsupported"
 
 
-@pytest.mark.parametrize("cut", ["parked", "claimed", "partial"])
-@pytest.mark.parametrize("registered", [False, True])
 @pytest.mark.parametrize(
-    "operation", ["pending", "resume", "resume_stream", "input", "approval", "results", "adoption"]
+    ("operation", "registered", "cut"),
+    [
+        (operation, registered, cut)
+        for operation in (
+            "pending",
+            "resume",
+            "resume_stream",
+            "input",
+            "approval",
+            "results",
+            "adoption",
+        )
+        for registered in (False, True)
+        for cut in ("parked", "claimed", "partial")
+    ],
 )
 async def test_other_entries_leave_future_workflow_untouched(
     store: Any,
@@ -295,40 +328,80 @@ async def test_other_entries_leave_future_workflow_untouched(
     agent = _agent(store, registered)
     root, call, child = await _seed(store, engine, agent, cut)
     before = await _snapshot(engine)
-    try:
-        if operation == "pending":
-            await run_store.get_pending(root, tenant_id=TENANT)
-        elif operation == "resume":
-            await agent.resume(root, tenant_id=TENANT)
-        elif operation == "resume_stream":
-            stream = agent.resume_stream(root, tenant_id=TENANT)
-            async for _ in stream:
-                pass
-        elif operation == "input":
-            await agent.submit_input(root, "answer", tenant_id=TENANT)
-        elif operation == "approval":
-            await agent.submit_approval(root, approved=True, tenant_id=TENANT)
-        elif operation == "results":
-            await agent.submit_tool_results(
-                root,
-                [ToolResult(call_id=call, name="reviewer", payload="report")],
-                tenant_id=TENANT,
-            )
-        else:
-            assert (
-                await claim_managed_adoption(
-                    store,
-                    root,
-                    agent=agent,
-                    call_id=call,
-                    child_run_id=child,
-                    result=ToolResult(call_id=call, name="reviewer", payload="report"),
-                )
-                is False
-            )
-    except (RunControlError, PersistenceError):
-        pass  # Existing strict codecs and status checks are valid refusals.
+    if operation == "adoption":
+        # The 0.7 single-child adoption never claims a fan-out wait, in any state.
+        adopted = await claim_managed_adoption(
+            store,
+            root,
+            agent=agent,
+            call_id=call,
+            child_run_id=child,
+            result=ToolResult(call_id=call, name="reviewer", payload="report"),
+        )
+        assert adopted is False
+    else:
+        with contextlib.suppress(RunControlError, PersistenceError):
+            await _enter(operation, agent, run_store, root, call, None)
     assert await _snapshot(engine) == before
+    assert agent.provider.calls == 0
+    assert all(child.provider.calls == 0 for child in agent.subagents)
+
+
+async def _enter(
+    operation: str, agent: Agent, run_store: Any, root: str, call: str, token: str | None
+) -> None:
+    if operation == "pending":
+        await run_store.get_pending(root, tenant_id=TENANT)
+    elif operation == "resume":
+        await agent.resume(root, tenant_id=TENANT, expected_pause_id=token)
+    elif operation == "resume_stream":
+        stream = agent.resume_stream(root, tenant_id=TENANT, expected_pause_id=token)
+        events = [item async for item in stream]
+        last = events[-1] if events else None
+        if last is not None and getattr(last.type, "value", last.type) == "run_error":
+            raise RunControlError("the stream ended with run_error")
+    elif operation == "input":
+        await agent.submit_input(root, "answer", tenant_id=TENANT, expected_pause_id=token)
+    elif operation == "approval":
+        await agent.submit_approval(root, approved=True, tenant_id=TENANT, expected_pause_id=token)
+    else:
+        await agent.submit_tool_results(
+            root,
+            [ToolResult(call_id=call, name="reviewer", payload="report")],
+            tenant_id=TENANT,
+            expected_pause_id=token,
+        )
+
+
+@pytest.mark.parametrize(
+    ("operation", "registered", "cut", "token"),
+    [
+        (operation, registered, cut, token)
+        for operation in ("resume", "resume_stream", "input", "approval", "results")
+        for registered in (False, True)
+        for cut in ("parked", "claimed", "partial")
+        for token in ("wait", "foreign")
+    ],
+)
+async def test_token_bearing_entries_leave_future_workflow_untouched(
+    store: Any,
+    engine: Any,
+    run_store: Any,
+    cut: str,
+    operation: str,
+    registered: bool,
+    token: str,
+) -> None:
+    """A token never claims a fan-out wait: neither the wait's own generation nor any other."""
+    agent = _agent(store, registered)
+    root, call, _ = await _seed(store, engine, agent, cut, version=4)
+    pause_id = (await store.get_pause_state(root))["pause_id"] if token == "wait" else None
+    before = await _snapshot(engine)
+    with pytest.raises((RunControlError, PersistenceError, ValueError)):
+        await _enter(operation, agent, run_store, root, call, pause_id or generate_ulid())
+    assert await _snapshot(engine) == before
+    assert agent.provider.calls == 0
+    assert all(child.provider.calls == 0 for child in agent.subagents)
 
 
 @pytest.mark.parametrize("mode", ["error", "reclaim"])
@@ -401,3 +474,110 @@ async def test_preclaim_reads_each_format_once_and_never_writes(store: Any, engi
         event.remove(engine.sync_engine, "before_cursor_execute", record)
     assert len(statements) == 3
     assert all(s.lstrip().upper().startswith("SELECT") for s in statements)
+
+
+@tool(target="client")
+async def governance_read() -> str:
+    """Read the value on the client."""
+    raise AssertionError("client tool executed on server")
+
+
+def _governance_agent(store: Any, *, limit: int = 4) -> Agent:
+    return Agent(
+        name="governance",
+        prompt="Read the value.",
+        tools=[governance_read],
+        provider=ScriptedLLM([tool_call("governance_read", pid="read"), LLMResponse(text="done")]),
+        state_store=store,
+        limits=Limits(max_parallel_subagents=limit),
+    )
+
+
+async def test_pre_parallel_snapshot_resumes_with_default_limit(
+    store: Any, engine: Any, caplog: Any
+) -> None:
+    agent = _governance_agent(store)
+    paused = await agent.run("read", tenant_id=TENANT)
+    current = agent._limits
+    previous_fields = [f.name for f in fields(current) if f.name != "max_parallel_subagents"]
+    previous_type = make_dataclass("PreParallelLimits", [(name, int) for name in previous_fields])
+    try:
+        agent._limits = previous_type(*(getattr(current, name) for name in previous_fields))
+        previous_snapshot = governance_snapshot(agent)
+    finally:
+        agent._limits = current
+    record = await store.get_run(paused.run_id)
+    raw = await store.get_pause_state(paused.run_id)
+    raw[GOVERNANCE_KEY] = previous_snapshot
+    async with engine.begin() as conn:
+        await conn.execute(
+            update(AgentRun)
+            .where(AgentRun.id == paused.run_id)
+            .values(meta={**record.meta, GOVERNANCE_KEY: previous_snapshot}, pause_data=raw)
+        )
+    call = paused.pending.tool_calls[0]
+    with caplog.at_level(logging.WARNING):
+        result = await agent.resume(
+            paused.run_id,
+            tool_results=[ToolResult(name=call.name, call_id=call.id, payload="value")],
+            expected_pause_id=paused.pause_id,
+            tenant_id=TENANT,
+        )
+    assert result.status == RunStatus.SUCCESS
+    events = await store.get_run_events(paused.run_id)
+    assert not any(event.event_type == "governance.changed" for event in events)
+    assert not any(
+        getattr(r, "code", None) in {"governance_changed", "governance_mismatch"}
+        for r in caplog.records
+    )
+
+
+async def test_parallel_override_change_is_detected_before_resume_claim(
+    store: Any, engine: Any
+) -> None:
+    agent = _governance_agent(store, limit=8)
+    paused = await agent.run("read", tenant_id=TENANT)
+    saved = governance_snapshot(agent)
+    agent._limits = Limits(max_parallel_subagents=16)
+    assert saved != governance_snapshot(agent)
+    before = await _snapshot(engine)
+    call = paused.pending.tool_calls[0]
+    with pytest.raises(GovernanceMismatchError) as exc:
+        await agent.resume(
+            paused.run_id,
+            tool_results=[ToolResult(name=call.name, call_id=call.id, payload="value")],
+            expected_pause_id=paused.pause_id,
+            tenant_id=TENANT,
+        )
+    assert exc.value.changed == ("limits",)
+    assert await _snapshot(engine) == before
+
+
+@pytest.mark.parametrize("shape", ["single_binding", "duplicate_child"])
+@pytest.mark.parametrize("entry", ["reclaim", "resume"])
+async def test_malformed_v4_wait_refuses_before_claim(
+    store: Any, engine: Any, shape: str, entry: str
+) -> None:
+    agent = _agent(store)
+    root, _, _ = await _seed(store, engine, agent, "parked", version=4)
+    raw = await store.get_pause_state(root)
+    envelope = raw["managed_fanout"]
+    if shape == "single_binding":
+        envelope["n"] = 1
+        envelope["bindings"] = envelope["bindings"][:1]
+        raw["pending_tool_calls"] = raw["pending_tool_calls"][:1]
+        raw["pending_targets"] = {raw["pending_tool_calls"][0]["id"]: "agent"}
+    else:
+        envelope["bindings"][1]["child_run_id"] = envelope["bindings"][0]["child_run_id"]
+    async with engine.begin() as conn:
+        await conn.execute(update(AgentRun).where(AgentRun.id == root).values(pause_data=raw))
+    before = await _snapshot(engine)
+    with pytest.raises(ManagedStateError) as exc:
+        if entry == "reclaim":
+            await agent.reclaim(root, tenant_id=TENANT)
+        else:
+            await agent.resume(root, expected_pause_id=raw["pause_id"], tenant_id=TENANT)
+    assert exc.value.reason == "wait_invalid"
+    record = await store.get_run(root)
+    assert (record.claim_epoch, record.reclaim_attempts) == (7, 1)
+    assert await _snapshot(engine) == before

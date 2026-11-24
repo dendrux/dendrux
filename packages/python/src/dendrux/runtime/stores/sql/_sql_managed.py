@@ -3,14 +3,26 @@
 from __future__ import annotations
 
 import datetime as _dt
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
-from sqlalchemy import select
+from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 
 import dendrux.runtime.state as _state
 from dendrux import _codes
 from dendrux._lifecycle import STORAGE_FORMAT_CHECKPOINTED
 from dendrux._meta_keys import STORE_SESSION_KEY
+from dendrux.db.enums import AgentRunStatus
+from dendrux.db.models import AgentRun, ToolCallRecord
+from dendrux.errors import (
+    ManagedStateError,
+    RunCancelledError,
+    RunFencedError,
+    RunNotFoundError,
+)
+from dendrux.runtime._capabilities import require_managed_subagents
+from dendrux.runtime._digest import content_digest
+from dendrux.runtime.context import DelegationDepthExceededError
 from dendrux.runtime.durability import retry_transient_db
 from dendrux.runtime.state import (
     _TERMINAL_STATUS_VALUES,
@@ -27,17 +39,58 @@ from dendrux.runtime.stores.sql import _sql_support
 from dendrux.runtime.stores.sql._managed_reads import ManagedReads
 from dendrux.runtime.stores.sql._sql_evidence import _SqlEvidence
 from dendrux.runtime.stores.sql._sql_support import logger
-from dendrux.types import RunStatus, generate_ulid
+from dendrux.types import _ULID_PATTERN, RunStatus, _validate_persistable, generate_ulid
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from sqlalchemy.ext.asyncio import AsyncSession
 
+    from dendrux.runtime._managed_fanout_store import BindManagedChildrenRequest
+    from dendrux.runtime.state import EventWrite, TraceWrite
+
+    _AnyBind = BindManagedChildRequest | BindManagedChildrenRequest
+
+
+class _ManagedCall(Protocol):
+    """One managed invocation as the bind writers read it: a single bind or one batch child."""
+
+    @property
+    def parent_run_id(self) -> str: ...
+    @property
+    def iteration_index(self) -> int: ...
+    @property
+    def tool_call_id(self) -> str: ...
+    @property
+    def row_id(self) -> str: ...
+    @property
+    def provider_tool_call_id(self) -> str | None: ...
+    @property
+    def tool_name(self) -> str: ...
+    @property
+    def params(self) -> dict[str, Any] | None: ...
+    @property
+    def intent_event(self) -> EventWrite: ...
+    @property
+    def child_run_id(self) -> str: ...
+    @property
+    def child_agent_name(self) -> str: ...
+    @property
+    def child_input_data(self) -> dict[str, Any] | None: ...
+    @property
+    def child_seed_traces(self) -> tuple[TraceWrite, ...]: ...
+    @property
+    def child_model(self) -> str | None: ...
+    @property
+    def child_strategy(self) -> str | None: ...
+    @property
+    def child_meta(self) -> dict[str, Any] | None: ...
+    @property
+    def child_pii_mapping(self) -> dict[str, str] | None: ...
+
 
 def _bound_child_id(rows: Sequence[Any]) -> str | None:
     """The child id of exactly one managed intent row, else None (a conflict)."""
-    from dendrux.types import _ULID_PATTERN
 
     if len(rows) != 1 or rows[0].target != "agent":
         return None
@@ -57,7 +110,6 @@ def _child_matches(
 
     Tenant and parent link are compared before the child's header is parsed.
     """
-    from dendrux.errors import ManagedStateError
 
     if child.tenant_id != tenant_id or child.parent_run_id != request.parent_run_id:
         return False
@@ -87,7 +139,6 @@ def _existing_wait_id(
     * Started intent on a live parent: active. Checkpoint binding, pending call,
       v3 pause generation and envelope must all agree.
     """
-    from dendrux.errors import ManagedStateError
 
     parent_id, call_id = request.parent_run_id, request.tool_call_id
     names_call = isinstance(outgoing, dict) and outgoing.get("tool_call_id") == call_id
@@ -118,7 +169,6 @@ def _active_wait_id(
     The projected envelope must already be a JSON object; a stored scalar or
     string (even one that encodes an object) is refused without parsing it.
     """
-    from dendrux.errors import ManagedStateError
 
     envelope = parent.wait_binding
     pause_id = outgoing.get("pause_id")
@@ -150,8 +200,6 @@ class _SqlManaged(_SqlEvidence, ManagedReads):
         nonce on the intent row receives the child's execution token. No
         provider, hook or user code runs inside.
         """
-        from dendrux.runtime._capabilities import require_managed_subagents
-        from dendrux.types import _validate_persistable
 
         require_managed_subagents(self)
         for value, name in (
@@ -202,10 +250,8 @@ class _SqlManaged(_SqlEvidence, ManagedReads):
             _raw_driver_errors=True,
         )
 
-    async def _bind_parent(self, session: AsyncSession, request: BindManagedChildRequest) -> Any:
+    async def _bind_parent(self, session: AsyncSession, request: _AnyBind) -> Any:
         """Lock the parent row; a foreign or missing parent is not found (no disclosure)."""
-        from dendrux.db.models import AgentRun
-        from dendrux.errors import RunNotFoundError
 
         parent = (
             await session.execute(
@@ -226,6 +272,9 @@ class _SqlManaged(_SqlEvidence, ManagedReads):
                         self.json_get(AgentRun.pause_data, ("managed_wait",), "json").label(
                             "wait_binding"
                         ),
+                        self.json_get(AgentRun.pause_data, ("managed_fanout",), "json").label(
+                            "wait_fanout"
+                        ),
                     ).where(AgentRun.id == request.parent_run_id),
                     "update",
                 )
@@ -243,8 +292,6 @@ class _SqlManaged(_SqlEvidence, ManagedReads):
         The state is classified from the parent's lifecycle and the intent
         outcome, never from one binding copy: see ``_existing_wait_id``.
         """
-        from dendrux.db.models import AgentRun, ToolCallRecord
-        from dendrux.errors import ManagedStateError
 
         parent_id, call_id = request.parent_run_id, request.tool_call_id
         outgoing = (parent.loop_state or {}).get(MANAGED_BINDING_KEY)
@@ -283,13 +330,25 @@ class _SqlManaged(_SqlEvidence, ManagedReads):
 
     def _bind_admit(self, request: BindManagedChildRequest, parent: Any) -> ManagedHeader:
         """Admission under the parent lock; returns the child's managed header."""
-        from dendrux.errors import ManagedStateError, RunCancelledError, RunFencedError
-        from dendrux.runtime.context import DelegationDepthExceededError
+        header = self._admit_parent(request, parent, request.child_run_id, (request.child_path,))
+        return self._admit_call(request, parent, header, request.tool_call_id, request.child_path)
+
+    def _admit_parent(
+        self,
+        request: _AnyBind,
+        parent: Any,
+        child_run_id: str,
+        child_paths: Sequence[tuple[str, ...]],
+    ) -> ManagedHeader:
+        """Parent-level admission, once per bind; returns the parent's managed header.
+
+        ``child_run_id`` names the refused child in a cancellation error.
+        """
 
         parent_id = request.parent_run_id
         cancelled = parent.cancel_requested or parent.root_stopped
         if cancelled or parent.status in _TERMINAL_STATUS_VALUES:
-            raise RunCancelledError(request.child_run_id, parent_id)
+            raise RunCancelledError(child_run_id, parent_id)
         if (
             parent.status != RunStatus.RUNNING.value
             or parent.claim_epoch != request.parent_claim_epoch
@@ -300,42 +359,59 @@ class _SqlManaged(_SqlEvidence, ManagedReads):
             raise ManagedStateError(reason="storage_format", run_id=parent_id)
         state = parent.loop_state or {}
         header = ManagedHeader.from_dict(state.get(MANAGED_HEADER_KEY), run_id=parent_id)
-        if header.root_run_id != request.root_run_id or request.child_path[:-1] != header.path:
+        if header.root_run_id != request.root_run_id or any(
+            path[:-1] != header.path for path in child_paths
+        ):
             raise ManagedStateError(reason="header_invalid", run_id=parent_id)
         if state.get(MANAGED_BINDING_KEY) is not None:
             raise ManagedStateError(reason="binding_outstanding", run_id=parent_id)
+        return header
+
+    def _admit_call(
+        self,
+        request: _AnyBind,
+        parent: Any,
+        header: ManagedHeader,
+        tool_call_id: str,
+        child_path: tuple[str, ...],
+    ) -> ManagedHeader:
+        """One call's admission: pending call and depth; returns the child's managed header."""
+
+        parent_id = request.parent_run_id
         if not any(
-            isinstance(p, dict) and p.get("call_id") == request.tool_call_id
-            for p in state.get("pending") or ()
+            isinstance(p, dict) and p.get("call_id") == tool_call_id
+            for p in (parent.loop_state or {}).get("pending") or ()
         ):
             raise ManagedStateError(reason="pending_missing", run_id=parent_id)
         level = int(parent.delegation_level or 0) + 1
         if request.max_delegation_depth is not None and level > request.max_delegation_depth:
             raise DelegationDepthExceededError(level, request.max_delegation_depth)
         return ManagedHeader(
-            root_run_id=request.root_run_id,
-            path=request.child_path,
+            root_run_id=header.root_run_id,
+            path=child_path,
             parent_run_id=parent_id,
-            tool_call_id=request.tool_call_id,
+            tool_call_id=tool_call_id,
         )
 
     async def _bind_park_parent(
         self,
         session: AsyncSession,
-        request: BindManagedChildRequest,
+        request: _AnyBind,
         parent: Any,
         wait: dict[str, Any],
+        binding: dict[str, Any] | None = None,
     ) -> None:
-        """Save the v3 wait and outgoing binding, and retire the parent's epoch."""
-        from sqlalchemy import update
+        """Save the wait and the checkpoint's outgoing binding, and retire the parent's epoch.
 
-        from dendrux.db.models import AgentRun
-        from dendrux.errors import RunFencedError
+        ``binding`` is the checkpoint copy of the wait's binding; by default the single
+        binding of a v3 wait. Both copies come from the one wait value that is persisted.
+        """
 
         parent_id, epoch = request.parent_run_id, request.parent_claim_epoch
         state = _apply_loop_patch(dict(parent.loop_state or {}), request.parent_patch)
-        # Both binding copies come from the one wait value that is persisted.
-        state[MANAGED_BINDING_KEY] = {**wait["managed_wait"], "pause_id": wait["pause_id"]}
+        if binding is None:
+            binding = {**wait["managed_wait"], "pause_id": wait["pause_id"]}
+        state[MANAGED_BINDING_KEY] = binding
         _sql_support._validate_checkpoint(parent_id, state)
         values: dict[str, Any] = {
             **_sql_support._status_values(RunStatus.PAUSED.value),
@@ -367,12 +443,8 @@ class _SqlManaged(_SqlEvidence, ManagedReads):
             _codes.log_code(logger, _codes.RUN_FENCED, run_id=parent_id)
             raise RunFencedError(parent_id, claim_epoch=epoch)
 
-    async def _bind_intent(
-        self, session: AsyncSession, request: BindManagedChildRequest, nonce: str
-    ) -> None:
+    async def _bind_intent(self, session: AsyncSession, request: _ManagedCall, nonce: str) -> None:
         """The unique managed tool intent, started, carrying the binding and creator nonce."""
-        from dendrux.db.models import ToolCallRecord
-        from dendrux.runtime._digest import content_digest
 
         digest = content_digest(
             dict(
@@ -413,15 +485,16 @@ class _SqlManaged(_SqlEvidence, ManagedReads):
     async def _bind_child(
         self,
         session: AsyncSession,
-        request: BindManagedChildRequest,
+        request: _ManagedCall,
         parent: Any,
         child_state: dict[str, Any],
+        *,
+        blocked: bool = False,
     ) -> None:
-        """Create the child running at epoch 0 with its managed header."""
-        from sqlalchemy.exc import IntegrityError
+        """Create the child running at epoch 0 with its managed header.
 
-        from dendrux.db.enums import AgentRunStatus
-        from dendrux.db.models import AgentRun
+        ``blocked`` is trusted per-child block evidence (a batch child's ``child_blocked``).
+        """
 
         child_id = request.child_run_id
         session.add(
@@ -438,7 +511,9 @@ class _SqlManaged(_SqlEvidence, ManagedReads):
                 parent_run_id=request.parent_run_id,
                 delegation_level=int(parent.delegation_level or 0) + 1,
                 tenant_id=parent.tenant_id,
-                meta=_sql_support._creation_metadata(session, self, child_id, request.child_meta),
+                meta=_sql_support._creation_metadata(
+                    session, self, child_id, request.child_meta, blocked=blocked
+                ),
                 last_progress_at=_dt.datetime.now(_dt.UTC),
                 claim_epoch=0,
             )
@@ -463,10 +538,10 @@ class _SqlManaged(_SqlEvidence, ManagedReads):
                 self._write_conflict(request.parent_run_id)
             raise
 
-    async def _bind_seeds(self, session: AsyncSession, request: BindManagedChildRequest) -> None:
+    async def _bind_seeds(self, session: AsyncSession, request: _ManagedCall) -> None:
         for trace in request.child_seed_traces:
             await self._insert_trace(session, request.child_run_id, trace)
 
-    async def _bind_event(self, session: AsyncSession, request: BindManagedChildRequest) -> None:
+    async def _bind_event(self, session: AsyncSession, request: _ManagedCall) -> None:
         await _state._write_event(session, request.parent_run_id, request.intent_event)
         self._mark_announce(session, (request.parent_run_id, request.child_run_id))

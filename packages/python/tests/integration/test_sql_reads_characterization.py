@@ -223,13 +223,20 @@ async def test_list_count_identical_filters_and_deferred_payloads(
         started_before=STAMP + timedelta(days=1),
         metadata_filter={"thread_id": "thread"},
     )
-    with _reads(engine, record_property) as (sql, params):
-        rows = await store.list_runs(**options, limit=MAX_PAGE + 1)
+    columns = []
+
+    def projected(conn, cursor, statement, values, context, many):
+        columns.extend(column[0] for column in cursor.description)
+
+    event.listen(engine.sync_engine, "after_cursor_execute", projected)
+    try:
+        with _reads(engine, record_property) as (sql, params):
+            rows = await store.list_runs(**options, limit=MAX_PAGE + 1)
+    finally:
+        event.remove(engine.sync_engine, "after_cursor_execute", projected)
     assert len(rows) == (0 if status == [] else 1)
-    assert (
-        "pause_data" not in sql[0].split(" FROM ")[0]
-        and "pii_mapping" not in sql[0].split(" FROM ")[0]
-    )
+    assert "pause_data" not in columns and "pii_mapping" not in columns
+    assert "CASE WHEN" in sql[0].split(" FROM ")[0]
     assert "created_at DESC, agent_runs.id DESC" in sql[0] and MAX_PAGE in params[0][0].values()
     with _reads(engine, record_property):
         assert await store.count_runs(**options) == len(rows)

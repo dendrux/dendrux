@@ -7,6 +7,7 @@ import textwrap
 from typing import TYPE_CHECKING
 
 import pytest
+import yaml
 
 from tools import semgrep_ratchet as sr
 
@@ -279,7 +280,6 @@ def test_safe_exception_reporting_is_not_flagged(tmp_path: Path) -> None:
 # Each test builds one scratch tree and runs Semgrep once. ---
 
 _FUNCTION = "async def {name}(store, run_id, code, name, text):\n    {body}\n\n"
-_METHOD = "class {cls}:\n    async def {name}(self, store, run_id):\n        {body}\n\n"
 _FAIL = "await store.finalize_run(run_id, status=RunStatus.ERROR.value)"
 _REBUILD = "await store.finalize_with_event(run_id, status=RunStatus.ERROR.value, event_type=EV)"
 _CANCEL = "await store.finalize_run(run_id, status=RunStatus.CANCELLED.value)"
@@ -288,92 +288,58 @@ _FINGERPRINT = "fp = compute_idempotency_fingerprint(name, text)"
 _OUTPUT_NAME = 'fp = f"{name.__module__}.{name.__qualname__}"'
 _LOSS = 'return code.startswith("08")'
 
-# (rule, file, template, class, allowed function, body); the class is empty for a module
-# function. Each rule has its own wrong-function name, so a surviving rule cannot stand in
-# for a deleted one.
-ALLOWED_COPIES = [
-    (
-        "error-finalize-outside-helper",
-        "runtime/runner.py",
-        _FUNCTION,
-        "",
-        "_persist_run_failure",
-        _FAIL,
-    ),
-    (
-        "error-finalize-outside-helper",
-        "runtime/_reclaim.py",
-        _FUNCTION,
-        "",
-        "_handle_rebuild_failure",
-        _REBUILD,
-    ),
-    (
-        "cancel-finalize-outside-helper",
-        "runtime/runner.py",
-        _FUNCTION,
-        "",
-        "_persist_run_cancellation",
-        _CANCEL,
-    ),
-    (
-        "cancel-finalize-outside-helper",
-        "runtime/runner.py",
-        _FUNCTION,
-        "",
-        "_finalize_loop_cancelled",
-        _CANCEL,
-    ),
-    (
-        "cancel-finalize-outside-helper",
-        "runtime/runner.py",
-        _FUNCTION,
-        "",
-        "_pause_with_event",
-        _CANCEL,
-    ),
-    ("cancel-finalize-outside-helper", "agent.py", _METHOD, "Agent", "_cancel_one", _CANCEL),
-    ("run-started-outside-startup", "runtime/runner.py", _FUNCTION, "", "_start_new_run", _STARTED),
-    (
-        "new-run-fingerprint-outside-helper",
-        "runtime/runner.py",
-        _FUNCTION,
-        "",
-        "_new_run_metadata",
-        _FINGERPRINT,
-    ),
-    (
-        "new-run-fingerprint-outside-helper",
-        "runtime/runner.py",
-        _FUNCTION,
-        "",
-        "_new_run_metadata",
-        _OUTPUT_NAME,
-    ),
-    (
-        "new-run-fingerprint-outside-helper",
-        "runtime/runner.py",
-        _FUNCTION,
-        "",
-        "_idempotent_hit_after_image_error",
-        _FINGERPRINT,
-    ),
-    (
-        "connection-loss-code-copy",
-        "runtime/stores/_errors.py",
-        _FUNCTION,
-        "",
-        "_is_connection_loss_code",
-        _LOSS,
-    ),
-]
+# rule -> bodies that rule must flag. The allowed places come from the rule's own
+# metadata.allow_in in the yml, so this table cannot drift from it. Each rule has its own
+# wrong-function name, so a surviving rule cannot stand in for a deleted one.
+ALLOWED_BODIES = {
+    "error-finalize-outside-helper": [_FAIL, _REBUILD],
+    "cancel-finalize-outside-helper": [_CANCEL],
+    "run-started-outside-startup": [_STARTED],
+    "new-run-fingerprint-outside-helper": [_FINGERPRINT, _OUTPUT_NAME],
+    "connection-loss-code-copy": [_LOSS],
+}
+# allow_in is also used by a rule that has its own dedicated test above.
+ALLOW_IN_TESTED_ELSEWHERE = {"session-commit-outside-write-tx"}
+# An allow_in entry whose body is not one of the shared bodies of its rule.
+ENTRY_BODIES = {
+    "dendrux.runtime._reclaim:_handle_rebuild_failure": [_REBUILD],
+}
+
+
+def _allow_in_entries() -> dict[str, list[str]]:
+    rules = yaml.safe_load(sr.RULES.read_text())["rules"]
+    return {
+        rule["id"]: list(rule["metadata"]["allow_in"])
+        for rule in rules
+        if rule.get("metadata", {}).get("allow_in")
+    }
+
+
+def _allowed_copies() -> list[tuple[str, str, str, str, str]]:
+    """(rule, file, class, function, body) for every allow_in entry of the yml."""
+    rows = []
+    for rule, entries in _allow_in_entries().items():
+        if rule in ALLOW_IN_TESTED_ELSEWHERE:
+            continue
+        for entry in entries:
+            module, qualname = entry.split(":")
+            cls, _, name = qualname.rpartition(".")
+            where = module.removeprefix("dendrux.").replace(".", "/") + ".py"
+            for body in ENTRY_BODIES.get(entry, ALLOWED_BODIES[rule]):
+                rows.append((rule, where, cls, name, body))
+    return rows
+
+
+def test_every_allow_in_rule_has_a_body_to_prove_it() -> None:
+    covered = set(ALLOWED_BODIES) | ALLOW_IN_TESTED_ELSEWHERE
+    assert set(_allow_in_entries()) == covered
 
 
 @SKIP_NO_SEMGREP
 def test_an_allowed_shape_passes_only_in_its_own_function(tmp_path: Path) -> None:
     files: dict[str, str] = {}
     expected: set[tuple[str, str, str]] = set()
-    for rule, where, template, cls, name, body in ALLOWED_COPIES:
+    for rule, where, cls, name, body in _allowed_copies():
         module = "dendrux." + where.removesuffix(".py").replace("/", ".")
         stem = rule.removesuffix("-outside-helper").removesuffix("-outside-startup")
         wrong_name = "wrong_" + stem.replace("-", "_")
@@ -381,7 +347,7 @@ def test_an_allowed_shape_passes_only_in_its_own_function(tmp_path: Path) -> Non
         # for a method, another class): only the wrong places may be reported.
         wrong = [("Other", name), (cls, wrong_name)] if cls else [("", wrong_name)]
         for place_cls, place_name in [(cls, name), *wrong]:
-            files[where] = files.get(where, "") + template.format(
+            files[where] = files.get(where, "") + _FUNCTION.format(
                 cls=place_cls, name=place_name, body=body
             )
         expected.update((rule, module, f"{c}.{n}" if c else n) for c, n in wrong)

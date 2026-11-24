@@ -17,6 +17,7 @@ CAPABILITIES = (
     "atomic_completion",
     "recovery",
     "managed_subagents",
+    "managed_fanout",
 )
 #: Flags that together make a store create format-2 runs (``state.py`` creation rule).
 FORMAT_2_FLAGS = ("fenced_writes", "retry_ids", "checkpointing", "atomic_completion")
@@ -80,6 +81,9 @@ class Declaration:
         if capability == "managed_subagents":
             # Match require_managed_subagents: narrowing a prerequisite disables managed use.
             return enabled and all(self.has(flag) for flag in (*FORMAT_2_FLAGS, "recovery"))
+        if capability == "managed_fanout":
+            # Match fanout_support: fan-out needs managed use (and so its prerequisites).
+            return enabled and self.has("managed_subagents")
         return enabled
 
     @property

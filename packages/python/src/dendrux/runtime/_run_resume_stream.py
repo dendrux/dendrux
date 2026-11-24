@@ -20,13 +20,16 @@ from dendrux._meta_keys import (
 )
 from dendrux._sentinel import _OMITTED, _OmittedType
 from dendrux.errors import (
+    GovernanceMismatchError,
     RunFencedError,
+    SkillContinuityError,
     safe_exception_info,
 )
 from dendrux.loops._helpers import (
     record_run_started,
 )
 from dendrux.runtime import (
+    _continuation_refusals,
     _reclaim,
     _run_contracts,
     _run_errors,
@@ -39,6 +42,7 @@ from dendrux.runtime import (
     _run_start,
     _run_tools,
 )
+from dendrux.runtime._entry_checks import reject_stream_on_started
 from dendrux.runtime._managed_cancel import (
     ManagedRootStoppedError,
 )
@@ -57,12 +61,14 @@ from dendrux.types import (
     PauseState,
     RunEventType,
     RunStatus,
+    RunStream,
     _usage_from_dict,
 )
 
 if TYPE_CHECKING:
     from collections.abc import (
         AsyncGenerator,
+        Awaitable,
         Callable,
     )
 
@@ -76,7 +82,6 @@ if TYPE_CHECKING:
         ContentPart,
         RunEvent,
         RunResult,
-        RunStream,
         ToolResult,
     )
 
@@ -106,18 +111,21 @@ async def _stream_resume_images(
     raw = await store.get_pause_state(run_id)
     if raw is None:
         raise ValueError("Run has no pause state")
-    _submit.require_pause_id(
-        agent, expected_pause_id, pause_id=raw.get("pause_id"), store=store, run_id=run_id
-    )
+    _run_resume_prep.check_continuation_pause(agent, store, run_id, raw, expected_pause_id)
     media_pause = PauseState.from_dict(raw)
     if media_pause.agent_name and media_pause.agent_name != agent.name:
         raise ValueError("Agent name mismatch on resume")
+    record = await _continuation_refusals.image_run(agent, store, run_id)
     if stream_results is not None:
         _submit.validate_result_names(run_id, media_pause, stream_results)
-        stream_results = await _submit.prepare_resume_results(
-            agent, store, run_id, media_pause, stream_results
+        stream_results = await _submit.prepare_results_for_status(
+            agent, run_id, media_pause, stream_results, record.status
         )
+        # A result transform can change the run. Recheck its status before ingest.
+        ingest_record = None
         results_prepared = True
+    else:
+        ingest_record = record
     stream_results, user_parts = await _run_images._ingest_resume_images(
         agent,
         provider,
@@ -127,6 +135,7 @@ async def _stream_resume_images(
         tool_results=stream_results,
         input_items=input_items,
         loop_method="run_stream",
+        record=ingest_record,
     )
     return store, stream_results, user_parts, results_prepared
 
@@ -474,14 +483,50 @@ async def _initial_stream_images(
     expected_pause_id: str | None,
     results: list[ToolResult] | None,
     items: tuple[Any, ...],
-) -> tuple[StateStore | None, list[ToolResult] | None, tuple[ContentPart, ...] | None, bool]:
+) -> (
+    tuple[StateStore | None, list[ToolResult] | None, tuple[ContentPart, ...] | None, bool]
+    | _continuation_refusals.DefinitionRefusal
+):
     if items or any(result.images for result in results or ()):
-        return await _stream_resume_images(
-            agent, provider, store, resolver, run_id, expected_pause_id, results, items
+        return await _continuation_refusals.image_setup(
+            _stream_resume_images(
+                agent, provider, store, resolver, run_id, expected_pause_id, results, items
+            )
         )
     return store, results, None, False
 
 
+async def _resume_error_event(
+    run_id: str,
+    exc: Exception,
+    status: RunStatus,
+    shared: dict[str, Any],
+    mcp_meta: dict[str, Any],
+    on_definition_refusal: Callable[[Exception], Awaitable[RunEvent]] | None,
+    images: Any,
+) -> RunEvent:
+    from dendrux.types import RunEvent, RunResult
+
+    if (
+        on_definition_refusal is not None
+        and not shared.get("claimed")
+        and (isinstance(exc, (GovernanceMismatchError, SkillContinuityError)) or exc is images)
+    ):
+        return await on_definition_refusal(exc)
+    error = _run_errors._safe_error(exc)
+    result = RunResult(
+        run_id=run_id,
+        status=status,
+        error=error,
+        error_info=_run_errors._provider_error_info(exc),
+        meta=_run_resume_loop._resume_warning_meta(
+            shared.get("ctx"), _run_outcome._stream_error_meta(mcp_meta, exc)
+        ),
+    )
+    return RunEvent(type=RunEventType.RUN_ERROR, run_result=result, error=error)
+
+
+@reject_stream_on_started
 def resume_stream(
     run_id: str,
     *,
@@ -494,6 +539,7 @@ def resume_stream(
     extra_notifier: LoopNotifier | None = None,
     expected_pause_id: str | None = None,
     _tenant_explicit: bool | None = None,
+    _on_definition_refusal: Callable[[Exception], Awaitable[RunEvent]] | None = None,
     _claimed: ClaimResult | None = None,
 ) -> RunStream:
     """Stream a resumed run as RunEvents, returning a RunStream.
@@ -515,8 +561,7 @@ def resume_stream(
     are ingested before the claim; an image error is raised from the first
     ``__anext__`` and leaves the run waiting.
     """
-    from dendrux.types import RunEvent, RunResult
-    from dendrux.types import RunStream as _RunStream
+    from dendrux.types import RunEvent
 
     input_items: tuple[Any, ...] = ()
     if user_input is not None:
@@ -529,19 +574,20 @@ def resume_stream(
 
     async def _generate() -> AsyncGenerator[RunEvent, None]:
         store = state_store
-        stream_results = tool_results
-        user_parts: tuple[ContentPart, ...] | None = None
-        store, stream_results, user_parts, results_prepared = await _initial_stream_images(
+        images = await _initial_stream_images(
             agent,
             provider,
             store,
             state_store_resolver,
             run_id,
             expected_pause_id,
-            stream_results,
+            tool_results,
             input_items,
         )
         try:
+            store, stream_results, user_parts, results_prepared = (
+                _continuation_refusals.checked_images(images)
+            )
             store = await _run_resume_prep._resolve_resume_stream_store(store, state_store_resolver)
             _shared["state_store"] = store
 
@@ -579,10 +625,8 @@ def resume_stream(
             _shared["expected_status"] = expected
             progress = _shared["progress"] = _run_contracts._ResumeProgress()
 
-            # 5. Prepare (shared helper — history, notifier).
-            #    Does NOT fire any lifecycle hooks; that's done below inside
-            #    the same try block so failure or released-finish hooks pair
-            #    with on_run_started.
+            # 5. Prepare (shared helper: history, notifier, frame capability). Lifecycle
+            #    hooks fire below, in this try block, so failure hooks pair with them.
             run_tenant = run_record.tenant_id if run_record else None
             ctx = await _run_resume_prep._prepare_resume(
                 run_id,
@@ -598,6 +642,7 @@ def resume_stream(
                 tenant_id=run_tenant,
                 history_records=reads.history_records,
                 pause_data=raw_pause,
+                recovering=recovering,
             )
             image_runtime = _run_images._image_runtime(agent, store, run_tenant, run_id)
             _shared["ctx"] = ctx
@@ -714,19 +759,8 @@ def resume_stream(
 
         except Exception as exc:
             failure_status = await _stream_resume_failure(_shared, extra_notifier, run_id, exc)
-
-            yield RunEvent(
-                type=RunEventType.RUN_ERROR,
-                run_result=RunResult(
-                    run_id=run_id,
-                    status=failure_status,
-                    error=_run_errors._safe_error(exc),
-                    error_info=_run_errors._provider_error_info(exc),
-                    meta=_run_resume_loop._resume_warning_meta(
-                        _shared.get("ctx"), _run_outcome._stream_error_meta(mcp_meta, exc)
-                    ),
-                ),
-                error=_run_errors._safe_error(exc),
+            yield await _resume_error_event(
+                run_id, exc, failure_status, _shared, mcp_meta, _on_definition_refusal, images
             )
 
         finally:
@@ -784,7 +818,7 @@ def resume_stream(
             )
         return None
 
-    return _RunStream(
+    return RunStream(
         run_id=run_id,
         generator=stream_context.wrap(_generate()),
         cleanup=lambda: _run_events._shielded_cleanup(_cleanup, run_id=run_id),

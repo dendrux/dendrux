@@ -19,6 +19,11 @@ The commands run on PostgreSQL, SQLite, MySQL and MariaDB. The sections below sa
 | `dendrux db status` | Print `revision`, `storage_format` and `activate_step` |
 | `dendrux db activate` | Check, deduplicate, build uniqueness and enable format 2 for new runs |
 | `dendrux db dedupe` | Remove identical duplicates without enabling format 2 |
+| `dendrux runs` | List recent runs: `--limit`/`-n`, `--offset`, `--status`/`-s`, `--tenant`/`-t`, `--format` and, since 0.8, `--exclude-waiting`. The table has a "Waiting for" column |
+
+## Listing runs
+
+`dendrux runs` reads the database from `DENDRUX_DATABASE_URL` (or the local SQLite default), like the `db` commands; there is no URL flag. Make sure the variable points at the database you mean: a SQLite path that does not exist is created empty. `--exclude-waiting` leaves out parents that only wait on their subagents (`waiting_for="subagents"`); a child's own pause still needs a person, so use `RunStore.get_pendings(root)` to find work (see [Finding runs that need a person](/docs/guides/subagents#finding-runs-that-need-a-person)). On a narrow or non-interactive terminal the table shortens columns; set `COLUMNS` to widen it.
 
 ## Migration history in 0.6.1
 

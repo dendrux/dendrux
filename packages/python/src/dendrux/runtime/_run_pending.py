@@ -8,6 +8,8 @@ from dendrux import _codes
 from dendrux._lifecycle import PAUSE_STATUSES as _PAUSE_STATUSES
 from dendrux._meta_keys import STOP_REASON_META_KEY as STOP_REASON_META_KEY
 from dendrux.runtime import _run_errors
+from dendrux.runtime._pending import _PendingReader as _PendingReader
+from dendrux.runtime._pending import facing_status
 from dendrux.runtime._run_errors import logger
 from dendrux.runtime.replay import REPLAY_META_KEY
 from dendrux.runtime.submit import _claim_failure_mapping
@@ -22,9 +24,11 @@ from dendrux.types import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import Awaitable, Callable, Sequence
 
-    from dendrux.runtime.state import StateStore
+    from dendrux.runtime._managed_pending import FacingView
+    from dendrux.runtime._pending import PendingPause
+    from dendrux.runtime.state import RunRecord, StateStore, TenantScope
     from dendrux.types import RunResult
 
 _CONTROL_EVENT_LIMIT = 100
@@ -89,6 +93,42 @@ async def _read_recovery_info(store: StateStore, record: Any, *, best_effort: bo
     return RecoveryInfo(record.reclaim_attempts, record.last_reclaimed_at, ids, truncated)
 
 
+def attach_pendings(result: RunResult, pendings: Sequence[PendingPause]) -> RunResult:
+    """The one writer of a result's pause fields (spec §8.4).
+
+    Non-empty: ``pendings`` in stable order, ``pending`` the first and ``pause_id`` its
+    token. Empty: all three are cleared. ``status`` is set first by the caller from the
+    same read (``facing_status``; the first pending's status for a managed view), so it
+    is never None and never from another generation than ``pendings``; a status that is
+    not a pause carries no pause fields at all.
+    """
+    if result.status not in _PAUSE_STATUSES:
+        pendings = ()
+    result.pendings = tuple(pendings)
+    result.pending = result.pendings[0] if result.pendings else None
+    result.pause_id = result.pending.pause_id if result.pending is not None else None
+    return result
+
+
+def _own_pendings(result: RunResult) -> tuple[PendingPause, ...]:
+    """A result's own pause as its pendings (nothing read: the in-memory view)."""
+    pending = result.pending
+    return (pending,) if pending is not None and result.status in _PAUSE_STATUSES else ()
+
+
+async def attach_facing(
+    result: RunResult, reader: _PendingReader, run_id: str, tenant_id: TenantScope
+) -> FacingView | None:
+    """Attach what the run waits on as its caller sees it; returns the view read.
+
+    A root waiting on subagents reports its workflow's pauses and status (0.7, 0.8).
+    """
+    pendings = await reader.get_pendings(run_id, tenant_id=tenant_id)
+    result.status = RunStatus(facing_status(result.status.value, reader.last_view))
+    attach_pendings(result, pendings)
+    return reader.last_view
+
+
 async def _attach_persisted_pending(store: StateStore, result: RunResult, record: Any) -> RunResult:
     result.recovery = await _recovery_info(store, record)
     if await _pending_moved(store, result, record):
@@ -97,8 +137,9 @@ async def _attach_persisted_pending(store: StateStore, result: RunResult, record
 
 
 async def _pending_moved(store: StateStore, result: RunResult, record: Any) -> bool:
-    """Attach a paused run's pending; True when that read saw the run move on (0.7)."""
+    """Attach a paused run's pendings; True when that read saw the run move on (0.7)."""
     if result.status not in _PAUSE_STATUSES or record is None:
+        attach_pendings(result, _own_pendings(result))
         return False
     return await _load_persisted_pending(store, result, record)
 
@@ -121,6 +162,8 @@ async def _reread_moved(store: StateStore, result: RunResult) -> None:
     result.error_info = _run_errors._error_info_from_meta(fresh.meta)
     if result.status in _PAUSE_STATUSES:
         await _load_persisted_pending(store, result, fresh)
+    else:
+        attach_pendings(result, ())  # it finished: no earlier read's pause survives
 
 
 async def _load_persisted_pending(store: StateStore, result: RunResult, record: Any) -> bool:
@@ -129,13 +172,10 @@ async def _load_persisted_pending(store: StateStore, result: RunResult, record: 
     A moved read keeps the later view's status: it is never a private managed
     wait, and it is coherent with the pending it came with.
     """
-    from dendrux.runtime._pending import _PendingReader
-
-    result.pending = None
-    result.pause_id = None
+    attach_pendings(result, ())
     reader = _PendingReader(store)
     try:
-        result.pending = await reader.get_pending(
+        pendings = await reader.get_pendings(
             result.run_id, tenant_id=getattr(record, "tenant_id", None)
         )
     except Exception:
@@ -145,7 +185,7 @@ async def _load_persisted_pending(store: StateStore, result: RunResult, record: 
         result.status.value, getattr(record, "status", None), reader.last_view
     )
     result.status = RunStatus(status)
-    result.pause_id = result.pending.pause_id if result.pending else None
+    attach_pendings(result, pendings)
     return moved
 
 
@@ -155,8 +195,6 @@ def _read_status(status: str, record_status: str | None, view: Any) -> tuple[str
     A parent waiting on a subagent reports its active branch; a run that moved
     to another public status between the reads keeps that later status (0.7).
     """
-    from dendrux.runtime._pending import facing_status
-
     moved = view is not None and not view.managed and view.status != record_status
     return (view.status if moved else facing_status(status, view)), moved
 
@@ -168,9 +206,7 @@ async def _committed_pause_result(
         record = await store.get_run(result.run_id)
     except Exception:
         _codes.log_code(logger, _codes.RESULT_READ_FAILED, run_id=result.run_id)
-        result.pending = None
-        result.pause_id = None
-        return result
+        return attach_pendings(result, ())
     if record is not None and record.status != result.status.value:
         return await persisted(RunStatus(record.status))
     return await _attach_persisted_pending(store, result, record)
@@ -189,8 +225,8 @@ def _ensure_pause_generation(
                 for k, v in (provider_kwargs or pause.provider_kwargs).items()
                 if k in {"model", "max_tokens", "temperature", "thinking", "effort"}
             }
-            result.pause_id = pause.pause_id
             result.pending = _in_memory_pending(result)
+            attach_pendings(result, _own_pendings(result))
 
 
 def _pause_event_data(result: RunResult, pause_state: PauseState) -> dict[str, Any]:
@@ -291,15 +327,23 @@ async def _build_cached_result(
     The contract is: "return the cached final outcome" — status, answer, error,
     iteration count, and aggregate usage. Not "return the identical object."
     """
-    from dendrux.types import RunResult
-
     run = await state_store.get_run(run_id)
     if run is None:
         raise RuntimeError(f"Idempotent run {run_id} not found in database")
 
-    output = _cached_output(run.answer, output_type, run_id)
+    result = _cached_record_result(run, output_type)
+    mapping = await state_store.get_pii_mapping(run_id)
+    if mapping:
+        result.meta = _run_errors._public_meta({"pii_mapping": mapping})
+    return await _attach_persisted_pending(state_store, result, run)
 
-    result = RunResult(
+
+def _cached_record_result(run: RunRecord, output_type: type | None = None) -> RunResult:
+    from dendrux.types import RunResult
+
+    output = _cached_output(run.answer, output_type, run.id)
+
+    return RunResult(
         run_id=run.id,
         status=RunStatus(run.status),
         answer=run.answer,
@@ -324,11 +368,6 @@ async def _build_cached_result(
             _stop_reason_from_meta(run.meta) if run.status == RunStatus.SUCCESS.value else None
         ),
     )
-
-    mapping = await state_store.get_pii_mapping(run_id)
-    if mapping:
-        result.meta = _run_errors._public_meta({"pii_mapping": mapping})
-    return await _attach_persisted_pending(state_store, result, run)
 
 
 def _stop_reason_from_meta(meta: dict[str, Any] | None) -> StopReason | None:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING, Any, cast
 
-from sqlalchemy import select
+from sqlalchemy import ColumnElement, and_, case, select
 
 from dendrux._lifecycle import StoredEventType
 from dendrux._meta_keys import (
@@ -14,6 +14,7 @@ from dendrux._meta_keys import (
     OBSERVATION_META_KEY,
     STOP_REASON_META_KEY,
 )
+from dendrux.db.models import AgentRun
 from dendrux.runtime._bounds import DEFAULT_LIST_LIMIT, DEFAULT_READ_LIMIT, MAX_PAGE
 from dendrux.runtime._bounds import IN_CHUNK as _IN_CHUNK
 from dendrux.runtime.durability import _safe_database_call
@@ -42,6 +43,19 @@ if TYPE_CHECKING:
     from datetime import datetime
 
 _TRACE_POSITION_STRIDE = 1000
+
+
+def _waiting_for_expression(store: _StoreHost) -> ColumnElement[str | None]:
+    return case(
+        (
+            and_(
+                AgentRun.status == "paused",
+                store.json_get(AgentRun.pause_data, ["pause_reason"], "str") == "managed_wait",
+            ),
+            "subagents",
+        ),
+        else_=None,
+    )
 
 
 class _SqlReads(_StoreHost):
@@ -350,6 +364,17 @@ class _SqlReads(_StoreHost):
                 return None
             return _run_to_record(row)
 
+    async def get_waiting_for(
+        self, run_id: str, *, tenant_id: TenantScope = UNSCOPED
+    ) -> str | None:
+        """Read the scoped display label without changing the runtime run projection."""
+        stmt = _apply_tenant_scope(
+            select(_waiting_for_expression(self)).where(AgentRun.id == run_id), tenant_id
+        )
+        async with self._session_factory() as session:
+            # The selected CASE returns only the literal label or SQL NULL.
+            return cast("str | None", await session.scalar(stmt))
+
     async def get_next_trace_index(self, run_id: str) -> int:
         """Read the next trace order from the run/order index, without payloads."""
         from sqlalchemy import select
@@ -499,6 +524,8 @@ class _SqlReads(_StoreHost):
                     id=r.id,
                     outcome=r.outcome,
                     observation=(r.meta or {}).get(OBSERVATION_META_KEY),
+                    content_digest=r.content_digest,
+                    managed_child_run_id=_bound_child(r.meta),
                     idempotent=r.idempotent,
                     replayed_at=_to_aware_utc(r.replayed_at),
                     tool_call_id=r.tool_call_id,
@@ -544,6 +571,7 @@ class _SqlReads(_StoreHost):
         started_after: datetime | None = None,
         started_before: datetime | None = None,
         metadata_filter: dict[str, Any] | None = None,
+        include_waiting: bool = True,
     ) -> list[RunRecord]:
         """Runs newest first, filtered in SQL. Never loads ``pause_data`` or ``pii_mapping``.
 
@@ -564,7 +592,7 @@ class _SqlReads(_StoreHost):
             # runs share timestamps and offset paging would otherwise skip
             # or duplicate rows across pages.
             stmt = (
-                select(AgentRun)
+                select(AgentRun, _waiting_for_expression(self))
                 .options(
                     defer(AgentRun.pause_data, raiseload=True),
                     defer(AgentRun.pii_mapping, raiseload=True),
@@ -581,11 +609,12 @@ class _SqlReads(_StoreHost):
                 started_before=started_before,
                 metadata_filter=metadata_filter,
             )
+            if not include_waiting:
+                stmt = stmt.where(_waiting_for_expression(self).is_(None))
             stmt = stmt.limit(capped_limit).offset(clamped_offset)
 
             result = await session.execute(stmt)
-            rows = result.scalars().all()
-            return [_run_to_record(r) for r in rows]
+            return [_run_to_record(row, waiting_for=label) for row, label in result.all()]
 
     async def count_pauses_per_run(
         self,
@@ -622,6 +651,7 @@ class _SqlReads(_StoreHost):
         started_after: datetime | None = None,
         started_before: datetime | None = None,
         metadata_filter: dict[str, Any] | None = None,
+        include_waiting: bool = True,
     ) -> int:
         """Count runs matching the ``list_runs`` filters (same tenant semantics)."""
         from sqlalchemy import func, select
@@ -640,6 +670,8 @@ class _SqlReads(_StoreHost):
                 started_before=started_before,
                 metadata_filter=metadata_filter,
             )
+            if not include_waiting:
+                stmt = stmt.where(_waiting_for_expression(self).is_(None))
             result = await session.execute(stmt)
             total = result.scalar_one()
             return int(total)
@@ -711,3 +743,10 @@ class _SqlReads(_StoreHost):
                 )
 
         return stmt.where(self.metadata_filter_predicate(AgentRun.meta, metadata_filter))
+
+
+def _bound_child(meta: dict[str, Any] | None) -> str | None:
+    """The child a managed intent row was bound to (its ``meta.managed.child_run_id``)."""
+    managed = (meta or {}).get("managed")
+    child = managed.get("child_run_id") if isinstance(managed, dict) else None
+    return child if isinstance(child, str) else None

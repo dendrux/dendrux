@@ -1,5 +1,130 @@
 # Changelog
 
+## 0.8.0 - 2026-11-24
+
+See [Upgrading to 0.8.0](../../docs/upgrading-to-0.8.0.mdx) for the upgrade steps and what
+custom-store authors and code that reads error text must do. No schema migration is needed.
+
+### Added
+
+- **Parallel subagents.** A model that calls several subagents in one response now runs them at
+  once, up to `Limits.max_parallel_subagents` (default 4, 1 to 32). The whole batch is refused
+  before any effect when it is over the limit, with code `managed_fanout_limit`, and the tool
+  result gives the requested count and the limit. `Agent(exclusive_subagents=[...])` names
+  children that must be the only subagent call of their turn. Needs the new `managed_fanout`
+  store capability (declared by the built-in SQL stores); without it the limit is 1. See the
+  [Managed subagents guide](../../docs/guides/subagents.mdx).
+  - **Several pauses.** `RunResult.pendings` lists every external pause of a workflow (depth
+    first, siblings in call order) on result paths (a refused stream on a store without the built-in SQL projection may return no
+    pendings: read them with the tenant-scoped `get_pendings` or `get_result`), for workflows of up to 257 active runs
+    (larger ones raise `ManagedStateError(reason="binding_conflict")` on those reads), and `RunStore.get_pendings()` reads
+    them. A continuation through the root names its leaf with `expected_pause_id`; an unheld
+    token raises `PauseStatusMismatchError(reason="pause_id")` with `current_pause_id`. A budget
+    pause makes one pause per leaf that observes the breach.
+  - **Streaming.** `stream()` and `resume_stream()` run parallel children, with child tool
+    progress live. The non-terminal `SUBAGENT_PAUSED` event carries the child `run_id`,
+    `pause_id`, and ordered `call_ids` on `RunEvent`. These replace the pre-release
+    `RunEvent.pending` field. Read arguments during progress through tenant-scoped
+    `store.get_pending()` or `store.get_pendings()`. Terminal events carry the full
+    `run_result`. This change affects no 0.7 users.
+    Events pass through one bounded queue. A held approval batch can be resumed on a
+    stream, and `resume_stream(root, expected_pause_id=)` answers any paused child.
+  - **Recovery.** `reclaim(root)` reconnects every branch without rerunning finished children.
+    `sweep(adoptable_after=timedelta(...))` lists, in `SweepResult.adoptable`, the roots of old
+    managed waits whose children are all terminal; the developer reclaims them. Payload-free,
+    token-less `resume(root)` reconnects the same way when no leaf is externally paused.
+  - **Cancel and pause requests.** `cancel_run(root)` and `request_pause(root)` reach every
+    bound branch, deepest first, without revoking a running claim; a batch bind that races a
+    cancel creates all children or none.
+  - One root budget still covers the tree. It is a soft limit on iterations: each executing
+    leaf can make one more unchecked provider call before it observes a breach.
+  - `Limits.max_parallel_subagents` and `MAX_PARALLEL_SUBAGENTS`.
+- **`waiting_for`.** `RunSummary`, `RunDetail` and `get_subtree` nodes report
+  `waiting_for="subagents"` for a parent stored as paused on a managed wait. The label describes the parent only; a child may still need a person, so check `get_pendings(root)`.
+  `RunStore.list_runs()` and `count_runs()` take `include_waiting=False` to leave those runs out
+  (new `waiting_filter` store capability), and `dendrux runs --exclude-waiting` does the same.
+  Stored statuses and existing filters are unchanged.
+- **`dendrux.cancel_run(run_id, tenant_id=..., database_url=... | state_store=...)`** cancels a run
+  and its subagents without building the `Agent` or loading a provider. `tenant_id` is required
+  (`UNSCOPED` is refused), `cascade` defaults to `True` and `max_nodes` bounds the traversal. A run
+  in another process stops at its next checkpoint. Repeat the call if a cascade fails partway.
+- **`on_started=`.** `Agent.run()` and `Agent.retry()` take a callback that receives the run id as
+  soon as the run is saved and claimed, before the model starts. A failing callback raises
+  `dendrux.errors.OnStartedError` (a `RuntimeError`, code `on_started_failed`) and the run ends
+  `error`; a cancel requested before the control read wins. Not supported on `stream()`.
+- **`dendrux.testing.FakeModel`.** A scripted, stateless model that answers by agent name and turn,
+  with `say`, `call`, `calls`, `structured` and `when`, assertions on what each agent was asked,
+  and stable `FakeModelScriptError` codes. See
+  [Testing agents with FakeModel](../../docs/recipes/testing-with-fake-model.mdx).
+- Log codes for fan-out, `on_started_failed` and the new refusals (see
+  [Log codes](../../docs/reference/log-codes.mdx)).
+- `Agent` docstring covers `subagents`, `exclusive_subagents`, `limits`, `budget` and
+  `lease_interval`.
+
+### Changed
+
+- A custom live-update adapter that catches the cancellation from Dendrux's own deadline and returns
+  is now counted as a failed send or a close timeout (see the live-update cancellation entry under Fixed).
+- An oversized subagent batch reports `managed_fanout_limit` instead of
+  `managed_batch_unsupported` in tool results, events and logs. A subagent beside a client tool and
+  an `exclusive_subagents` conflict keep `managed_batch_unsupported`. Migration: change any filter
+  on the old code.
+- `StructuredOutputValidationError` no longer carries the model's answer: `str(error)` and
+  `validation_error` list a count and built-in error kinds only, and `__cause__` is `None`.
+  `raw_response` stays on the exception. Migration: read `output_type_name`, `validation_error` or
+  `raw_response` instead of parsing the message.
+- `TenantScopeRequiredError(operation, *, message=None)` takes an optional message. Existing
+  messages are unchanged.
+- A saved fan-out wait that does not match its children raises
+  `ManagedStateError(reason="binding_conflict")`, a `PersistenceError`, instead of
+  `RunNotReclaimableError(reason="pause_format_unsupported")`. It is not a `RunControlError`.
+  `sweep()`'s `adoptable` list can repeat a root across cursor pages; `reclaim` is idempotent.
+- Blocked fan-out children persist a safe `{"task": ...}` projection of the call parameters. The
+  one-child path still persists the raw parameters.
+- `SingleCall` raises a fence that happens while entering the provider lease directly, before it
+  bills a call or retries an image, instead of recording `llm.failed`.
+- A cancel that commits after the `on_started` control read loses to the callback error: the run
+  ends `error` and the terminal write clears `cancel_requested`.
+- A recovering stream continuation no longer counts as an explicit budget-resume acknowledgement,
+  so stream and batch recovery behave the same.
+- `aiosqlite>=0.22.1` is now required (the floor was `>=0.19`).
+- Internal: the `errors.py` HTTP mapping in the module docstring is grouped by status;
+  `ProviderUnavailableError` stays under 503 and `OnStartedError` is listed under 500.
+
+### Fixed
+
+- A continuation that the selected governance policy refuses (`on_governance_change="raise"`), or whose saved skill manifest no longer matches (for a managed parent, any change to its skill set), is refused before anything is written, so the pending approval or input can be retried.
+- A cancelled write on a file SQLite database could leave the file locked for every later writer
+  (`lock_timeout`). Dendrux now closes a `sqlite+aiosqlite` connection's cursors and rolls back
+  before the connection is closed, invalidated or garbage-collected, without waiting on the database
+  worker. 0.7.0 and earlier are affected. The store's reported `deployment` follows the database
+  SQLite really opens for unusual URL forms.
+- `RunStore.from_database_url(...).get_pending()` and `get_pendings()` no longer raise
+  `StoreCapabilityError` for a paused fan-out workflow on SQLite.
+- Live-update `flush()` and `close()`: a cancellation pending at the start is delivered before the
+  transport is called, and one that arrives during the send or close propagates as a cancellation even
+  if the transport's cleanup replaces it (the caller's reason is preserved in the usual case; an
+  adapter that swallows or replaces the cancellation can change it). A transport's own timeout or cancelled future counts as a
+  failed send and no longer cancels the caller or already-started fan-out children. One abandoned
+  at loop shutdown ends cleanly.
+- The Agent-side `cancel_run` and the module function share one implementation; the behaviour of
+  `Agent.cancel_run` is unchanged.
+
+### Documentation
+
+- The subagents guide covers parallel fan-out, its limits, several pauses and the resume loop,
+  cancel and pause timing, the soft budget bound, recovery and the all-at-once upgrade; the stale
+  "planned for 0.7.1" line is gone.
+- New: the `dendrux.cancel_run` recipe section, the `on_started` reference, the `waiting_for` and
+  `include_waiting` reference, the FakeModel recipe and the 0.8 upgrade page.
+- The governance page now says subagent calls are not approval-gatable in 0.8. The cancellation and
+  recorder pages note that a custom recorder's fenced write after a pause can land after a cancel of
+  that paused run.
+- The RunStore reference now says a managed root's pending reads use the root id and that `get_pending`
+  returns the first pause of the workflow.
+- Errors reference: `OnStartedError`, `TenantScopeRequiredError(message=)` and the structured error
+  text; the HTTP mapping puts `ProviderUnavailableError` under 503 again.
+
 ## 0.7.0 - 2026-11-17
 
 See [Upgrading to 0.7.0](../../docs/upgrading-to-0.7.0.mdx) for the steps that custom-store

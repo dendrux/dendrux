@@ -201,6 +201,8 @@ ADDITIVE_060_RECORD_FIELDS = {
 }
 # contracts §7 / §12.15: additive sweep result shape only.
 ADDITIVE_060_RESULT_FIELDS = {"SweepResult": {"reclaimable", "cursor"}}
+# 0.8: additive v1 browser DTO keys; the goldens were recorded without them.
+ADDITIVE_080_WIRE_KEYS = frozenset({"pendings"})
 # contracts §12.7 / §12.15: preserve every other base and its order.
 ADDITIVE_060_EXCEPTION_BASES = {"RunControlError"}
 
@@ -212,6 +214,13 @@ def _pending_excluded_fields(obj: Any) -> set[str]:
     ):
         return origin_fields
     return set()
+
+
+def _result_excluded_fields(obj: Any) -> set[str]:
+    excluded = ADDITIVE_060_RESULT_FIELDS.get(type(obj).__name__, set())
+    if type(obj).__name__ == "SweepResult" and obj.adoptable == []:
+        return excluded | {"adoptable"}
+    return excluded
 
 
 def raw(obj: Any) -> Any:
@@ -236,7 +245,7 @@ def raw(obj: Any) -> Any:
     if hasattr(obj, "__dataclass_fields__") and not isinstance(obj, type):
         excluded = (
             ADDITIVE_060_RECORD_FIELDS.get(type(obj).__name__, set())
-            | ADDITIVE_060_RESULT_FIELDS.get(type(obj).__name__, set())
+            | _result_excluded_fields(obj)
             | _pending_excluded_fields(obj)
         )
         return {
@@ -327,7 +336,7 @@ def result_view(result: Any) -> dict[str, Any]:
         "meta": raw(result.meta),
         "pending": raw(result.pending),
         "steps": [type(s.action).__name__ for s in result.steps],
-        "wire": raw(result.to_dict()),
+        "wire": raw({k: v for k, v in result.to_dict().items() if k not in ADDITIVE_080_WIRE_KEYS}),
     }
 
 

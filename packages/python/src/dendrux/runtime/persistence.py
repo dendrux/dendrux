@@ -60,6 +60,10 @@ from dendrux.runtime._blob_catalog import edges_for_parts, scrub_inline_images
 from dendrux.runtime._cancel_guard import capture
 from dendrux.runtime._capabilities import capabilities
 from dendrux.runtime._clarification import DEFAULT_PAUSE_SUMMARY_BYTES, clarification_summary
+from dendrux.runtime._managed_persistence import adopt_managed_result as adopt_managed_result
+from dendrux.runtime._trace_shared import _message_trace as _message_trace
+from dendrux.runtime._trace_shared import _tool_call_evidence as _tool_call_evidence
+from dendrux.runtime._trace_shared import message_trace as message_trace
 from dendrux.runtime.durability import retry_critical, retry_transient_db
 from dendrux.types import (
     ImagePart,
@@ -111,17 +115,6 @@ def _paused_call(call: dict[str, Any], pause: Any) -> dict[str, Any]:
 def _pause_pending(pending: list[dict[str, Any]], pause: Any) -> list[dict[str, Any]]:
     remaining = {tc.id for tc in pause.pending_tool_calls}
     return [_paused_call(call, pause) for call in pending if call["call_id"] in remaining]
-
-
-def _tool_call_evidence(tc: ToolCall) -> dict[str, Any]:
-    """Persisted shape of a tool call; never includes the raw argument text."""
-    return {
-        "id": tc.id,
-        "provider_tool_call_id": tc.provider_tool_call_id,
-        "name": tc.name,
-        "params": tc.params,
-        **tool_call_parse_meta(tc),
-    }
 
 
 def _serialize_message(m: Message) -> dict[str, Any]:
@@ -207,59 +200,6 @@ def image_stats(
         "bytes": sum(p.ref.byte_length for p in parts),
         "estimated_tokens": total,
     }
-
-
-def message_trace(
-    message: Message,
-    order: int,
-    *,
-    kind: str = "turn",
-    tenant_scope: str | None = None,
-) -> Any:
-    """A lossless conversation envelope, with content stored only once."""
-    return _message_trace(message, order, generate_ulid(), kind=kind, tenant_scope=tenant_scope)
-
-
-def _message_trace(
-    message: Message,
-    order: int,
-    trace_id: str,
-    *,
-    kind: str = "turn",
-    tenant_scope: str | None = None,
-) -> Any:
-    from dendrux.runtime.state import TraceWrite
-    from dendrux.types import _message_to_dict
-
-    envelope = _message_to_dict(message)
-    envelope.pop("content", None)
-    meta = dict(message.meta)
-    meta[MESSAGE_META_KEY] = envelope
-    if message.tool_calls:
-        meta["tool_calls"] = [_tool_call_evidence(tc) for tc in message.tool_calls]
-    if message.reasoning_blocks:
-        meta["reasoning_blocks"] = message.reasoning_blocks
-    if message.call_id:
-        meta["call_id"] = message.call_id
-    if message.name:
-        meta["tool_name"] = message.name
-    if message.parts is not None:
-        meta[PARTS_META_KEY] = [content_part_to_dict(p) for p in message.parts]
-    edges = (
-        edges_for_parts(tenant_scope, "trace", str(order), meta.get(PARTS_META_KEY) or [])
-        if tenant_scope
-        else []
-    )
-    return TraceWrite(
-        trace_id,
-        message.role.value,
-        message.content,
-        order,
-        trace_kind=kind,
-        meta=meta,
-        blob_refs=edges or None,
-        blob_refs_scope=tenant_scope if edges else None,
-    )
 
 
 @dataclass(frozen=True)
@@ -1858,82 +1798,3 @@ def resolve_pending(
             raise ValueError("Unsupported tool-call outcome")
         actions.append(ResolutionAction(kind, call_id, pending["order_index"]))
     return actions
-
-
-@_managed_budget.propagate_fault
-async def adopt_managed_result(
-    store: StateStore,
-    run_id: str,
-    *,
-    claim: Any,
-    call_id: str,
-    report: ToolResult,
-    child_run_id: str,
-    agent_path: Sequence[str],
-    observation: Message | None = None,
-    pii_mapping: dict[str, str] | None = None,
-) -> dict[str, Any]:
-    """Complete a parent's managed tool intent with its accepted report (0.7).
-
-    One ``complete_tool_call`` transaction under the adoption claim's epoch:
-    started intent to completed or failed (its binding metadata kept), the
-    reserved observation, the outcome event, the call removed from pending and
-    the outgoing binding and submission marker cleared. Ordinary
-    ``consume_submission`` is never also called for this observation. A retry
-    after a lost acknowledgement finds the completed intent and adds nothing.
-    Returns the checkpoint after the change.
-    """
-    from dendrux.errors import ManagedStateError
-    from dendrux.runtime.state import EventWrite, _apply_loop_patch
-    from dendrux.types import tool_result_message
-
-    state = dict(claim.loop_state or {})
-    binding = state.get("managed_wait") or {}
-    pending = next((p for p in state.get("pending", []) if p.get("call_id") == call_id), None)
-    if binding.get("tool_call_id") != call_id or binding.get("child_run_id") != child_run_id:
-        raise ManagedStateError(reason="binding_conflict", run_id=run_id)
-    if pending is None:
-        raise ManagedStateError(reason="pending_missing", run_id=run_id)
-    iteration = int(state.get("iteration", 0))
-    trace = message_trace(observation or tool_result_message(report), pending["order_index"])
-    trace.meta["iteration"] = iteration
-    outcome = "completed" if report.success else "failed"
-    event = EventWrite(
-        generate_ulid(),
-        StoredEventType.TOOL_COMPLETED.value,
-        iteration,
-        {
-            "tool_name": report.name,
-            "target": "agent",
-            "success": report.success,
-            "duration_ms": report.duration_ms,
-            "child_run_id": child_run_id,
-            "agent_path": list(agent_path),
-            "managed_outcome": _managed_cancel.outcome_code(report),
-            **_managed_budget.adoption_event(report, state),
-        },
-        call_id,
-        None,
-    )
-    patch = _managed_budget.adoption_patch(state, call_id)
-
-    async def complete() -> None:
-        await store.complete_tool_call(
-            run_id,
-            claim_epoch=claim.claim_epoch,
-            tool_call_id=call_id,
-            outcome=outcome,
-            result_payload=report.payload,
-            success=report.success,
-            duration_ms=report.duration_ms,
-            error_message=report.error,
-            replayed=False,
-            observation=trace,
-            event=event,
-            loop_state_patch=patch,
-            meta=None,
-            pii_mapping=pii_mapping,
-        )
-
-    await retry_critical(complete, label="complete_tool_call", run_id=run_id)
-    return _apply_loop_patch(state, patch)

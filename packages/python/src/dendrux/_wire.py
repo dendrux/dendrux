@@ -6,6 +6,7 @@ import contextlib
 import json
 import math
 import re
+from copy import deepcopy
 from typing import TYPE_CHECKING, Any
 
 from dendrux import _codes
@@ -126,6 +127,23 @@ def _structured_output(output: Any) -> Any:
 
 
 def _pending_wire(pending: Any, mapping: Any) -> Any:
+    if not hasattr(pending, "_wire_display"):
+        return project_pending(pending, mapping)
+    if pending._wire_display is None:
+        return project_pending(pending, None)
+    display = deepcopy(pending._wire_display)
+    if display["run_id"] != pending.run_id:
+        # Re-addressing adds ancestor names; preserve the redacted child path and name.
+        path = pending.agent_path or []
+        suffix = display.get("agent_path") or []
+        display.update(
+            run_id=pending.run_id, agent_path=[*path[: len(path) - len(suffix)], *suffix]
+        )
+    return display
+
+
+def project_pending(pending: Any, mapping: Any) -> Any:
+    """Render a pause using the mapping belonging to its origin."""
     data = pending.to_dict()
     if pending.kind == "paused":
         for call in data.get("pending_tool_calls", []):
@@ -174,6 +192,16 @@ def _pending_origin(pending: Any) -> dict[str, Any]:
     }
 
 
+def _wire_pendings(result: RunResult, pending: Any, mapping: Any) -> list[Any]:
+    """Every pause rendered like ``pending``, in ``RunResult.pendings`` order.
+
+    An old single pause is one item; a run that is not paused has none.
+    """
+    if pending is None:
+        return []
+    return [_pending_wire(p, mapping) for p in tuple(result.pendings) or (pending,)]
+
+
 def _result_mapping(result: RunResult) -> Any:
     return result._wire_pii_mapping or result.meta.get("pii_mapping")
 
@@ -200,6 +228,7 @@ def result_to_dict(result: RunResult) -> dict[str, Any]:
         "run_id": result.run_id,
         "status": result.status.value,
         "pending": _pending_wire(pending, mapping) if pending else None,
+        "pendings": _wire_pendings(result, pending, mapping),
         "answer": answer,
         "answer_omitted": omitted,
         "output": _structured_output(result.output),

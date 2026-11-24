@@ -99,8 +99,9 @@ class StoreCapabilities:
     atomic_completion: bool = False
     recovery: bool = False
     deployment: Literal["single_process", "single_host", "multi_server"] | None = None
-    # Internal (0.7): atomic managed-subagent bind (``bind_managed_child``).
-    managed_subagents: bool = False
+    managed_subagents: bool = False  # Internal (0.7): ``bind_managed_child``.
+    managed_fanout: bool = False  # Internal (0.8): ``bind_managed_children`` (2..32 children).
+    waiting_filter: bool = False
 
 
 @dataclass(frozen=True)
@@ -583,6 +584,7 @@ class RunRecord:
     lease_expired_at: datetime | None = None
     last_reclaimed_at: datetime | None = None
     trace_link: str | None = None
+    waiting_for: str | None = None
 
 
 @dataclass(frozen=True)
@@ -649,9 +651,7 @@ class NoteRecord:
     delivered_iteration: int | None = None
 
 
-# ---------------------------------------------------------------------------
 # Delegation read models
-# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -700,11 +700,9 @@ class SubtreeSummary:
 
 @dataclass
 class DelegationInfo:
-    """Bounded delegation context for a single run.
+    """Bounded delegation context of one run, from ``StateStore.get_delegation_info()``.
 
-    Returned by ``StateStore.get_delegation_info()``. When truncated, subtree
-    totals cover only visited rows and are lower bounds on the full tree.
-    """
+    When truncated, subtree totals cover only visited rows and are lower bounds."""
 
     parent: ParentRef | None
     children: list[RunBrief]
@@ -747,6 +745,8 @@ class ToolCallReadRecord:
     idempotent: bool = False
     replayed_at: datetime | None = None
     observation: dict[str, Any] | None = None
+    content_digest: str | None = None  # started: the intent digest; resolved: the outcome digest
+    managed_child_run_id: str | None = None  # the child a managed intent was bound to
 
 
 @dataclass
@@ -880,6 +880,7 @@ class SweepResult:
     abandoned_waiting: list[SweptRun] = field(default_factory=list)
     reclaimable: list[ReclaimableRun] = field(default_factory=list)
     cursor: str | None = None
+    adoptable: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -1736,18 +1737,14 @@ def _extract_status(row: AgentRun) -> str:
     return s.value if hasattr(s, "value") else str(s)
 
 
-def _run_to_record(row: AgentRun) -> RunRecord:
-    """Convert an AgentRun ORM object to a RunRecord dataclass."""
-    answer = None
-    if row.output_data and isinstance(row.output_data, dict):
-        answer = row.output_data.get("answer")
+def _run_to_record(row: AgentRun, *, waiting_for: str | None = None) -> RunRecord:
     return RunRecord(
         id=row.id,
         agent_name=row.agent_name,
         status=_extract_status(row),
         input_data=row.input_data,
         output_data=row.output_data,
-        answer=answer,
+        answer=row.output_data.get("answer") if isinstance(row.output_data, dict) else None,
         error=row.error,
         iteration_count=row.iteration_count,
         model=row.model,
@@ -1777,6 +1774,7 @@ def _run_to_record(row: AgentRun) -> RunRecord:
         lease_expired_at=_to_aware_utc(row.lease_expired_at),
         last_reclaimed_at=_to_aware_utc(row.last_reclaimed_at),
         trace_link=row.trace_link,
+        waiting_for=waiting_for,
     )
 
 

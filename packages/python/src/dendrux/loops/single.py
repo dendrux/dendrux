@@ -341,79 +341,82 @@ class _Attempt(NamedTuple):
 async def _single_complete(
     pre: _SinglePrelude, prepared: PreparedRequest, output_type: type[BaseModel] | None
 ) -> tuple[LLMResponse, Any]:
-    """The provider call itself (structured or plain), under telemetry and a lease."""
+    """Run the structured or plain provider call inside the admitted attempt."""
     calls = pre.calls
     validated_output: Any = None
-    with telemetry_context(
-        run_id=pre.run_id,
-        iteration=1,
-        sinks=governance_sinks(calls.recorder, calls.notifier, pre.run_id),
-    ):
-        async with lease_scope(calls.recorder):
-            if output_type is not None:
-                from dendrux.llm.structured import structured_complete
+    if output_type is not None:
+        from dendrux.llm.structured import structured_complete
 
-                response, validated_output = await structured_complete(
-                    calls.provider,
-                    prepared.wire,
-                    output_type,
-                    run_id=pre.run_id,
-                    cache_key_prefix=pre.cache_key_prefix,
-                    **pre.pkw,
-                )
-            else:
-                response = await complete_call(
-                    calls.provider,
-                    prepared.wire,
-                    tools=None,
-                    run_id=pre.run_id,
-                    cache_key_prefix=pre.cache_key_prefix,
-                    **pre.pkw,
-                )
+        response, validated_output = await structured_complete(
+            calls.provider,
+            prepared.wire,
+            output_type,
+            run_id=pre.run_id,
+            cache_key_prefix=pre.cache_key_prefix,
+            **pre.pkw,
+        )
+    else:
+        response = await complete_call(
+            calls.provider,
+            prepared.wire,
+            tools=None,
+            run_id=pre.run_id,
+            cache_key_prefix=pre.cache_key_prefix,
+            **pre.pkw,
+        )
 
-        if response.tool_calls:
-            raise RuntimeError(
-                f"SingleCall received unexpected tool_calls from provider "
-                f"({len(response.tool_calls)} calls). SingleCall agents must "
-                f"have zero tools — the provider should not produce tool calls."
-            )
+    if response.tool_calls:
+        raise RuntimeError(
+            f"SingleCall received unexpected tool_calls from provider "
+            f"({len(response.tool_calls)} calls). SingleCall agents must "
+            f"have zero tools — the provider should not produce tool calls."
+        )
     return response, validated_output
+
+
+async def _record_single_failure(
+    calls: ProviderCallSite, prepared: PreparedRequest, exc: Exception, started_at: float
+) -> bool:
+    """Record a provider failure and report whether it is eligible for image retry."""
+    if isinstance(exc, StructuredOutputValidationError):
+        await _record_rejected_call(
+            exc,
+            agent=calls.agent,
+            provider=calls.provider,
+            run_id=calls.run_id,
+            recorder=calls.recorder,
+            notifier=calls.notifier,
+            warnings=calls.warnings,
+            semantic_messages=prepared.semantic,
+            duration_ms=int((time.monotonic() - started_at) * 1000),
+            model=calls.pkw.get("model"),
+        )
+        return False
+    await calls.record_failure(exc, started_at, 1)
+    return bool(prepared.slots)
 
 
 async def _single_attempt(
     pre: _SinglePrelude, prepared: PreparedRequest, output_type: type[BaseModel] | None
 ) -> _Attempt:
-    """``llm.started``, one provider call, and the failure record when it raises.
-
-    A rejected structured output and a failure with no image to retry
-    propagate; any other failure comes back with its wire bytes dropped.
-    """
+    """Run one admitted provider call under its lease and account for the outcome."""
     calls = pre.calls
-    await calls.started(prepared, None, 1)
-    t0 = time.monotonic()
+    started_at = None
     try:
-        response, validated_output = await _single_complete(pre, prepared, output_type)
-    except StructuredOutputValidationError as _invalid:
-        await _record_rejected_call(
-            _invalid,
-            agent=calls.agent,
-            provider=calls.provider,
+        with telemetry_context(
             run_id=pre.run_id,
-            recorder=calls.recorder,
-            notifier=calls.notifier,
-            warnings=pre.warnings,
-            semantic_messages=prepared.semantic,
-            duration_ms=int((time.monotonic() - t0) * 1000),
-            model=pre.pkw.get("model"),
-        )
-        raise
-    except Exception as _llm_exc:
-        await calls.record_failure(_llm_exc, t0, 1)
-        if not prepared.slots:
+            iteration=1,
+            sinks=governance_sinks(calls.recorder, calls.notifier, pre.run_id),
+        ):
+            async with lease_scope(calls.recorder):
+                started_at = time.monotonic()
+                response, validated_output = await _single_complete(pre, prepared, output_type)
+    except Exception as exc:
+        if started_at is None or not await _record_single_failure(calls, prepared, exc, started_at):
             raise
         prepared = release_wire(prepared)
-        return _Attempt(prepared, None, None, t0, _llm_exc)
-    return _Attempt(prepared, response, validated_output, t0, None)
+        return _Attempt(prepared, None, None, started_at, exc)
+    return _Attempt(prepared, response, validated_output, started_at, None)
 
 
 async def _single_batch_call(
@@ -425,7 +428,7 @@ async def _single_batch_call(
     """The batch provider call over its image request view, retried once on an image failure.
 
     Returns the answered attempt, or the run's end: an image guardrail block,
-    or a cancel seen before the retry.
+    or a cancel seen before a provider call.
     """
     images, calls = pre.images, pre.calls
     guardrails = calls.agent.guardrails or ()
@@ -442,6 +445,8 @@ async def _single_batch_call(
                 usage=UsageStats(),
                 meta=guardrail_meta(g_engine, pre.warnings),
             )
+        if not await calls.start_single_attempt(prepared, control_reader):
+            break
         attempt = await _single_attempt(pre, prepared, output_type)
         if attempt.failure is None:
             return attempt
@@ -456,15 +461,7 @@ async def _single_batch_call(
         )
         del attempt
         if stop is not None:
-            # SingleCall honours cancel only: nothing ran, so iteration 0.
-            return RunResult(
-                run_id=pre.run_id,
-                status=RunStatus.CANCELLED,
-                steps=[],
-                iteration_count=0,
-                usage=UsageStats(),
-                meta=guardrail_meta(g_engine, pre.warnings),
-            )
+            break
         if error is not None:
             raise error
         retried = True
@@ -474,6 +471,10 @@ async def _single_batch_call(
             guardrails=guardrails,
             force_tombstones=decision.tombstones,
         )
+    # SingleCall honours cancel only: a stopped attempt adds no completed iteration.
+    return RunResult(
+        run_id=pre.run_id, status=RunStatus.CANCELLED, meta=guardrail_meta(g_engine, pre.warnings)
+    )
 
 
 async def _scan_single_incoming(
@@ -1139,10 +1140,7 @@ def _cancel_reader(
     run_id: str,
     interrupt: asyncio.Event | None = None,
 ) -> Callable[[], Awaitable[Any]]:
-    """Control reader for an image retry: SingleCall honours cancel only (it never pauses).
-
-    An in-process ``interrupt`` (stream) counts as cancel.
-    """
+    """Read cancellation (including stream interrupts) for calls and image retries; never pause."""
 
     async def read() -> Any:
         if interrupt is not None and interrupt.is_set():

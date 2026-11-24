@@ -15,6 +15,7 @@ import math
 import random
 import socket
 import ssl
+import sys
 from abc import ABC, abstractmethod
 from collections import OrderedDict, deque
 from contextlib import suppress
@@ -27,7 +28,7 @@ from dendrux import _codes
 from dendrux.errors import FollowCapacityError, LiveUpdatesUnavailableError
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Callable, Iterable, Sequence
+    from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -105,9 +106,83 @@ def _shutdown_socket(transport: Any) -> None:
         transport.get_extra_info("socket").shutdown(socket.SHUT_RDWR)
 
 
-def _caller_cancelled() -> bool:
+def _cancel_count() -> int:
+    """The running task's cancellation count; the baseline an operation records at its start."""
     task = asyncio.current_task()
-    return task is not None and task.cancelling() > 0
+    return task.cancelling() if task is not None else 0
+
+
+def _restore_caller_exit(error: BaseException | None = None, baseline: int = 0) -> None:
+    """Propagate requests received since the owning operation's checkpoint."""
+    try:
+        count = _cancel_count()
+    except RuntimeError:
+        # A transport may replace GeneratorExit while its coroutine is finalized off-loop.
+        raise GeneratorExit from None
+    if count > baseline:
+        raise _caller_cancel(error) from None
+
+
+def _caller_cancel(error: BaseException | None) -> asyncio.CancelledError:
+    """Recover a delivered request from cleanup, ignoring the caller's enclosing handler."""
+    pending = [error]
+    seen = {id(sys.exception())}
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        if isinstance(current, asyncio.CancelledError):
+            return current
+        seen.add(id(current))
+        pending.extend((current.__context__, current.__cause__))
+    # An adapter that consumed the exception can leave only the request count.
+    return asyncio.CancelledError()
+
+
+async def _restore_adapter_exit(error: BaseException | None, baseline: int) -> None:
+    try:
+        _restore_caller_exit(error, baseline)
+    except asyncio.CancelledError:
+        # A request made just before the adapter returned may still await delivery.
+        # A later request at this checkpoint must not replace the original exception.
+        at_exit = _cancel_count()
+        try:
+            await asyncio.sleep(0)
+        except asyncio.CancelledError:
+            if _cancel_count() == at_exit:
+                raise
+        raise
+
+
+async def _adapter_failure(
+    timeout: float, operation: Callable[[], Awaitable[None]], abort: Callable[[], None]
+) -> BaseException | None:
+    """Run in the owning task. Return transport failures and propagate caller cancellation."""
+    limit = asyncio.timeout(timeout)
+    abort_on_exit = True
+    try:
+        # Deliver requests pending at entry before transport cleanup can replace them.
+        await asyncio.sleep(0)
+        baseline = _cancel_count()
+        failure: BaseException | None = None
+        try:
+            async with limit:
+                await operation()
+            if limit.expired():
+                failure = TimeoutError()
+        except (Exception, asyncio.CancelledError) as error:
+            failure = error
+        # The timeout has now withdrawn its own cancellation, even if cleanup swallowed it.
+        await _restore_adapter_exit(failure, baseline)
+        abort_on_exit = failure is not None
+        return failure
+    except GeneratorExit:
+        # Coroutine finalization can run after the adapter's event loop has closed.
+        abort_on_exit = False
+        raise
+    finally:
+        if abort_on_exit:
+            abort()
 
 
 def _quoted(run_id: str) -> str:
@@ -477,17 +552,12 @@ class LiveUpdates(ABC):
                 return
 
     async def _send_batch(self, messages: Sequence[str], count: int, remaining: float) -> bool:
-        try:
-            async with asyncio.timeout(min(self.send_timeout_s, remaining)):
-                await self.send(messages)
-        except asyncio.CancelledError as error:
-            self._drop_batch(count)
-            if _caller_cancelled():
-                raise
-            self._send_failure(error, count)
-            return False
-        except Exception as error:
-            self._drop_batch(count)
+        error = await _adapter_failure(
+            min(self.send_timeout_s, remaining),
+            lambda: self.send(messages),
+            lambda: self._drop_batch(count),
+        )
+        if error is not None:
             self._send_failure(error, count)
             return False
         self._counts["sent"] += count
@@ -741,8 +811,7 @@ class LiveUpdates(ABC):
             self._degraded(ConnectionError())
 
     def _listener_failure(self, error: BaseException) -> None:
-        if _caller_cancelled():
-            raise asyncio.CancelledError from None
+        _restore_caller_exit()
         self._degraded(error)
 
     async def _receive_messages(self) -> None:
@@ -849,19 +918,17 @@ class LiveUpdates(ABC):
     async def _close_owned(self) -> None:
         self._close_timeout_logged = False
         deadline = monotonic() + self.close_timeout_s
-        try:
-            async with asyncio.timeout(self.close_timeout_s):
-                await self._close_resources(deadline)
-        except asyncio.CancelledError:
-            self._abort_all()
-            if _caller_cancelled():
-                raise
-        except TimeoutError:
-            self._abort_all()
+        error = await _adapter_failure(
+            self.close_timeout_s, lambda: self._close_resources(deadline), self._abort_all
+        )
+        if error is not None:
+            self._close_failed(error)
+
+    def _close_failed(self, error: BaseException) -> None:
+        if isinstance(error, TimeoutError):
             self._close_timeout()
-        except Exception as error:
+        else:
             self._last_error_type = _error_type(error)
-            self._abort_all()
             _codes.log_code(
                 logger,
                 _codes.LIVE_UPDATES_UNAVAILABLE,

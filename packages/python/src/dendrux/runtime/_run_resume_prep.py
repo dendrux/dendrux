@@ -17,6 +17,7 @@ from dendrux._lifecycle import (
     StoredEventType,
 )
 from dendrux.errors import (
+    InvalidToolResultError,
     RunFencedError,
 )
 from dendrux.loops.react import ReActLoop
@@ -26,6 +27,7 @@ from dendrux.runtime import (
     _run_contracts,
     _run_entry,
     _run_events,
+    _run_execute,
     _run_images,
     _run_pending,
     _run_tools,
@@ -40,6 +42,8 @@ from dendrux.runtime.submit import (
     _claimed_submission_view,
     _release_supported,
     legacy_approval_denial,
+    pause_validator,
+    validate_tool_results,
 )
 from dendrux.skills._session import SkillSession, current
 from dendrux.types import (
@@ -267,20 +271,14 @@ async def _prepare_resume(
     history_records: Any = None,
     pause_data: dict[str, Any] | None = None,
     submission_projection: _SubmissionProjection | None = None,
-    recovering: bool = False,
+    recovering: bool,
 ) -> _run_contracts._ResumeContext:
-    """Build everything needed to re-enter the loop after a resume.
+    """Prepare a claimed continuation's history, recorder and frame capability.
 
-    Receives an already-loaded PauseState — does NOT load pause data or
-    claim the run. Those steps are owned by the caller (_resume_core for
-    direct resume, resume_stream for streaming, resume_claimed for
-    post-submit_and_claim resume).
-
-    Steps performed:
-      1. Record durable run.resumed event (the store allocates its index)
-      2. Build resume history (inject tool results or user input)
-      3. Create recorder with correct trace offset
-      4. Notify recorder of injected messages
+    ``recovering``: the continuation resolves an interrupted step instead of applying a
+    new payload. Every frame, batch or stream, gets its fan-out capability here, from its
+    store. The caller owns loading and claiming, injected-history replay and lifecycle
+    notifications, including their failure cleanup.
     """
     from dendrux.runtime.persistence import PersistenceRecorder
     from dendrux.tool import get_tool_def
@@ -360,7 +358,7 @@ async def _prepare_resume(
     # pairs with on_run_failed. See _replay_resume_injected_history below.
 
     await _run_tools._emit_declared_tools(agent, recorder, extra_notifier, run_id)
-    return _run_contracts._ResumeContext(
+    ctx = _run_contracts._ResumeContext(
         history=history,
         recorder=recorder,
         notifier=extra_notifier,
@@ -368,6 +366,8 @@ async def _prepare_resume(
         resolved_loop=resolved_loop,
         resolved_strategy=resolved_strategy,
     )
+    _run_execute._configure_fanout(ctx.recorder, state_store)
+    return ctx
 
 
 def _canonicalize_legacy_denials(
@@ -576,6 +576,16 @@ async def _resume_session(
     return session, user_input, items
 
 
+def check_continuation_pause(
+    agent: Agent, store: StateStore, run_id: str, raw: dict[str, Any], expected_pause_id: str | None
+) -> None:
+    """Check the token and policy before preparing a continuation payload."""
+    _submit.require_pause_id(
+        agent, expected_pause_id, pause_id=raw.get("pause_id"), store=store, run_id=run_id
+    )
+    _submit.check_governance(agent, run_id, raw)
+
+
 async def _read_resume_pause(
     store: StateStore,
     agent: Agent,
@@ -591,9 +601,7 @@ async def _read_resume_pause(
     if raw is None:
         raise ValueError(f"Run '{run_id}' has no pause state — cannot resume.")
     if not skip_claim:
-        _submit.require_pause_id(
-            agent, expected_pause_id, pause_id=raw.get("pause_id"), store=store, run_id=run_id
-        )
+        check_continuation_pause(agent, store, run_id, raw, expected_pause_id)
     return await _load_resume_pause(
         store, agent, provider, run_id, raw, reads, read_record=read_record
     )
@@ -718,3 +726,28 @@ async def _resume_submission(
             checkpoint=reads.checkpoint,
         )
     return store, expected_status, raw, tool_results, user_parts
+
+
+async def results_for_generation(
+    agent: Agent,
+    store: StateStore,
+    run_id: str,
+    results: list[ToolResult],
+    expected_pause_id: str | None,
+) -> PauseState:
+    """The pause ``results`` answer, validated; a stale token is reported before the results.
+
+    Call ids belong to one pause generation, so results checked against a newer pause
+    look wrong. When they do and the caller named a token, the generation is compared
+    first: a token for another pause raises ``PauseStatusMismatchError(reason="pause_id")``
+    naming the current one. The claim's locked comparison still follows on success.
+    """
+    try:
+        return await validate_tool_results(store, run_id, results, agent=agent)
+    except InvalidToolResultError:
+        if expected_pause_id is not None:
+            record = await store.get_run(run_id)
+            current = await store.get_pause_state(run_id) or {}
+            status = record.status if record is not None else RunStatus.PAUSED.value
+            pause_validator(run_id, expected_pause_id)({**current, "status": status})
+        raise

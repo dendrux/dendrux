@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -159,13 +160,17 @@ async def test_event_reads_survive_unconvertible_event_data(
     pending = await run_store.get_pending(run_id, tenant_id="A")
     assert pending is not None and pending.tool_calls[0].params == {"q": "a\x00b"}
     seen = []
+    # The budget only bounds a hang. The stored events must arrive however slow the
+    # runner is, so the loop stops at the second one instead of waiting for the end.
     async with run_store.follow(
-        run_id, tenant_id="A", until_terminal=False, max_duration_s=1.0
+        run_id, tenant_id="A", until_terminal=False, max_duration_s=60.0
     ) as f:
-        async for item in f:
-            if isinstance(item, (FollowEnd, FollowHeartbeat)) or len(seen) == 2:
-                break
-            seen.append(item)
+        async with asyncio.timeout(30):
+            async for item in f:
+                assert not isinstance(item, (FollowEnd, FollowHeartbeat)), item
+                seen.append(item)
+                if len(seen) == 2:
+                    break
     assert [e.event_type for e in seen] == ["approval.requested", "run.paused"]
     assert seen[1].data["pending_tool_calls"][0]["params"] == {"q": "a\x00b"}
     pairs, _ = await run_store.get_pause_page(run_id, tenant_id="A")

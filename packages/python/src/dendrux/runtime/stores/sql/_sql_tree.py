@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 from sqlalchemy import select
 
 from dendrux import _codes
+from dendrux.db.models import AgentRun
 from dendrux.runtime._bounds import (
     DEFAULT_READ_LIMIT,
     DEFAULT_SUBTREE_DEPTH,
@@ -34,6 +35,7 @@ from dendrux.runtime.state import (
 )
 from dendrux.runtime.stores.sql import _sql_support
 from dendrux.runtime.stores.sql._sql_host import _StoreHost
+from dendrux.runtime.stores.sql._sql_reads import _waiting_for_expression
 from dendrux.runtime.stores.sql._sql_support import logger
 from dendrux.runtime.stores.sql._types import RunParentCursor
 
@@ -41,8 +43,6 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from sqlalchemy.ext.asyncio import AsyncSession
-
-    from dendrux.db.models import AgentRun
 
 
 class _SqlTree(_StoreHost):
@@ -440,6 +440,23 @@ class _SqlTree(_StoreHost):
                 )
         return out
 
+    async def _waiting_labels_by_run(
+        self, session: AsyncSession, rows: list[tuple[AgentRun, int]]
+    ) -> dict[str, str | None]:
+        """``waiting_for`` label per paused run, one query per ``_IN_CHUNK`` paused ids.
+
+        Only stored-paused runs can carry a label, so a subtree with none costs no query.
+        ``rows`` are ``(run, depth)`` from a tenant-scoped traversal, so no scope is applied.
+        """
+        run_ids = [r.id for r, _ in rows if r.status == "paused"]
+        out: dict[str, str | None] = {}
+        for i in range(0, len(run_ids), _IN_CHUNK):
+            stmt = select(AgentRun.id, _waiting_for_expression(self)).where(
+                AgentRun.id.in_(run_ids[i : i + _IN_CHUNK])
+            )
+            out.update((rid, label) for rid, label in (await session.execute(stmt)).all())
+        return out
+
     async def get_subtree(
         self, run_id: str, *, tenant_id: TenantScope = UNSCOPED, max_nodes: int | None = None
     ) -> SubtreeRecord | None:
@@ -456,13 +473,20 @@ class _SqlTree(_StoreHost):
             rows = [
                 (root, 0),
                 *await self._bfs_descendants(
-                    session, root.id, tenant_id=tenant_id, max_nodes=max_nodes
+                    session,
+                    root.id,
+                    tenant_id=tenant_id,
+                    max_nodes=max_nodes,
                 ),
             ]
-            usage = await self._usage_by_run(session, [r.id for r, _ in rows])
+            ids = [r.id for r, _ in rows]
+            usage = await self._usage_by_run(session, ids)
+            waiting_labels = await self._waiting_labels_by_run(session, rows)
             nodes = [
                 SubtreeNodeRecord(
-                    run=_run_to_record(r), depth=d, usage=usage.get(r.id, UsageRollup())
+                    run=_run_to_record(r, waiting_for=waiting_labels.get(r.id)),
+                    depth=d,
+                    usage=usage.get(r.id, UsageRollup()),
                 )
                 for r, d in rows
             ]

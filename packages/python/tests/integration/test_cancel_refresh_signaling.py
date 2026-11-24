@@ -7,6 +7,7 @@ import pytest
 
 from dendrux import Agent, tool
 from dendrux.errors import PersistenceError
+from dendrux.runtime import _cancel, _managed_cancel
 from dendrux.types import LLMResponse, RunStatus
 from tests._helpers.gates import wait_for_gate
 from tests._helpers.scripted_provider import ScriptedLLM, tool_call
@@ -78,7 +79,7 @@ async def test_legacy_cascade_signals_completed_children_when_later_child_fails(
     agent = Agent(name="cascade", prompt="p", state_store=store, strict_tenancy=False)
     await store.create_run("root", agent.name, tenant_id="tenant")
     monkeypatch.setattr(store, "mark_cancel_requested", None)
-    monkeypatch.setattr(agent, "_mark_cancel_subtree", _levels)
+    monkeypatch.setattr(_managed_cancel, "mark_subtree", _levels)
     attempted, signalled = [], []
 
     async def cancel_one(_store, run_id, *, signal):
@@ -87,7 +88,7 @@ async def test_legacy_cascade_signals_completed_children_when_later_child_fails(
             raise PersistenceError()
         return "cancel_requested"
 
-    monkeypatch.setattr(agent, "_cancel_one", cancel_one)
+    monkeypatch.setattr(_cancel, "cancel_one", cancel_one)
     monkeypatch.setattr(agent, "_task_manager", SimpleNamespace(cancel=signalled.append))
     with pytest.raises(PersistenceError):
         await agent.cancel_run("root", tenant_id="tenant", cascade=True)

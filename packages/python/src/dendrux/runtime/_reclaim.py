@@ -20,11 +20,23 @@ from dendrux._lifecycle import (
     StoredEventType,
 )
 from dendrux.errors import PersistenceError, RunNotFoundError, RunNotReclaimableError
+from dendrux.loops import _managed_batch
 from dendrux.loops._helpers import order_observations, project_message, record_message, record_tool
+from dendrux.runtime import _reclaim_managed
 from dendrux.runtime._bounds import MAX_PAGE
+from dendrux.runtime._reclaim_managed import _admit_recovered_call as _admit_recovered_call
+from dendrux.runtime._reclaim_managed import _finish_saved_adoption as _finish_saved_adoption
+from dendrux.runtime._reclaim_managed import _handed_off as _handed_off
+from dendrux.runtime._reclaim_managed import _managed_handoff as _managed_handoff
+from dendrux.runtime._reclaim_managed import _ManagedPending as _ManagedPending
+from dendrux.runtime._reclaim_managed import _pending_adoption as _pending_adoption
+from dendrux.runtime._reclaim_managed import _refuse_bound_pending as _refuse_bound_pending
+from dendrux.runtime._reclaim_managed import (
+    _refuse_recovered_managed_results as _refuse_recovered_managed_results,
+)
 from dendrux.runtime.context import managed_root_reclaim_scope
 from dendrux.runtime.persistence import PersistenceRecorder, resolve_pending
-from dendrux.runtime.state import MANAGED_BINDING_KEY, UNSCOPED, claimed_store
+from dendrux.runtime.state import UNSCOPED, claimed_store
 from dendrux.types import (
     Message,
     PauseState,
@@ -73,10 +85,12 @@ async def reclaim(
         # Last resort: unreachable when the store and its reads agree. The claim
         # cost one recovery attempt; nothing runs and the root reclaims later.
         _refuse_direct_child(run_id, claim.loop_state)
-    if _pending_adoption(claim.loop_state):
+    if _reclaim_managed._pending_adoption(claim.loop_state, run_id=run_id):
         # A managed parent claimed for adoption before its tool row completed:
         # finish that adoption from the saved report, then continue (0.7).
-        claim = await _finish_saved_adoption(agent, owned, run_id, claim)
+        claim = await _reclaim_managed._finish_saved_adoption(
+            agent, owned, run_id, claim, tenant_id=tenant_id
+        )
     return await _continue_session(agent, store, run_id, claim, notifier, session)
 
 
@@ -156,10 +170,7 @@ async def continue_claimed(
     *,
     notifier: LoopNotifier | None,
 ) -> RunResult:
-    """Continue an owned format-2 run from its checkpoint (managed adoption, 0.7).
-
-    As reclaim does after its claim: from durable history, never an in-memory frame.
-    """
+    """Continue an owned checkpoint from durable history."""
     from dendrux.skills._session import SkillSession
 
     session = SkillSession.prepare(agent)
@@ -224,19 +235,7 @@ async def _check_before_claim(
     if record is None or (tenant_id is not UNSCOPED and record.tenant_id != tenant_id):
         return
     state = await store.get_loop_state(run_id) or {}
-    binding = state.get(MANAGED_BINDING_KEY)
-    version = (await store.get_pause_state(run_id) or {}).get("schema_version", 1)
-    if (isinstance(version, int) and version > 3) or (
-        binding is not None
-        and not (
-            isinstance(binding, dict)
-            and binding.get("v", 1) == 1
-            and set(binding) - {"v"} == {"tool_call_id", "child_run_id", "pause_id"}
-            and all(isinstance(v, str) and v for k, v in binding.items() if k != "v")
-        )
-    ):
-        _codes.log_code(logger, _codes.PAUSE_FORMAT_UNSUPPORTED, run_id=run_id)
-        raise RunNotReclaimableError(run_id, "pause_format_unsupported")
+    await _reclaim_managed._check_wait_format(store, run_id, state, tenant_id=record.tenant_id)
     if not via_root and record.parent_run_id is not None:
         _refuse_direct_child(run_id, state)
 
@@ -247,52 +246,6 @@ def _refuse_direct_child(run_id: str, state: dict[str, Any] | None) -> None:
     header = (state or {}).get("managed")
     if isinstance(header, dict) and "invocation" in header:
         raise ManagedChildControlError(run_id)
-
-
-def _pending_adoption(state: dict[str, Any] | None) -> bool:
-    """A running parent whose checkpoint still holds a claimed managed adoption."""
-    state = state or {}
-    return state.get(MANAGED_BINDING_KEY) is not None and bool(state.get("submission"))
-
-
-async def _finish_saved_adoption(
-    agent: Agent, owned: StateStore, run_id: str, claim: ClaimResult
-) -> ClaimResult:
-    """Complete the managed tool intent from the durably accepted report, once."""
-    from dendrux.errors import ManagedStateError
-    from dendrux.runtime._managed import complete_adoption, project_report
-    from dendrux.runtime.state import ClaimResult, ManagedHeader
-    from dendrux.runtime.submit import _submission_payload, deserialize_tool_results
-
-    state = claim.loop_state or {}
-    binding = state[MANAGED_BINDING_KEY]
-    raw = await owned.get_pause_state(run_id) or {}
-    try:
-        payload = _submission_payload(raw)
-        results = deserialize_tool_results(payload["submitted_tool_results"])
-    except (KeyError, TypeError, ValueError):
-        raise ManagedStateError(reason="binding_conflict", run_id=run_id) from None
-    if len(results) != 1 or results[0].call_id != binding.get("tool_call_id"):
-        raise ManagedStateError(reason="binding_conflict", run_id=run_id)
-    header = ManagedHeader.from_dict(state.get("managed"), run_id=run_id)
-    tool = next(
-        (p.get("tool") for p in state.get("pending", []) if p.get("call_id") == results[0].call_id),
-        results[0].name,
-    )
-    # The saved report is already transformed and admitted; only its projection
-    # into the conversation is redone, from the saved mapping.
-    accepted = await project_report(agent, owned, run_id, results[0])
-    if payload.get("managed_blocked"):
-        accepted = replace(accepted, blocked=accepted.blocked or "blocked")
-    after = await complete_adoption(
-        owned,
-        run_id,
-        claim,
-        accepted,
-        child_run_id=binding.get("child_run_id"),
-        path=(*header.path, str(tool)),
-    )
-    return ClaimResult(claim.claim_epoch, claim.storage_format, after, None)
 
 
 class _PauseReadMemo:
@@ -466,18 +419,14 @@ async def rebuild_pause(
 
 
 def _continuation_base(raw: dict[str, Any], run_id: str) -> PauseState:
-    """The pause a continuation starts from; a stale v3 wait is read strictly (0.7).
-
-    After adoption the parent's raw pause data may still hold its old managed
-    wait. The checkpoint is authoritative: only the wait's continuation fields
-    are used, never its binding or a saved submission.
-    """
-    if raw.get("schema_version") != 3:
+    """Keep continuation fields from a stale managed wait; its bindings are retired."""
+    if raw.get("schema_version") not in (3, 4):
         return PauseState.from_dict(raw)
     wait = PauseState.from_managed_dict(raw, run_id=run_id)
     return replace(
         wait,
         managed_wait=None,
+        managed_fanout=None,
         schema_version=2,
         pause_reason=None,
         pending_tool_calls=[],
@@ -645,7 +594,7 @@ async def _consume_recovery_submission(
     if descriptor:
         raw = await store.get_pause_state(run_id) or {}
         payload = _submission_payload(raw)
-        _refuse_recovered_managed_results(
+        _reclaim_managed._refuse_recovered_managed_results(
             run_id, descriptor, raw, recorder._loop_state, payload, lookups
         )
         injected = _recovery_input(payload, descriptor["kind"])
@@ -658,36 +607,6 @@ async def _consume_recovery_submission(
         await recorder.consume_resume(injected)
         ctx.history.extend(injected)
     return recorder._loop_state, descriptor
-
-
-def _refuse_recovered_managed_results(
-    run_id: str,
-    descriptor: dict[str, Any],
-    raw: dict[str, Any],
-    state: dict[str, Any],
-    payload: dict[str, Any],
-    lookups: Any,
-) -> None:
-    """A saved caller result never answers a generated subagent call (0.7).
-
-    Earlier unreleased builds could pause a subagent call for a client and claim
-    a submitted result for it. Recovery checks the saved results against the
-    durable pending targets (pause and checkpoint) and the generated calls before
-    projecting or consuming anything. Approval submissions are runtime denials
-    and are not checked here.
-    """
-    from dendrux.loops.react import SubagentTool
-    from dendrux.runtime.submit import deserialize_tool_results, refuse_managed_results
-
-    if descriptor["kind"] != "tool_results":
-        return
-    results = deserialize_tool_results(payload.get("submitted_tool_results") or [])
-    targets = {
-        **(raw.get("pending_targets") or {}),
-        **{p["call_id"]: p.get("target") for p in state.get("pending", [])},
-        **{r.call_id: "agent" for r in results if isinstance(lookups.fn.get(r.name), SubagentTool)},
-    }
-    refuse_managed_results(run_id, targets, results)
 
 
 class _RecoveryBlockedError(Exception):
@@ -1059,69 +978,43 @@ async def _resolve_saved_call(
 _ORDINARY = object()
 
 
-@dataclass(frozen=True)
-class _ManagedPending:
-    """The one generated subagent call pending in a supported recovered batch (0.7)."""
-
-    call: ToolCall
-    admitted: bool
-
-
 async def _recover_managed_calls(
     agent: Agent, ctx: _ResumeContext, run_id: str, lookups: Any
 ) -> object:
-    """Classify pending generated subagent calls before any hook or effect (0.7).
-
-    An unsupported batch is refused per call, as the live preflight would. A
-    supported batch (one managed call, other calls server-side) returns a
-    :class:`_ManagedPending`: ordinary recovery then resolves the server calls
-    and admits the managed call, which is bound afterwards, never dispatched.
-    A saved approval submission is consumed first, as for any batch; a batch
-    that needs an approval decision pauses for it, and the approved
-    continuation binds the managed call. Returns ``_ORDINARY`` when no
-    generated call is pending, None after a durable refusal.
-    """
-    from dendrux.loops.react import SubagentTool, _managed_batch_unsupported
-    from dendrux.runtime._managed import ADMITTED_KEY
-
     pending = ctx.pause_state.pending_tool_calls
-    state = cast("PersistenceRecorder", ctx.recorder)._loop_state
+    recorder = cast("PersistenceRecorder", ctx.recorder)
+    state = recorder._loop_state
+    policy = _managed_batch.batch_policy(
+        agent, fanout_capable=_managed_batch.loop_fanout_capable(recorder)
+    )
     refused = set(state.get("managed_refused") or ())
     if refused and any(tc.id in refused for tc in pending):
         # The whole batch was refused durably; finish refusing what is left.
-        await _refuse_recovered_batch(ctx, run_id, pending)
+        original = _reclaim_managed._refused_batch(ctx.history, refused, pending)
+        decision = _managed_batch.classify_batch(original, lookups, policy)
+        decision, limit = _reclaim_managed._saved_refusal(
+            ctx.history, refused, decision, policy.limit
+        )
+        await _refuse_recovered_batch(ctx, run_id, pending, decision, limit=limit)
         return None
-    managed = [tc for tc in pending if isinstance(lookups.fn.get(tc.name), SubagentTool)]
+    managed = [
+        tc for tc in pending if isinstance(lookups.fn.get(tc.name), _managed_batch.SubagentTool)
+    ]
     if not managed:
         return _ORDINARY
-    if _managed_batch_unsupported(pending, lookups):
-        await _refuse_recovered_batch(ctx, run_id, pending)
+    decision = _managed_batch.classify_batch(pending, lookups, policy)
+    if decision.action == "refuse":
+        await _refuse_recovered_batch(ctx, run_id, pending, decision, limit=policy.limit)
         return None
-    return _ManagedPending(managed[0], admitted=state.get(ADMITTED_KEY) == managed[0].id)
-
-
-def _refuse_bound_pending(found: _ManagedPending | None, run_id: str, rows: dict[str, Any]) -> None:
-    """A pending managed call that already has a tool row is invalid state (0.7).
-
-    A bound call's parent is parked, never reclaimed with it pending.
-    """
-    from dendrux.errors import ManagedStateError
-
-    if found is not None and found.call.id in rows:
-        raise ManagedStateError(reason="binding_outstanding", run_id=run_id)
+    return _ManagedPending.from_calls(
+        managed, admitted=state.get("managed_admitted"), run_id=run_id
+    )
 
 
 async def _admitted_arguments(
     ctx: _ResumeContext, run_id: str, tc: ToolCall, lookups: Any
 ) -> list[ToolCall]:
-    """An admitted call's execution arguments, rebuilt without its policy callbacks.
-
-    History keeps the model's placeholder form; the live batch admitted the
-    restored, validated arguments. Only those two stages run again (the PII
-    guardrail's restore from the saved mapping, then validation), so the child
-    receives exactly the brief its admission saw and no raw value is written to
-    model-visible evidence.
-    """
+    """Restore admitted arguments without repeating policy callbacks."""
     from dendrux.loops.react import _pii_placeholders, _restore_calls, _validate_calls
 
     engine = cast("PersistenceRecorder", ctx.recorder).guardrail_engine
@@ -1130,60 +1023,24 @@ async def _admitted_arguments(
     return await _validate_calls(calls, lookups, frozenset(_pii_placeholders(engine)), batch)
 
 
-async def _admit_recovered_call(
-    ctx: _ResumeContext, run_id: str, found: _ManagedPending, outcome: Any, lookups: Any
-) -> list[ToolCall]:
-    """The managed call's recovered admission: brief size after policy, as live."""
-    from dendrux.loops.react import _admit_managed_briefs
-
-    ready = [tc for tc in outcome.pending_calls if tc.id == found.call.id]
-    if not ready or outcome.approval_gates:
-        return list(outcome.pending_calls)
-    return await _admit_managed_briefs(ready, lookups, _recovery_batch(ctx, run_id))
-
-
-def _managed_handoff(
-    agent: Agent, ctx: _ResumeContext, run_id: str, call: ToolCall, lookups: Any
-) -> RunResult:
-    """Hand the admitted managed call to the durable bind, after the server calls."""
-    from dendrux.loops.react import MANAGED_HANDOFF_KEY, ManagedHandoff
-
-    pause = replace(
-        ctx.pause_state,
-        history=ctx.history,
-        pending_tool_calls=[call],
-        pending_targets={call.id: "agent"},
-        approval_gates=None,
-        pending_decisions=None,
-    )
-    return RunResult(
-        run_id=run_id,
-        status=RunStatus.RUNNING,
-        steps=pause.steps,
-        iteration_count=pause.iteration,
-        usage=pause.usage,
-        meta={
-            "pause_state": pause,
-            MANAGED_HANDOFF_KEY: ManagedHandoff(
-                call=call, child=lookups.fn[call.name].agent, parent=agent
-            ),
-        },
-    )
-
-
-async def _refuse_recovered_batch(ctx: _ResumeContext, run_id: str, calls: list[ToolCall]) -> None:
-    """One ``managed_batch_unsupported`` observation per pending call, no effects."""
+async def _refuse_recovered_batch(
+    ctx: _ResumeContext,
+    run_id: str,
+    calls: list[ToolCall],
+    decision: _managed_batch.BatchDecision | None = None,
+    *,
+    limit: int = 1,
+) -> None:
     from dendrux._meta_keys import NOT_EXECUTED_META_KEY
-    from dendrux.loops.react import _managed_batch_result
     from dendrux.types import tool_result_message
 
     recorder = cast("PersistenceRecorder", ctx.recorder)
     iteration = ctx.pause_state.iteration
-    _codes.log_code(logger, _codes.MANAGED_BATCH_UNSUPPORTED, run_id=run_id, count=len(calls))
+    _managed_batch.log_refusal(logger, run_id, decision, count=len(calls), limit=limit)
     if not set(recorder._loop_state.get("managed_refused") or ()) >= {tc.id for tc in calls}:
         await recorder.mark_managed_refusal([tc.id for tc in calls])
     for tc in calls:
-        result = _managed_batch_result(tc)
+        result = _managed_batch._managed_batch_result(tc, decision, limit=limit)
         await record_tool(recorder, run_id, tc, result, iteration)
         message = tool_result_message(result)
         message.meta[NOT_EXECUTED_META_KEY] = True
@@ -1243,16 +1100,11 @@ class _Prepared:
         return None
 
     async def prepare(self, tc: ToolCall, action: Any, row: Any) -> None:
-        """Resolve a saved outcome, or prepare the call without dispatching it.
-
-        The pending managed call is held, never dispatched: admitted by its live
-        batch it is not prepared again; otherwise the parent's policy and brief
-        limit admit it now, as the live batch would have (0.7).
-        """
+        """Resolve saved outcomes, then prepare unbound calls without dispatching them."""
         run = self.run
         if await _resolve_saved_call(run.ctx, run.run_id, tc, action, row, self.held, self.gates):
             return
-        managed = run.found is not None and tc.id == run.found.call.id
+        managed = run.found is not None and tc.id in run.found.call_ids
         if managed and run.found is not None and run.found.admitted:
             self.held.extend(await _admitted_arguments(run.ctx, run.run_id, tc, run.lookups))
             return
@@ -1273,7 +1125,7 @@ class _Prepared:
         )
         if managed and run.found is not None:
             ready = await _admit_recovered_call(
-                run.ctx, run.run_id, run.found, outcome, run.lookups
+                run.found, outcome, run.lookups, _recovery_batch(run.ctx, run.run_id)
             )
         else:
             ready = list(outcome.pending_calls)
@@ -1302,6 +1154,7 @@ async def resolve(
         return cast("RunResult | None", managed)
     found = managed if isinstance(managed, _ManagedPending) else None
     state, descriptor = await _consume_recovery_submission(store, run_id, ctx, lookups)
+    found = _reclaim_managed._surviving_managed(found, state, run_id)
     pending = state.get("pending", [])
     rows = await _pending_rows(store, run_id, pause.iteration, pending)
     by_id = {row.tool_call_id: row for row in rows}
@@ -1315,7 +1168,7 @@ async def resolve(
         phases={p["call_id"]: p["phase"] for p in pending},
         reserved=counts.copy(),
     )
-    _refuse_bound_pending(found, run_id, by_id)
+    _reclaim_managed._refuse_bound_pending(found, run_id, by_id)
     barrier = await prep.prepare_all(store, actions, by_id)
     if barrier is not None:
         return barrier
@@ -1335,8 +1188,8 @@ async def resolve(
     if barrier is not None:
         return barrier
     order_observations(recorder, ctx.history)
-    if _handed_off(found, held):
-        return _managed_handoff(agent, ctx, run_id, held[0], lookups)
+    if _reclaim_managed._handed_off(found, held):
+        return _reclaim_managed._managed_handoff(agent, ctx, run_id, held, lookups)
     return await _recovery_pause_result(store, run_id, ctx, state, descriptor, held, prep.gates)
 
 
@@ -1349,6 +1202,9 @@ async def _pending_rows(
     return list(await store.get_tool_calls(run_id, iteration_index=iteration, limit=MAX_PAGE))
 
 
-def _handed_off(found: _ManagedPending | None, held: list[ToolCall]) -> bool:
-    """Only the admitted managed call is left: it goes to the bind (0.7)."""
-    return found is not None and [tc.id for tc in held] == [found.call.id]
+def configure_recovery_frame(ctx: _ResumeContext, store: StateStore, *, streaming: bool) -> None:
+    """Set the continuation frame's batch capability before resolving or entering its loop."""
+    # Cycle: _run_execute uses _reclaim for continuations; removed with frame setup extraction.
+    from dendrux.runtime._run_execute import _configure_fanout
+
+    _configure_fanout(ctx.recorder, None if streaming else store)

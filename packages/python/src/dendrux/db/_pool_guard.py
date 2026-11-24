@@ -32,20 +32,31 @@ cancelled, but once the caller is cancelled it waits at most
 ``CLOSE_AFTER_CANCEL_S`` seconds. A close still running then is abandoned: it
 keeps running in the background, and the single-connection lock (if the caller
 holds one) stays held until that close finishes.
+
+:func:`guard_sqlite_closes` makes every physical close of a ``sqlite+aiosqlite``
+file-database connection (closed by the pool, invalidated after a cancelled write,
+or garbage collected) first close the cursors it handed out and roll back.
+Otherwise a cursor kept alive by a retained exception traceback leaves the closed
+connection as a SQLite zombie that holds the file's write lock and journal, and
+every later writer times out. A plain return to the pool is not a physical close
+and is not covered.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import sqlite3
 import sys
 import weakref
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
 
+from sqlalchemy import event
 from sqlalchemy.pool import SingletonThreadPool, StaticPool
 
 from dendrux import _codes
+from dendrux.db._engine_options import is_memory_sqlite
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable
@@ -59,6 +70,7 @@ __all__ = [
     "CLOSE_AFTER_CANCEL_S",
     "WAIT_WARNING_S",
     "close_fully",
+    "guard_sqlite_closes",
     "serialized",
     "shares_one_connection",
     "warn_if_shared_connection",
@@ -94,6 +106,98 @@ _GUARDS: dict[tuple[Pool, asyncio.AbstractEventLoop], _Guard] = {}
 _WARNED: weakref.WeakSet[Pool] = weakref.WeakSet()
 
 
+_STATEMENTS_ATTR = "_dendrux_sqlite_statements"  # set on each aiosqlite connection
+
+
+class _SQLiteStatements:
+    """Finalize one aiosqlite connection's statements and roll back before it closes.
+
+    SQLite keeps a connection closed with unfinalized statements alive as a zombie
+    that still holds its write lock and journal. A cursor referenced from a retained
+    exception traceback keeps its statement unfinalized, so a cancelled write could
+    lock the file for every later writer. This wraps the connection's worker queue
+    (aiosqlite's dynamic driver boundary) to record the cursors it returns, by weak
+    reference only, so completed statements never accumulate.
+    """
+
+    def __init__(self, driver: Any) -> None:
+        self.driver = weakref.ref(driver)
+        self.raw: sqlite3.Connection = driver._connection
+        self.cursors: weakref.WeakSet[sqlite3.Cursor] = weakref.WeakSet()
+
+        async def _execute(function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+            # A weak reference: a strong one would tie the driver into a reference cycle.
+            connection = self.driver()
+            if connection is None:
+                raise sqlite3.ProgrammingError("sqlite_connection_unavailable")
+
+            def _tracked() -> Any:
+                result = function(*args, **kwargs)
+                if isinstance(result, sqlite3.Cursor):
+                    self.cursors.add(result)
+                return result
+
+            # Looked up per call, so a later patch of the class method still applies.
+            return await type(connection)._execute(connection, _tracked)
+
+        driver._execute = _execute
+
+    def finalize(self) -> None:
+        """Close every recorded cursor, then roll back; runs on the worker thread."""
+        for cursor in list(self.cursors):
+            try:
+                cursor.close()
+            except sqlite3.Error:
+                # Cleanup isolation: still finalize the other statements and roll back.
+                logger.debug("sqlite_statement_cleanup_failed")
+        try:
+            self.raw.rollback()
+        except sqlite3.Error:
+            logger.debug("sqlite_rollback_cleanup_failed")
+
+    def enqueue(self) -> None:
+        """Queue :meth:`finalize` ahead of the close; never waits for the worker."""
+        driver = self.driver()
+        if driver is not None:
+            # aiosqlite's worker runs an item without a Future and reports nothing back.
+            driver._tx.put_nowait((None, self.finalize))
+
+
+def _track_sqlite_statements(dbapi_connection: Any, *_args: object) -> None:
+    driver = dbapi_connection.driver_connection
+    if getattr(driver, _STATEMENTS_ATTR, None) is None:
+        setattr(driver, _STATEMENTS_ATTR, _SQLiteStatements(driver))
+
+
+def _finalize_before_close(dbapi_connection: Any, *_args: object) -> None:
+    # Pool "close" (checked-in or invalidated) and "close_detached" (garbage collected)
+    # both fire before SQLAlchemy's graceful close or force stop is queued, so FIFO
+    # order runs the finalize first. No await: a busy worker cannot extend a cancelled
+    # caller's bounded close.
+    statements = vars(dbapi_connection.driver_connection).pop(_STATEMENTS_ATTR, None)
+    if statements is not None:
+        statements.enqueue()
+
+
+def guard_sqlite_closes(engine: AsyncEngine) -> None:
+    """Finalize statements and roll back before each aiosqlite connection closes.
+
+    Idempotent. A no-op for every engine other than a ``sqlite+aiosqlite`` file
+    database: in-memory SQLite has no file lock to leave behind, so it gets no
+    listeners and no driver wrapper.
+    """
+    driver = (engine.dialect.name, engine.dialect.driver)
+    if driver != ("sqlite", "aiosqlite") or is_memory_sqlite(engine):
+        return
+    target = engine.sync_engine
+    if event.contains(target, "checkout", _track_sqlite_statements):
+        return
+    event.listen(target, "connect", _track_sqlite_statements)
+    event.listen(target, "checkout", _track_sqlite_statements)
+    event.listen(target, "close", _finalize_before_close)
+    event.listen(target, "close_detached", _finalize_before_close)
+
+
 def _bind_to_current_loop(engine: AsyncEngine) -> None:
     """Make every pool checkout on another event loop fail with a clear error.
 
@@ -104,8 +208,6 @@ def _bind_to_current_loop(engine: AsyncEngine) -> None:
     """
     if engine.dialect.name == "sqlite":
         return
-    from sqlalchemy import event
-
     owner = asyncio.get_running_loop()
 
     def _check_loop(*_args: object) -> None:
@@ -196,6 +298,7 @@ async def serialized(engine: AsyncEngine) -> AsyncIterator[None]:
     A no-op for every other pool. Re-entering from the task that already holds
     the lock does not wait (see the module docstring for what that implies).
     """
+    guard_sqlite_closes(engine)
     if not shares_one_connection(engine):
         yield
         return
