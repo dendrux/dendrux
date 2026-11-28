@@ -11,6 +11,7 @@ docs/
 ├── overview.mdx            → /docs
 ├── is-dendrux-for-you.mdx  → /docs/is-dendrux-for-you
 ├── quickstart.mdx          → /docs/quickstart
+├── changelog.mdx           → /docs/changelog (main changes per release; full list in packages/python/CHANGELOG.md)
 ├── upgrading-to-0.5.0.mdx  → /docs/upgrading-to-0.5.0
 ├── upgrading-to-0.6.0.mdx  → /docs/upgrading-to-0.6.0
 ├── upgrading-to-0.6.1.mdx  → /docs/upgrading-to-0.6.1
