@@ -11,7 +11,7 @@ Until 1.0, a minor release can change a default directly. When it does, the rele
 
 ## 0.8.0
 
-Released 2026-11-24. **Migration:** no schema migration. Upgrade every worker together if you use subagents. [Upgrading to 0.8.0](/docs/upgrading-to-0.8.0)
+Released 2026-11-24. **Migration:** no schema migration. Upgrade every worker on a database together; mixing 0.7 and 0.8 workers is not supported. [Upgrading to 0.8.0](/docs/upgrading-to-0.8.0)
 
 - **Parallel subagents.** A model that calls several subagents in one response now runs them at once, up to `Limits.max_parallel_subagents` (default 4). A batch over the limit is refused before anything runs, and `Agent(exclusive_subagents=[...])` names children that must run alone. See [Managed subagents](/docs/guides/subagents#parallel-subagents).
 - **Several pauses at once.** `RunResult.pendings` and `RunStore.get_pendings()` list every paused child of a workflow. Answer one through the root with its `expected_pause_id`. Streaming, `reclaim(root)` and `cancel_run(root)` all work across the parallel branches.
@@ -33,7 +33,7 @@ Released 2026-11-17. **Migration:** no schema migration. Custom stores must pass
 - **Bounded reads by default.** `get_events`, `get_traces`, `get_llm_calls` and `get_tool_invocations` read at most 1,000 rows per call (a larger `limit` raises), and `get_subtree` raises past 10,000 descendants.
 - **Typed tools.** `@tool(...)` keeps the decorated function's signature for type checkers.
 
-## 0.6.1 "Stability"
+## 0.6.1
 
 Released 2026-11-10. **Migration:** yes for PostgreSQL, MySQL, MariaDB and SQLite set up with Dendrux migrations: run `dendrux db migrate` once. Automatic SQLite needs nothing. [Upgrading to 0.6.1](/docs/upgrading-to-0.6.1)
 
