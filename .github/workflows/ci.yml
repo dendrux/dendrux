@@ -2,9 +2,11 @@ name: CI
 
 on:
   push:
-    # Feature and track branches get the full matrix on every push, so heavy runs happen
-    # here instead of on a developer machine. Never push unreleased security fixes.
-    branches: [main, "feat/**"]
+    # Track and integration branches (feat/<version>-<name>) get the full matrix on every push,
+    # so heavy runs happen here instead of on a developer machine. A feature branch
+    # (feat/<version>) only fast-forwards to a commit that already passed, and its pull request
+    # gets its own run, so a push to it runs nothing. Never push unreleased security fixes.
+    branches: [main, "feat/*-*"]
   pull_request:
     branches: [main]
 
