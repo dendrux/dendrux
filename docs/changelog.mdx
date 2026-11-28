@@ -1,0 +1,99 @@
+---
+title: Changelog
+description: What changed in each Dendrux release from 0.3.0 to 0.8.0, whether it needs a migration, and where its upgrade guide is.
+---
+
+# Changelog
+
+The main changes in each release, newest first. Every item in full, including fixes and internal changes, is in the [full CHANGELOG on GitHub](https://github.com/dendrux/dendrux/blob/main/packages/python/CHANGELOG.md).
+
+Until 1.0, a minor release can change a default directly. When it does, the release notes and the upgrade guide say so.
+
+## 0.8.0
+
+Released 2026-11-24. **Migration:** no schema migration. Upgrade every worker on a database together; mixing 0.7 and 0.8 workers is not supported. [Upgrading to 0.8.0](/docs/upgrading-to-0.8.0)
+
+- **Parallel subagents.** A model that calls several subagents in one response now runs them at once, up to `Limits.max_parallel_subagents` (default 4). A batch over the limit is refused before anything runs, and `Agent(exclusive_subagents=[...])` names children that must run alone. See [Managed subagents](/docs/guides/subagents#parallel-subagents).
+- **Several pauses at once.** `RunResult.pendings` and `RunStore.get_pendings()` list every paused child of a workflow. Answer one through the root with its `expected_pause_id`. Streaming, `reclaim(root)` and `cancel_run(root)` all work across the parallel branches.
+- **`waiting_for`.** Run summaries and subtree nodes report `waiting_for="subagents"` for a parent that is waiting on its children. `list_runs()` and `count_runs()` take `include_waiting=False`, and `dendrux runs --exclude-waiting` does the same.
+- **`dendrux.cancel_run(...)`.** Cancel a run and its subagents from a route or script without building an `Agent` or loading a provider. `tenant_id` is required. See [Cancelling a run](/docs/recipes/cancel-run#cancel-a-run-without-an-agent).
+- **`on_started=`.** `Agent.run()` and `Agent.retry()` take a callback that receives the run id as soon as the run is saved, before the model starts.
+- **`dendrux.testing.FakeModel`.** A scripted model for tests that answers by agent name and turn. See [Testing agents with FakeModel](/docs/recipes/testing-with-fake-model).
+- **Fixes and changes.** A cancelled write on a SQLite file no longer leaves the file locked, and `aiosqlite>=0.22.1` is now required. `StructuredOutputValidationError` no longer includes the model's answer in its message. An oversized subagent batch reports the code `managed_fanout_limit`.
+
+## 0.7.0
+
+Released 2026-11-17. **Migration:** no schema migration. Custom stores must pass the store kit again, and every `sweep()` job must be upgraded before workflows use subagents. [Upgrading to 0.7.0](/docs/upgrading-to-0.7.0)
+
+- **Managed subagents.** `Agent(subagents=[...], description=...)` registers other agents as tools. A child runs its own loop in the same store and tenant, and its answer becomes the parent's tool result. One subagent call per model turn in this release. See [Managed subagents](/docs/guides/subagents).
+- **Child pauses surface on the root.** Answer a child's approval, client tool or question with the root run id and `expected_pause_id`. `reclaim(root_id)` recovers the tree without running a finished child twice, and `cancel_run(root_id)` cancels the children too.
+- **One budget for the tree.** Set the `Budget` on the root; it covers every child. `Limits.max_managed_runs` (default 128) and `Limits.max_subagent_definitions` (default 256) bound a workflow.
+- **SingleCall children.** A subagent can use `SingleCall` for one model step that never pauses, with an optional typed `output_type` report.
+- **`sweep()` defaults to `on_stale="reclaim"`.** Recoverable runs are marked for `agent.reclaim()`; pass `on_stale="error"` to finalise every stale run as before.
+- **Bounded reads by default.** `get_events`, `get_traces`, `get_llm_calls` and `get_tool_invocations` read at most 1,000 rows per call (a larger `limit` raises), and `get_subtree` raises past 10,000 descendants.
+- **Typed tools.** `@tool(...)` keeps the decorated function's signature for type checkers.
+
+## 0.6.1
+
+Released 2026-11-10. **Migration:** yes for PostgreSQL, MySQL, MariaDB and SQLite set up with Dendrux migrations: run `dendrux db migrate` once. Automatic SQLite needs nothing. [Upgrading to 0.6.1](/docs/upgrading-to-0.6.1)
+
+- **Separate migration history.** Dendrux keeps its migration history in its own `dendrux_alembic_version` table, so it no longer shares one with your application's Alembic history. Existing history is moved once by `dendrux db migrate`.
+- **Recovery counts reset on progress.** `reclaim_attempts` counts recovery attempts since the run last made new progress, not over its lifetime.
+- **Retrying a successful run** generates a new final answer, keeping the earlier context.
+- **Blocked content stays out of storage.** Text a guardrail blocks is replaced by a placeholder such as `[blocked: 1 finding]` before it is saved. A run holding blocked content cannot be retried, and `runs=` replay leaves it out with a warning.
+- **Recovery holds for approval.** Tool calls beside an unresolved approval wait for the decision during recovery instead of starting early.
+
+## 0.6.0 "Production"
+
+Released 2026-11-06. **Migration:** yes. Run `dendrux db migrate`, roll every worker and reader to 0.6, take a backup, then run `dendrux db activate`. Activation is one way. [Upgrading to 0.6.0](/docs/upgrading-to-0.6.0)
+
+- **Recovery.** `sweep(on_stale="reclaim")` marks runs whose worker stopped, and `agent.reclaim(...)` continues them from their last committed state. You call both from your own jobs; Dendrux starts no background workers. See [Recovery](/docs/guides/recovery).
+- **Durable checkpoints.** Storage format 2 keeps conversation history and execution state in bounded rows, so a run can continue after a restart between steps. Workers renew a lease on the runs they hold (`Agent(lease_interval=...)`).
+- **Optional live updates.** Postgres or Redis hints wake `RunStore.follow` early. They are off by default and only a wake-up: the database stays the source of truth. See [Live updates](/docs/guides/scaling#live-updates).
+- **MySQL and MariaDB.** `MySQLStateStore`, plus a store test kit for any other SQL database. See [MySQL and MariaDB](/docs/guides/mysql) and [Build your own store](/docs/guides/build-your-own-store).
+- **Bounded reads.** RunStore history reads and `get_subtree` take `limit=` or `max_nodes=`.
+- **Defaults change.** Strict tenancy, `on_governance_change="raise"` and counting cache tokens in budgets are on by default. The Agent no longer reads `DENDRUX_DATABASE_URL`; pass `state_store=` or `database_url=`. Provider extras need `anthropic>=0.77.0` and `openai>=1.97.2`.
+
+## 0.5.0 "Trust"
+
+Released 2026-10-28. **Migration:** yes. Run `dendrux db migrate` once, as a deploy job over a direct connection, before starting 0.5 workers. Rolling deploys are supported. [Upgrading to 0.5.0](/docs/upgrading-to-0.5.0)
+
+- **Tenant-scoped reads.** Pass `tenant_id=` on RunStore reads and Agent writes; `get_pending` and `follow` require it. A run from another tenant looks like a missing one. See [Multi-tenancy](/docs/architecture/multi-tenancy).
+- **Payloads hidden by default.** `RunStore.follow` and `get_event_view` show codes, ids, numbers and declared names only; the active pause stays actionable.
+- **Build your own read routes.** `RunStore.get_pending` and `RunStore.follow` replace the packaged read router and the embedded dashboard, which are removed. See [Build your own read routes](/docs/recipes/build-your-own-read-routes).
+- **Typed provider errors.** Every failed request is a `ProviderError` with a category, a retry hint and a safe message. Empty answers and refusals end the run as `error` instead of an empty success. Calls have deadlines (`call_timeout`, `stream_idle_timeout`). See [Handling provider errors](/docs/recipes/handling-provider-errors).
+- **Run integrity.** Every pause has a `pause_id`, and approving requires `expected_pause_id=`, so a stale tab cannot approve a newer pause.
+- **Validated tools and bounded inputs.** Tool arguments are validated and coerced to their types, and inputs, metadata, notes, tool results and queues all have limits (`Agent(limits=Limits(...))`).
+- **PII restore you control.** `PII(restore="allowlisted")` with `@tool(receives_pii=...)` returns real values only to the tools you name. See [PII restore](/docs/architecture/pii-restore).
+
+## 0.4.1
+
+Released 2026-10-18. **Migration:** no.
+
+- **Truncated answers are flagged.** `result.truncated` and `result.stop_reason` say when the final answer was cut off at the token limit, on all four providers. The run still succeeds, so check the flag.
+- **Anthropic strict mode.** `@tool(strict=True)` and structured output are sent strict on Anthropic when the schema allows it, with an automatic fallback and an `AnthropicProvider(strict=False)` opt-out.
+- **`tenant_id=` on run-control writes.** `submit_tool_results`, `submit_input`, `submit_approval`, `submit_resume`, `resume` and `resume_stream` refuse runs outside the tenant before writing anything.
+
+## 0.4.0
+
+Released 2026-10-18. **Migration:** yes. Run `dendrux db migrate`, even if you do not use images.
+
+- **Images.** User input, tool results (`ToolOutput(result, images=[...])`), client tool results and MCP image results all reach the model as images. See [Images](/docs/recipes/images).
+- **Stored once, by reference.** Images are stored once as tenant-scoped blobs, in the database by default or in your own `BlobStore` such as S3. Runs, pauses and events hold references only.
+- **Provider support.** Anthropic, OpenAI Chat and Responses, and OpenRouter. A model without vision support gets a typed error or a placeholder.
+
+## 0.3.0
+
+Released 2026-10-17. **Migration:** yes. Run `dendrux db migrate`.
+
+- **Per-call approvals.** `submit_approval(run_id, decisions={call_id: ApprovalDecision.approve()})` decides each gated call on its own. Since 0.5.0, approving also needs `expected_pause_id=`.
+- **`before_tool` policy hook.** One function sees each tool call before approval and returns allow, deny, require approval or a substituted result. It fails closed. See [Tool policy](/docs/architecture/tool-policy).
+- **Run control.** `request_pause` parks a running run and `submit_resume` continues it. `cancel_run(run_id, cascade=True)` stops delegated children too.
+- **Inbox notes.** `submit_note(run_id, "...")` tells a run something while it works; the model sees it at the next step. See [Inbox](/docs/architecture/inbox).
+- **Dollar budgets.** `Budget(max_cost_usd=..., on_exceed="pause" | "cancel", include_children=True)` enforces token and dollar limits across a run and its children.
+- **Subtree reads.** `RunStore.get_subtree(run_id)` returns a delegation tree with rolled-up usage.
+- **`MCPConnection.call_tool`** runs an MCP server tool directly from your app.
+
+## Earlier releases
+
+Releases before 0.3.0 were alphas (`0.2.0a14` to `0.2.0a23`). They are listed in the [full CHANGELOG on GitHub](https://github.com/dendrux/dendrux/blob/main/packages/python/CHANGELOG.md).
